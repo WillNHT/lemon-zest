@@ -3,9 +3,9 @@
 Sync a local music library to portable players — DAPs, Rockboxed players,
 plain USB drives — where each device keeps its own independent set.
 
-This is the MVP: the core engine and a CLI. It does the thing the whole
-project is for, which is to put the right files on a card **correctly,
-repeatably, and without breaking what is already there.**
+This is the MVP: the core engine, a CLI, and a local interface. It does the
+thing the whole project is for, which is to put the right files on a card
+**correctly, repeatably, and without breaking what is already there.**
 
 ## Why it exists
 
@@ -67,9 +67,32 @@ hoard sync "HiBy R1"
 Other commands: `hoard stats`, `hoard device list`, `hoard playlist list`,
 `hoard playlist unmatched`, `hoard log`, `hoard doctor <folder>`.
 
+## The interface
+
+```bash
+hoard gui
+```
+
+Opens `http://127.0.0.1:7777` in your browser. Everything above is there:
+browse and filter the library through a three-pane genre/artist/album
+browser, see at a glance which tracks are already on the selected device,
+tick playlists onto a device, dry-run, and sync with live progress.
+
+It is served by the same process that owns the catalog, with no build step,
+no `npm install`, and no CDN - so it works with the network unplugged. Long
+jobs run on a worker thread and are reported through a job registry, so a
+sync keeps going if you reload the page, and the catalog stays readable
+while it writes (SQLite in WAL mode).
+
+**Needs attention** collects everything worth a second look in one place:
+empty files (zero bytes on disk - failed downloads, which Hoard refuses to
+copy rather than putting dead entries on the card), untagged files, and
+playlist entries that resolve to nothing.
+
 ## What it guarantees
 
-Each of these is covered by a test in `tests/test_sync.py`:
+Each of these is covered by a test in `tests/test_sync.py`; `tests/test_server.py`
+covers the API the interface runs on. 25 tests, no network, no real card:
 
 | | |
 |---|---|
@@ -111,6 +134,8 @@ an intact card produce no work at all.
 | `planner.py` | The three-set diff. Pure; touches nothing |
 | `executor.py` | Carries out a plan, safely and resumably |
 | `cli.py` | Commands |
+| `server.py` | JSON API and job registry for the interface |
+| `web/` | The interface: one HTML file, one stylesheet, one script |
 
 The planner is deliberately side-effect free: it is both the dry run and the
 easiest part to test, which is why it was built first.
@@ -139,7 +164,11 @@ Two hazards, both hit in real use:
 
 Deliberately, per the build plan: transcoding (this library is uniformly
 AAC, so there is nothing to convert yet), loudness analysis and ReplayGain,
-streaming imports, iTunesDB for stock-firmware iPods, playback, and the GUI.
-The core is written so a Tauri or Electron front end can sit on top of it
-without changes — the planner and executor already communicate through plain
-dicts and an event callback.
+streaming imports, iTunesDB for stock-firmware iPods, and playback.
+
+The interface covers the library, playlists, devices and syncing. It does
+not yet have the loudness or import screens from the prototype, because
+there is nothing behind them to show. Nothing in the core knows the
+interface exists — the planner and executor communicate through plain dicts
+and an event callback — so a Tauri or Electron shell could replace the
+browser later without touching them.

@@ -7,3 +7,5 @@ hoard.db-wal
 hoard.db-shm
 *.log
 cookies.txt
+.testcard/
+.gui.log

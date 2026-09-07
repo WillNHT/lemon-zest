@@ -129,7 +129,12 @@ def plan(con, device, root, prune=False):
     for rel, t in planned.items():
         src = resolve_existing(t["path"])
         if src is None:
-            missing_source.append({"rel": rel, "track": t})
+            missing_source.append({"rel": rel, "track": t, "why": "file is gone"})
+            continue
+        # A zero-byte file is a failed download, not music. Copying it would
+        # put a dead entry on the card that the player has to choke on.
+        if t["size"] == 0:
+            missing_source.append({"rel": rel, "track": t, "why": "empty file"})
             continue
         m = manifest.get(rel)
         present = rel in on_card
