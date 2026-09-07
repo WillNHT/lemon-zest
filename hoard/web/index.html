@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hoard</title>
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%23cfc7b6'/><g fill='%239c4718'><rect x='2' y='2.6' width='12' height='2.6' rx='.7'/><rect x='3.7' y='6.7' width='8.6' height='2.6' rx='.7'/><rect x='5.4' y='10.8' width='5.2' height='2.6' rx='.7'/></g></svg>">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-hoard" viewBox="0 0 16 16"><g fill="currentColor"><rect x="2" y="2.6" width="12" height="2.6" rx=".7"/><rect x="3.7" y="6.7" width="8.6" height="2.6" rx=".7"/><rect x="5.4" y="10.8" width="5.2" height="2.6" rx=".7"/></g></symbol>
+  <symbol id="i-disc" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/></symbol>
+  <symbol id="i-device" viewBox="0 0 16 16"><rect x="4" y="1.6" width="8" height="12.8" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="5.8" y="11.2" width="4.4" height="1.6" fill="currentColor"/></symbol>
+  <symbol id="i-list" viewBox="0 0 16 16"><g fill="currentColor"><rect x="2" y="3" width="12" height="1.8"/><rect x="2" y="7.1" width="12" height="1.8"/><rect x="2" y="11.2" width="8" height="1.8"/></g></symbol>
+  <symbol id="i-warn" viewBox="0 0 16 16"><polygon points="8,2 14.4,13.6 1.6,13.6" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="7.2" y="6.4" width="1.6" height="4" fill="currentColor"/><rect x="7.2" y="11.2" width="1.6" height="1.6" fill="currentColor"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><g fill="currentColor"><rect x="7.1" y="2.4" width="1.8" height="11.2"/><rect x="2.4" y="7.1" width="11.2" height="1.8"/></g></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><polyline points="2.8,8.4 6.4,12 13.2,4" fill="none" stroke="currentColor" stroke-width="1.9"/></symbol>
+  <symbol id="i-sync" viewBox="0 0 16 16"><path d="M13.2 8a5.2 5.2 0 1 1-1.9-4" fill="none" stroke="currentColor" stroke-width="1.5"/><polygon points="13.6,1.4 13.6,5 10,5" fill="currentColor"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="5.6"/><polyline points="8,4.6 8,8.3 11,9.8"/></g></symbol>
+  <symbol id="i-level" viewBox="0 0 16 16"><g fill="currentColor"><rect x="2.4" y="9" width="2.4" height="5"/><rect x="6.8" y="5" width="2.4" height="9"/><rect x="11.2" y="2" width="2.4" height="12"/></g></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6.8" cy="6.8" r="4.2"/><line x1="10.1" y1="10.1" x2="14" y2="14"/></g></symbol>
+</defs></svg>
+
+<div id="app">
+  <header class="chrome">
+    <div class="brand">
+      <span class="mark"><svg width="12" height="12"><use href="#i-hoard"/></svg></span>
+      <span class="name">HOARD</span>
+      <span class="ver" id="ver">0.1</span>
+    </div>
+    <span class="sep"></span>
+    <div class="statusbox">
+      <span class="meter idle" id="meter"><i></i><i></i><i></i><i></i></span>
+      <span class="label" id="status-label">Ready</span>
+      <span class="meta" id="status-meta"></span>
+      <span class="track"><i id="status-bar" style="width:0%"></i></span>
+    </div>
+    <button class="btn" id="btn-rescan" title="Re-index every library folder">Rescan library</button>
+  </header>
+
+  <div class="body">
+    <nav class="sidebar" id="sidebar"></nav>
+    <main class="main">
+      <div class="titlebar" id="titlebar"></div>
+      <div class="pane" id="pane"></div>
+    </main>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<script src="app.js"></script>
+</body>
+</html>

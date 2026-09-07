@@ -304,7 +304,7 @@ def _print_plan(p, space):
     if p.get("playlist_deletes"):
         t.add_row("[red]playlists to remove[/]", f"{len(p['playlist_deletes']):,}")
     if p["missing_source"]:
-        t.add_row("[yellow]missing source files[/]", f"{len(p['missing_source']):,}")
+        t.add_row("[yellow]skipped sources[/]", f"{len(p['missing_source']):,}")
     t.add_row("free on card", human(space["free"]))
     t.add_row("needed", human(space["need"]))
     console.print(t)
@@ -328,9 +328,9 @@ def _print_plan(p, space):
             skip = f"  [yellow]{pl['skipped']} not in set[/]" if pl["skipped"] else ""
             console.print(f"  {pl['name']}  [dim]{len(pl['entries'])} entries[/]{skip}")
     if p["missing_source"]:
-        console.print("\n[yellow]source files that have gone missing[/]")
+        console.print("\n[yellow]skipped - not usable as a source[/]")
         for m in p["missing_source"][:10]:
-            console.print(f"  ? {m['track']['path']}")
+            console.print(f"  [dim]{m['why']:12}[/] {m['track']['path']}")
 
     if not space["fits"]:
         console.print(f"\n[bold red]will not fit[/] - short by "
@@ -478,6 +478,24 @@ def doctor_cmd(ctx, directory):
             "appended instead of replacing. Hoard rewrites playlists in "
             "place, so syncing with it once will collapse them back."
         )
+
+
+@cli.command("gui")
+@click.option("--port", default=7777, show_default=True)
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--no-browser", is_flag=True, help="Do not open a browser window.")
+@click.pass_context
+def gui_cmd(ctx, port, host, no_browser):
+    """Open the desktop interface in a browser."""
+    try:
+        from .server import serve
+    except ImportError:
+        raise click.ClickException(
+            "the interface needs Flask: pip install flask")
+    console.print(f"[green]Hoard[/] running at http://{host}:{port}/  "
+                  f"[dim](ctrl-c to stop)[/]")
+    serve(db_path=ctx.obj["db_path"], host=host, port=port,
+          open_browser=not no_browser)
 
 
 def main():
