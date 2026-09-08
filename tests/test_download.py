@@ -24,7 +24,9 @@ FAKE = '''
 import os, sys
 args = sys.argv[1:]
 out = args[args.index("-o") + 1]
-root = out.split("%(")[0]
+paths = [args[i + 1] for i, a in enumerate(args) if a == "-P"]
+home = next((p[len("home:"):] for p in paths if p.startswith("home:")), "")
+root = os.path.join(home, out.split("%(")[0])
 names = [n for n in os.environ.get("LZ_FAKE_FILES", "").split(";") if n]
 archive = None
 if "--download-archive" in args:
@@ -289,14 +291,69 @@ class DownloadTests(unittest.TestCase):
 
     def test_the_command_keeps_files_inside_the_library(self):
         args = download.build_args(self.cfg(), ["u"], self.root)
+        # The template stays relative: yt-dlp ignores --paths entirely when
+        # the output template is absolute, which would put the part files
+        # beside the finished audio instead of out of the scanner's way.
         out = args[args.index("-o") + 1]
-        self.assertTrue(out.startswith(self.root))
+        self.assertFalse(os.path.isabs(out))
+        paths = [args[i + 1] for i, a in enumerate(args) if a == "-P"]
+        self.assertIn("home:" + self.root, paths)
+        self.assertTrue(any(p.startswith("temp:")
+                            and download.INCOMPLETE_DIR in p for p in paths))
         # A user's own yt-dlp.conf must not redirect the output.
         self.assertIn("--ignore-config", args)
-        # Part files land somewhere the scanner ignores.
-        temp = args[args.index("-P") + 1]
-        self.assertIn(download.INCOMPLETE_DIR, temp)
         self.assertEqual(args[-1], "u")
+
+    # --------------------------------------------------- javascript runtime
+
+    def test_extra_js_runtimes_are_enabled_when_yt_dlp_knows_the_option(self):
+        """YouTube needs a JS runtime, and yt-dlp enables only deno itself.
+
+        Lemon Zest passes --ignore-config, so a user with Node but no Deno
+        cannot fix this in their own yt-dlp.conf. It has to happen here.
+        """
+        key = (tuple(download.ytdlp_command()), "--js-runtimes")
+        download._OPTION_SUPPORT[key] = True
+        args = download.build_args(self.cfg(), ["u"], self.root)
+        pairs = [(args[i], args[i + 1]) for i, a in enumerate(args)
+                 if a == "--js-runtimes"]
+        self.assertEqual([p[1] for p in pairs], ["node", "bun", "quickjs"])
+
+    def test_an_older_yt_dlp_is_not_handed_an_option_it_lacks(self):
+        key = (tuple(download.ytdlp_command()), "--js-runtimes")
+        download._OPTION_SUPPORT[key] = False
+        args = download.build_args(self.cfg(), ["u"], self.root)
+        self.assertNotIn("--js-runtimes", args)
+
+    def test_runtimes_can_be_turned_off(self):
+        key = (tuple(download.ytdlp_command()), "--js-runtimes")
+        download._OPTION_SUPPORT[key] = True
+        args = download.build_args(self.cfg(js_runtimes=""), ["u"], self.root)
+        self.assertNotIn("--js-runtimes", args)
+
+    def test_the_runtime_yt_dlp_would_pick_is_reported(self):
+        real = download.shutil.which
+        download.shutil.which = lambda n: (r"C:/bin/node.exe"
+                                           if n == "node" else None)
+        try:
+            status = download.js_runtime_status(self.cfg())
+            self.assertEqual(status["chosen"]["name"], "node")
+            # Deno is enabled whatever the config says, being yt-dlp's own
+            # default, so its absence must not be reported as a choice.
+            self.assertIn("deno", status["enabled"])
+            status = download.js_runtime_status(self.cfg(js_runtimes=""))
+            self.assertIsNone(status["chosen"])
+            self.assertIn("not enabled", status["detail"])
+        finally:
+            download.shutil.which = real
+
+    def test_a_missing_runtime_is_named_as_the_cause(self):
+        hint = download.explain(
+            "ERROR: [youtube] abc: The page needs to be reloaded.")
+        self.assertIn("JavaScript runtime", hint)
+        self.assertIn("Deno", hint)
+        self.assertIn("JavaScript runtime",
+                      download.explain("WARNING: n challenge solving failed"))
 
     def test_config_round_trips(self):
         download.set_config(self.con, cookies_mode="firefox",

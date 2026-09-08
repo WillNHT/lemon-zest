@@ -184,6 +184,9 @@ def download_cmd(ctx, urls, root, playlist_name, audio_format, audio_quality,
     status = dl_mod.cookie_status(cfg)
     colour = "green" if status["source"] != "none" else "yellow"
     console.print(f"[{colour}]cookies:[/] {status['detail']}")
+    js = dl_mod.js_runtime_status(cfg)
+    console.print(f"[{'green' if js['chosen'] else 'yellow'}]javascript:[/] "
+                  f"{js['detail']}")
 
     if info:
         for url in urls:
@@ -271,15 +274,20 @@ def download_cmd(ctx, urls, root, playlist_name, audio_format, audio_quality,
               help="yt-dlp output template, relative to the download folder.")
 @click.option("--format", "audio_format", default=None)
 @click.option("--quality", "audio_quality", default=None)
+@click.option("--js-runtimes", "js_runtimes", default=None,
+              help="JavaScript runtimes to enable beyond yt-dlp's own "
+                   "default of deno, comma separated. YouTube needs one to "
+                   "hand over a playable format.")
 @click.pass_context
 def download_config(ctx, cookies, firefox_profile, root, output, audio_format,
-                    audio_quality):
+                    audio_quality, js_runtimes):
     """Show or change how downloads are fetched."""
     con = _con(ctx)
     changes = _cookie_overrides(cookies, firefox_profile)
     changes.update({"root": root, "output": output,
                     "audio_format": audio_format,
-                    "audio_quality": audio_quality})
+                    "audio_quality": audio_quality,
+                    "js_runtimes": js_runtimes})
     changes = {k: v for k, v in changes.items() if v is not None}
     cfg = dl_mod.set_config(con, **changes) if changes else dl_mod.get_config(con)
 
@@ -289,9 +297,16 @@ def download_config(ctx, cookies, firefox_profile, root, output, audio_format,
     t.add_column("")
     t.add_row("yt-dlp", version or "[red]not installed[/]")
     for key in ("cookies_mode", "firefox_profile", "cookies_file", "root",
-                "output", "audio_format", "audio_quality"):
+                "output", "audio_format", "audio_quality", "js_runtimes"):
         t.add_row(key, str(cfg[key] or "-"))
     console.print(t)
+
+    js = dl_mod.js_runtime_status(cfg)
+    console.print()
+    console.print(f"[{'green' if js['chosen'] else 'yellow'}]{js['detail']}[/]")
+    if js["found"]:
+        for r in js["found"]:
+            console.print(f"  {r['name']}  [dim]{r['path']}[/]")
 
     status = dl_mod.cookie_status(cfg)
     colour = "green" if status["source"] != "none" else "yellow"

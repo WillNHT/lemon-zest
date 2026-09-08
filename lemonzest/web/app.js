@@ -615,6 +615,7 @@ function renderDownload() {
   const d = S.dl;
   if (!d) return '<div class="empty"><span class="spin"></span></div>';
   const cfg = d.config, ck = d.cookies;
+  const js = d.js_runtime || { found: [], chosen: null, detail: '' };
   const job = S.job && S.job.kind === 'download' ? S.job : null;
   const res = S.dlResult;
   const failed = !!(job && job.state === 'failed');
@@ -754,6 +755,34 @@ function renderDownload() {
         <p class="muted">Lemon Zest never copies the cookie database; yt-dlp
           reads it directly when a download runs. Close Firefox first if it
           refuses to read the profile.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <header><h3>JavaScript runtime</h3>
+        ${js.chosen ? `<span class="tag ok">${h(js.chosen.name.toUpperCase())}</span>`
+          : '<span class="tag warn">MISSING</span>'}
+        <span class="muted">YouTube signs its media URLs with a challenge that
+          has to be run; without a runtime, every video fails.</span></header>
+      <div class="in stack">
+        <p class="muted">${h(js.detail)}</p>
+        ${js.found.length ? `<table class="tbl"><tbody>${js.found.map(r => `<tr>
+          <td>${h(r.name)}${js.chosen && js.chosen.name === r.name
+            ? ' <span class="tag ok">in use</span>' : ''}</td>
+          <td class="mono clip pick" title="${h(r.path)}">${h(r.path)}</td>
+        </tr>`).join('')}</tbody></table>`
+        : `<div class="notice bad">${icon('i-warn')}<div>None installed.
+            Install <span class="mono">Deno</span> (deno.com) or
+            <span class="mono">Node</span>, then reload this page.</div></div>`}
+        <form id="dl-runtime-form" class="hstack">
+          <label class="muted">Enable</label>
+          <input name="js_runtimes" value="${h(cfg.js_runtimes)}"
+            placeholder="node,bun,quickjs"
+            style="${field};flex:1 1 12em;min-width:0;font-family:var(--mono)">
+          <button class="btn" type="submit">Save</button>
+        </form>
+        <span class="faint">yt-dlp enables deno on its own; these are the
+          others Lemon Zest enables alongside it. Deno wins when installed.</span>
       </div>
     </div>
 
@@ -1190,7 +1219,8 @@ document.addEventListener('submit', (ev) => {
       });
     });
   }
-  if (f.id === 'dl-cookie-form' || f.id === 'dl-output-form') {
+  if (f.id === 'dl-cookie-form' || f.id === 'dl-output-form'
+      || f.id === 'dl-runtime-form') {
     const body = {};
     for (const el of f.elements) if (el.name) body[el.name] = el.value;
     return guard(async () => { S.dl = await api('/download/config', {

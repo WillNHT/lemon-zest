@@ -306,6 +306,7 @@ def create_app(db_path=None):
         return {
             "config": cfg,
             "ytdlp": dl_mod.ytdlp_version(),
+            "js_runtime": dl_mod.js_runtime_status(cfg),
             "cookies": {
                 "mode": status["mode"], "source": status["source"],
                 "detail": status["detail"],
