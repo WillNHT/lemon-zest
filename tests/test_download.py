@@ -40,6 +40,7 @@ if archive and os.path.exists(archive):
     seen = set(open(archive, encoding="utf-8").read().splitlines())
 for name in names:
     if name in seen:
+        print("[download] " + name + " has already been recorded in the archive")
         continue
     path = os.path.join(root, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -171,6 +172,47 @@ class DownloadTests(unittest.TestCase):
         self.assertIn("output", kinds)
         self.assertTrue(any("something worth reading" in d
                             for k, d in seen if k == "output"))
+
+    def test_a_resumed_run_catalogs_what_an_earlier_one_left_behind(self):
+        """Indexing happens after yt-dlp exits, so an interrupted run leaves
+        audio on disk, a line in the archive, and no catalog row. The next
+        run skips those files and does not name them, so only a rescan can
+        find them - without it they stay invisible for good."""
+        # An earlier run: the file and the archive line, but no catalog row.
+        name = "Ghost/Album/Left Behind.m4a"
+        path = os.path.join(self.root, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\0" * 2048)
+        with open(os.path.join(self.root, download.ARCHIVE_NAME), "a",
+                  encoding="utf-8") as fh:
+            fh.write(name + "\n")
+        self.assertEqual(
+            self.con.execute("SELECT COUNT(*) FROM track").fetchone()[0], 0)
+
+        os.environ["LZ_FAKE_FILES"] = name + ";New/Album/Fresh.m4a"
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root, cfg=self.cfg())
+        self.assertEqual(summary["downloaded"], 1)   # only the new one
+        self.assertEqual(summary["skipped"], 1)
+        paths = [r["rel_path"] for r in
+                 self.con.execute("SELECT rel_path FROM track ORDER BY rel_path")]
+        self.assertIn(name, paths)
+        self.assertIn("New/Album/Fresh.m4a", paths)
+        self.assertTrue(any("rescan" in l for l in summary["log"]))
+
+    def test_a_video_id_is_read_out_of_whatever_shape_the_url_has(self):
+        self.assertEqual(
+            download.video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            "dQw4w9WgXcQ")
+        self.assertEqual(
+            download.video_id("https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=X"),
+            "dQw4w9WgXcQ")
+        self.assertEqual(download.video_id("https://youtu.be/dQw4w9WgXcQ"),
+                         "dQw4w9WgXcQ")
+        self.assertEqual(download.video_id("dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertIsNone(download.video_id("not a video"))
+        self.assertIsNone(download.video_id(""))
 
     def test_progress_is_reported(self):
         events = []
