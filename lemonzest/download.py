@@ -54,6 +54,18 @@ ARCHIVE_NAME = ".lemon-zest-downloads.txt"
 # runs mid-download never indexes a half-written file.
 INCOMPLETE_DIR = ".lz-incomplete"
 
+# YouTube signs its media URLs with a challenge that has to be executed, so
+# yt-dlp needs a JavaScript runtime to get a playable format at all. It
+# enables only Deno by default and treats the rest as opt-in, which means a
+# machine with Node but no Deno fails every video with "The page needs to be
+# reloaded". Lemon Zest passes --ignore-config, so the user cannot fix that
+# in their own yt-dlp.conf; enabling the others here is the only place it
+# can be done. Deno keeps its priority when it is installed, so this changes
+# nothing on a machine that already worked.
+EXTRA_JS_RUNTIMES = "node,bun,quickjs"
+# Highest priority first, which is the order yt-dlp itself picks in.
+JS_RUNTIMES = ("deno", "node", "bun", "quickjs")
+
 CONFIG_DEFAULTS = {
     "cookies_mode": "auto",     # auto | firefox | file | none
     "cookies_file": "",
@@ -62,6 +74,7 @@ CONFIG_DEFAULTS = {
     "output": DEFAULT_OUTPUT,
     "audio_format": "m4a",
     "audio_quality": "0",       # 0 is yt-dlp's best
+    "js_runtimes": EXTRA_JS_RUNTIMES,   # blank leaves yt-dlp's deno-only default
 }
 _PREFIX = "download."
 
@@ -140,6 +153,60 @@ def ytdlp_version():
     except Exception:
         return None
     return out.stdout.strip() or None
+
+
+_OPTION_SUPPORT = {}
+
+
+def supports_option(flag):
+    """Whether the installed yt-dlp knows an option.
+
+    Asked once per option per interpreter, off ``--help``, because passing
+    an option an older yt-dlp does not know is not a degraded download but
+    an immediate usage error - and this project would rather work with the
+    yt-dlp that is installed than pin a version.
+    """
+    cmd = ytdlp_command()
+    key = (tuple(cmd or ()), flag)
+    if key in _OPTION_SUPPORT:
+        return _OPTION_SUPPORT[key]
+    ok = False
+    if cmd:
+        try:
+            res = subprocess.run(cmd + ["--help"], capture_output=True,
+                                 text=True, timeout=60, encoding="utf-8",
+                                 errors="replace")
+            ok = flag in (res.stdout or "")
+        except Exception:
+            ok = False
+    _OPTION_SUPPORT[key] = ok
+    return ok
+
+
+def js_runtime_status(cfg=None):
+    """Which JavaScript runtime a download would use, and what is installed.
+
+    Reported next to the cookie source, for the same reason: without one,
+    every YouTube video fails, and the failure says nothing about why.
+    """
+    enabled = {"deno"}   # yt-dlp's own default, whatever Lemon Zest passes
+    for name in ((cfg or {}).get("js_runtimes") or "").replace(" ", ",").split(","):
+        if name.strip():
+            enabled.add(name.strip().lower())
+    found = [{"name": n, "path": norm(shutil.which(n))}
+             for n in JS_RUNTIMES if shutil.which(n)]
+    usable = [f for f in found if f["name"] in enabled]
+    chosen = usable[0] if usable else None
+    if chosen:
+        detail = "solving YouTube's JS challenges with " + chosen["name"]
+    elif found:
+        detail = ("%s is installed but not enabled here; enable it under "
+                  "JavaScript runtimes." % found[0]["name"])
+    else:
+        detail = ("no JavaScript runtime found. YouTube needs one to hand "
+                  "over a playable format - install Deno, or Node.")
+    return {"found": found, "chosen": chosen, "detail": detail,
+            "enabled": sorted(enabled)}
 
 
 def _child_env():
@@ -285,7 +352,12 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         "--no-overwrites",
         "--newline",
         "--no-abort-on-error",   # one dead video must not kill a playlist
-        "-o", os.path.join(root, output),
+        # The template stays relative and the folder is given with -P:
+        # yt-dlp ignores every --paths when the output template is itself
+        # absolute, which silently put the part files next to the finished
+        # audio - where a scan running mid-download would index them.
+        "-o", output,
+        "-P", "home:" + root,
         "-P", "temp:" + os.path.join(root, INCOMPLETE_DIR),
         "--progress-template",
         ("download:" + PROGRESS_PREFIX
@@ -301,6 +373,11 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         args += ["--download-archive", os.path.join(root, ARCHIVE_NAME)]
     if no_playlist:
         args.append("--no-playlist")
+    runtimes = (cfg.get("js_runtimes") or "").replace(" ", ",").split(",")
+    if any(r.strip() for r in runtimes) and supports_option("--js-runtimes"):
+        for name in runtimes:
+            if name.strip():
+                args += ["--js-runtimes", name.strip()]
     args += cookie_args(cfg)
     return args + list(urls)
 
@@ -321,6 +398,16 @@ _HINTS = (
      "has joined the channel."),
     (re.compile(r"private video|video unavailable", re.I),
      "The video is private or unavailable."),
+    # YouTube signs its media URLs with a challenge that has to be run.
+    # Without a runtime to run it in, yt-dlp gets no playable format and
+    # says "The page needs to be reloaded", which explains nothing.
+    (re.compile(r"page needs to be reloaded|signature solving failed"
+                r"|n challenge solving failed|javascript runtime"
+                r"|challenge solver", re.I),
+     "YouTube needs a JavaScript runtime to hand over a playable format, "
+     "and none of the ones enabled here is installed. Install Deno "
+     "(https://deno.com) or Node, then try again - Lemon Zest already "
+     "enables node, bun and quickjs alongside yt-dlp's own default of deno."),
     (re.compile(r"ffmpeg|ffprobe", re.I),
      "yt-dlp needs ffmpeg to extract audio. Install ffmpeg and put it on PATH."),
     (re.compile(r"could not copy .{0,40}cookie|permission denied.{0,40}cookies",
@@ -352,6 +439,8 @@ def probe(url, cfg, timeout=120):
             "yt-dlp is not installed. Install it with: pip install yt-dlp")
     args = (list(base) + ["--ignore-config", "-J", "--flat-playlist",
                           "--no-warnings"] + cookie_args(cfg) + [url])
+    # Listing a playlist needs no format, so no JS challenge is solved here;
+    # the runtime only matters once something is downloaded.
     try:
         res = subprocess.run(args, capture_output=True, text=True,
                              encoding="utf-8", errors="replace",
