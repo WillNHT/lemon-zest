@@ -13,6 +13,11 @@ Rules this module keeps:
     duplication that had grown a 101-track playlist to 1,817 lines. They
     are written under the device's own filename template, so the rewrite
     lands on the file the player is actually reading.
+  * Every destination is resolved to its on-disk spelling before it is
+    written. A card holding NFD filenames and a plan holding NFC ones
+    name the same file to a reader and two different files to the
+    filesystem, so writing the unresolved path replaces nothing and
+    leaves a second copy beside the first.
   * Deletions are checked against the plan again at execution time.
 """
 import os
@@ -21,7 +26,7 @@ import time
 from . import playlists as pl_mod
 from .db import log
 from .devices import PROFILES, free_space
-from .paths import norm
+from .paths import norm, resolve_existing
 
 COPY_CHUNK = 4 * 1024 * 1024
 
@@ -36,8 +41,22 @@ def _inside(root, path):
     return os.path.commonpath([root_abs, path_abs]) == root_abs
 
 
+def _on_disk(path):
+    """The spelling this path already has on the card, if it has one.
+
+    Unicode normalisation is not cosmetic here. The catalog and the plan
+    speak NFC; a card written by some other tool may hold the same name in
+    NFD. The two compare equal to a human and to any normalising compare,
+    but they are different filenames to the filesystem - so writing the
+    NFC path creates a second file and replaces nothing. Every write
+    resolves through this first.
+    """
+    return resolve_existing(path) or path
+
+
 def _copy_one(src, dst, expect_size=None):
     """Copy with a temp name and an atomic rename. Returns bytes written."""
+    dst = _on_disk(dst)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     tmp = dst + ".lz-tmp"
     written = 0
@@ -133,7 +152,7 @@ def execute(con, plan, prune=False, on_event=None, dry_run=False):
 
     # ---- deletions -----------------------------------------------------
     for d in plan["deletes"]:
-        dst = os.path.join(music_root, d["rel"].replace("/", os.sep))
+        dst = _on_disk(os.path.join(music_root, d["rel"].replace("/", os.sep)))
         if not _inside(root, dst):
             summary["errors"].append(f"refused delete outside device: {d['rel']}")
             continue
@@ -162,7 +181,7 @@ def execute(con, plan, prune=False, on_event=None, dry_run=False):
     # Remove playlist files this plan no longer includes, before writing
     # the current ones - an unticked playlist should not linger on the card.
     for pd in plan.get("playlist_deletes", []):
-        stale = os.path.join(pl_root, pd["filename"])
+        stale = _on_disk(os.path.join(pl_root, pd["filename"]))
         if not _inside(root, stale):
             continue
         try:
@@ -183,7 +202,7 @@ def execute(con, plan, prune=False, on_event=None, dry_run=False):
     for p in plan["playlists"]:
         fname = p.get("filename") or pl_mod.filename_for(
             p["name"], pl_mod.template_of(device))
-        dst = os.path.join(pl_root, fname)
+        dst = _on_disk(os.path.join(pl_root, fname))
         if not _inside(root, dst):
             summary["errors"].append(f"refused playlist outside device: {fname}")
             continue
