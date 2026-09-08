@@ -1,4 +1,4 @@
-# Hoard
+# Lemon Zest
 
 Sync a local music library to portable players — DAPs, Rockboxed players,
 plain USB drives — where each device keeps its own independent set.
@@ -15,7 +15,7 @@ syncs. `chill` was 101 tracks stored as 1,817 lines; across 23 playlists,
 again instead of replacing it.
 
 ```
-hoard doctor "C:/Users/ASUS/Music/hiby/Music"
+lemon-zest doctor "C:/Users/ASUS/Music/hiby/Music"
 ```
 
 ```
@@ -23,7 +23,7 @@ hoard doctor "C:/Users/ASUS/Music/hiby/Music"
 these playlists have grown 17.9x - each sync appended instead of replacing.
 ```
 
-Hoard rewrites playlists in place, so syncing once collapses them back.
+Lemon Zest rewrites playlists in place, so syncing once collapses them back.
 
 ## Install
 
@@ -37,40 +37,40 @@ pip install -e .
 Or run it without installing:
 
 ```bash
-python hoard-cli.py --help
+python lemon-zest.py --help
 ```
 
 ## Use
 
 ```bash
 # 1. Index the library. Read-only; it never touches your music files.
-hoard scan "C:/Users/ASUS/Music/hiby/Music"
+lemon-zest scan "C:/Users/ASUS/Music/hiby/Music"
 
 # 2. Import playlists. Run this for each folder that has them - the second
 #    import enriches the first rather than overwriting it, so the copies
 #    that resolve and the copies that carry Apple Music URIs both count.
-hoard playlist import "C:/Users/ASUS/Music/hiby/playlist_data"
-hoard playlist import "C:/Users/ASUS/Music/hiby/playlist_data/Playlists_hiby"
+lemon-zest playlist import "C:/Users/ASUS/Music/hiby/playlist_data"
+lemon-zest playlist import "C:/Users/ASUS/Music/hiby/playlist_data/Playlists_hiby"
 
 # 3. Pair the card.
-hoard device detect
-hoard device add E:/ --name "HiBy R1" --profile hiby
+lemon-zest device detect
+lemon-zest device add E:/ --name "HiBy R1" --profile hiby
 
 # 4. Say what goes on it.
-hoard device set "HiBy R1" --playlist chill --playlist angsty --artist Radiohead
+lemon-zest device set "HiBy R1" --playlist chill --playlist angsty --artist Radiohead
 
 # 5. Look before you leap, then sync.
-hoard plan "HiBy R1"
-hoard sync "HiBy R1"
+lemon-zest plan "HiBy R1"
+lemon-zest sync "HiBy R1"
 ```
 
-Other commands: `hoard stats`, `hoard device list`, `hoard playlist list`,
-`hoard playlist unmatched`, `hoard log`, `hoard doctor <folder>`.
+Other commands: `lemon-zest stats`, `lemon-zest device list`, `lemon-zest playlist list`,
+`lemon-zest playlist unmatched`, `lemon-zest log`, `lemon-zest doctor <folder>`.
 
 ## The interface
 
 ```bash
-hoard gui
+lemon-zest gui
 ```
 
 Opens `http://127.0.0.1:7777` in your browser. Everything above is there:
@@ -85,7 +85,7 @@ sync keeps going if you reload the page, and the catalog stays readable
 while it writes (SQLite in WAL mode).
 
 **Needs attention** collects everything worth a second look in one place:
-empty files (zero bytes on disk - failed downloads, which Hoard refuses to
+empty files (zero bytes on disk - failed downloads, which Lemon Zest refuses to
 copy rather than putting dead entries on the card), untagged files, and
 playlist entries that resolve to nothing.
 
@@ -142,7 +142,7 @@ easiest part to test, which is why it was built first.
 
 ### Device identity
 
-A device is matched by **volume label**, with a `.hoard-id` marker file at
+A device is matched by **volume label**, with a `.lemon-zest-id` marker file at
 the card root as the tiebreaker. That is enough for a personal fleet and
 needs no native USB APIs. Give each card a distinct label; the marker keeps
 two cards apart even when the labels collide.

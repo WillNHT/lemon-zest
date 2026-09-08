@@ -121,7 +121,7 @@ def write(path, name, rows, source_uri=None, encode_paths=False):
 
     body = "\r\n".join(lines) + "\r\n"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".hoard-tmp"
+    tmp = path + ".lz-tmp"
     with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(body)
         fh.flush()

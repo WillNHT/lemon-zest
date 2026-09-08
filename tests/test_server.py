@@ -10,8 +10,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hoard import db, devices, playlists, scan  # noqa: E402
-from hoard.server import create_app  # noqa: E402
+from lemonzest import db, devices, playlists, scan  # noqa: E402
+from lemonzest.server import create_app  # noqa: E402
 
 from test_sync import FFMPEG, make_mp3  # noqa: E402
 
@@ -20,7 +20,7 @@ class ServerTests(unittest.TestCase):
     def setUp(self):
         if not FFMPEG:
             self.skipTest("ffmpeg is needed to generate test audio")
-        self.tmp = tempfile.mkdtemp(prefix="hoard-srv-")
+        self.tmp = tempfile.mkdtemp(prefix="lz-srv-")
         self.lib = os.path.join(self.tmp, "library")
         self.card = os.path.join(self.tmp, "card")
         os.makedirs(self.card)
@@ -36,7 +36,7 @@ class ServerTests(unittest.TestCase):
         empty = os.path.join(self.lib, "Alpha", "Album", "04 Broken.mp3")
         open(empty, "wb").close()
 
-        self.db_path = os.path.join(self.tmp, "hoard.db")
+        self.db_path = os.path.join(self.tmp, "lemon-zest.db")
         con = db.connect(self.db_path)
         scan.scan(con, self.lib)
 

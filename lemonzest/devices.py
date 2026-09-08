@@ -5,9 +5,13 @@ Identity is the volume label, with a marker file as the tiebreaker.
 A personal fleet does not need USB descriptors. The label is what the
 operating system already hands us in an ordinary mount listing, on every
 platform, with no native API. Its one weakness is that two cards can share a
-name (FAT32 formats to "NO NAME" by default), so on first pair Hoard writes
-a .hoard-id file holding a generated UUID at the device root. The label is
-the everyday lookup; the marker file settles ties and survives a relabel.
+name (FAT32 formats to "NO NAME" by default), so on first pair Lemon Zest writes
+a .lemon-zest-id file holding a generated UUID at the device root. The label
+is the everyday lookup; the marker file settles ties and survives a relabel.
+
+Cards paired before the rename carry a .hoard-id instead. That file is still
+read, and the id inside it is kept, so a rename never re-pairs a card or
+re-copies its contents.
 """
 import ctypes
 import json
@@ -19,7 +23,8 @@ import psutil
 
 from .paths import norm
 
-MARKER = ".hoard-id"
+MARKER = ".lemon-zest-id"
+LEGACY_MARKER = ".hoard-id"
 
 # Profiles describe what a player will accept. Only the two the MVP supports
 # are defined; the shape is ready for more.
@@ -96,25 +101,39 @@ def list_volumes(removable_only=True):
             "total": usage.total,
             "free": usage.free,
             "removable": removable,
-            "hoard_id": read_marker(mp),
+            "device_uid": read_marker(mp),
         })
     return out
 
 
-def read_marker(root):
-    """Return the hoard id stored at a device root, or None."""
-    path = os.path.join(root, MARKER)
+def _read_one(path):
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh).get("hoard_id")
+            payload = json.load(fh)
     except Exception:
         return None
+    return payload.get("device_uid") or payload.get("hoard_id")
 
 
-def write_marker(root, hoard_id, name=None):
-    """Write the marker file that settles duplicate labels."""
+def read_marker(root):
+    """Return the device id stored at a device root, or None.
+
+    The current marker wins; the pre-rename one is the fallback, so a card
+    paired under the old name is recognised untouched.
+    """
+    return (_read_one(os.path.join(root, MARKER))
+            or _read_one(os.path.join(root, LEGACY_MARKER)))
+
+
+def write_marker(root, device_uid, name=None):
+    """Write the marker file that settles duplicate labels.
+
+    Retires a pre-rename marker once the new one is safely in place, and
+    only when it holds the same id - two markers disagreeing about which
+    device this is would be worse than one stale file.
+    """
     path = os.path.join(root, MARKER)
-    payload = {"hoard_id": hoard_id, "name": name,
+    payload = {"device_uid": device_uid, "name": name,
                "written_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -122,7 +141,13 @@ def write_marker(root, hoard_id, name=None):
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
-    return hoard_id
+    legacy = os.path.join(root, LEGACY_MARKER)
+    if os.path.exists(legacy) and _read_one(legacy) == device_uid:
+        try:
+            os.remove(legacy)
+        except OSError:
+            pass
+    return device_uid
 
 
 def register(con, root, name=None, profile="ums", label=None):
@@ -134,35 +159,35 @@ def register(con, root, name=None, profile="ums", label=None):
         raise ValueError("unknown profile: " + profile)
     spec = PROFILES[profile]
 
-    hoard_id = read_marker(root) or str(uuid.uuid4())
+    device_uid = read_marker(root) or str(uuid.uuid4())
     if label is None:
         label = _label_for(root)
     name = name or label or os.path.basename(root.rstrip("/")) or "Device"
-    write_marker(root, hoard_id, name)
+    write_marker(root, device_uid, name)
 
     now = time.time()
     con.execute(
-        "INSERT INTO device(hoard_id, label, name, root, profile, music_dir, "
+        "INSERT INTO device(device_uid, label, name, root, profile, music_dir, "
         "playlist_dir, created_at, last_seen) VALUES (?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(hoard_id) DO UPDATE SET label=excluded.label, "
+        "ON CONFLICT(device_uid) DO UPDATE SET label=excluded.label, "
         "name=excluded.name, root=excluded.root, profile=excluded.profile, "
         "music_dir=excluded.music_dir, playlist_dir=excluded.playlist_dir, "
         "last_seen=excluded.last_seen",
-        (hoard_id, label, name, root, profile, spec["music_dir"],
+        (device_uid, label, name, root, profile, spec["music_dir"],
          spec["playlist_dir"], now, now),
     )
     con.commit()
-    return con.execute("SELECT * FROM device WHERE hoard_id=?", (hoard_id,)).fetchone()
+    return con.execute("SELECT * FROM device WHERE device_uid=?", (device_uid,)).fetchone()
 
 
 def find(con, ref):
-    """Look a device up by name, label, hoard id or numeric id."""
+    """Look a device up by name, label, device id or numeric id."""
     row = None
     if str(ref).isdigit():
         row = con.execute("SELECT * FROM device WHERE id=?", (int(ref),)).fetchone()
     if row is None:
         row = con.execute(
-            "SELECT * FROM device WHERE hoard_id=? OR name=? OR label=? "
+            "SELECT * FROM device WHERE device_uid=? OR name=? OR label=? "
             "COLLATE NOCASE", (ref, ref, ref)
         ).fetchone()
     if row is None:
@@ -185,10 +210,10 @@ def locate(con, device):
     then falls back to the label. Returns a mount point or None.
     """
     root = device["root"]
-    if root and os.path.isdir(root) and read_marker(root) == device["hoard_id"]:
+    if root and os.path.isdir(root) and read_marker(root) == device["device_uid"]:
         return root
     for vol in list_volumes(removable_only=False):
-        if vol["hoard_id"] and vol["hoard_id"] == device["hoard_id"]:
+        if vol["device_uid"] and vol["device_uid"] == device["device_uid"]:
             return vol["mountpoint"]
     if device["label"]:
         for vol in list_volumes(removable_only=False):
