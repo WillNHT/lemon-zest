@@ -332,6 +332,38 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self._card_playlists(),
                          ["mix-Owner.m3u8", "mix.m3u8"])
 
+    def test_sync_replaces_a_differently_normalised_filename(self):
+        """The same name in NFD and NFC is one file to a reader, two to disk.
+
+        The card's playlists were written by the player, whose spelling of
+        a Vietnamese name need not match the catalog's. Everything that
+        compares normalises, so the plan correctly reports a replacement -
+        and then the writer opens the other byte sequence and leaves the
+        original sitting beside a clean copy. Caught on the real card,
+        where a sync turned 23 playlists into 46.
+        """
+        import unicodedata
+        owner = "Ti\u1ebfn"                      # precomposed
+        self._set_template("{name}-" + owner + ".m3u8")
+        music = os.path.join(self.card, "Music")
+        os.makedirs(music, exist_ok=True)
+        nfd = unicodedata.normalize("NFD", "mix-" + owner + ".m3u8")
+        theirs = os.path.join(music, nfd)
+        with open(theirs, "w", encoding="utf-8", newline="") as fh:
+            fh.write("#EXTM3U\r\n" + "Alpha/First/01 One.mp3\r\n" * 40)
+        # Precondition: the two spellings really are different filenames.
+        self.assertFalse(os.path.exists(
+            os.path.join(music, unicodedata.normalize("NFC", nfd))))
+
+        p = self._plan()
+        self.assertEqual(len(p["playlists"]), 1)
+        self.assertIsNotNone(p["playlists"][0]["replaces"])
+        self.assertEqual(p["playlist_strays"], [])
+
+        self._sync()
+        self.assertEqual(len(self._card_playlists()), 1)
+        self.assertEqual(len(playlists.read(theirs)["entries"]), 3)
+
     def test_detecting_the_template_from_the_card(self):
         files = ["chill-Owner.m3u8", "mix-Owner.m3u8", "unrelated.m3u8"]
         template, matched, total = playlists.infer_template(
