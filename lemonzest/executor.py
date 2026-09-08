@@ -10,7 +10,9 @@ Rules this module keeps:
   * The manifest row is written only after the rename succeeds, so a crash
     leaves the file to be recopied rather than recorded as done.
   * Playlists are always rewritten, never appended. This is the fix for the
-    duplication that had grown a 101-track playlist to 1,817 lines.
+    duplication that had grown a 101-track playlist to 1,817 lines. They
+    are written under the device's own filename template, so the rewrite
+    lands on the file the player is actually reading.
   * Deletions are checked against the plan again at execution time.
 """
 import os
@@ -179,7 +181,8 @@ def execute(con, plan, prune=False, on_event=None, dry_run=False):
             summary["errors"].append("playlist " + pd["filename"] + ": " + str(exc))
 
     for p in plan["playlists"]:
-        fname = p.get("filename") or pl_mod.safe_filename(p["name"])
+        fname = p.get("filename") or pl_mod.filename_for(
+            p["name"], pl_mod.template_of(device))
         dst = os.path.join(pl_root, fname)
         if not _inside(root, dst):
             summary["errors"].append(f"refused playlist outside device: {fname}")
