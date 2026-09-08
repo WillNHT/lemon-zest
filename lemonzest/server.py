@@ -392,12 +392,40 @@ def create_app(db_path=None):
                          "size": d_["size"]} for d_ in p["deletes"][:500]],
             "deletes_total": len(p["deletes"]),
             "playlists": [{"name": pl["name"], "entries": len(pl["entries"]),
-                           "skipped": pl["skipped"]} for pl in p["playlists"]],
+                           "skipped": pl["skipped"], "filename": pl["filename"],
+                           "replaces": pl.get("replaces")}
+                          for pl in p["playlists"]],
             "playlist_deletes": p.get("playlist_deletes", []),
+            "playlist_template": p.get("playlist_template"),
+            "playlist_strays": p.get("playlist_strays", []),
             "missing_source": [{"path": m["track"]["path"], "why": m["why"]}
                                for m in p["missing_source"][:50]],
             "missing_total": len(p["missing_source"]),
         })
+
+    @app.post("/api/devices/<int:did>/detect-playlists")
+    def device_detect_playlists(did):
+        """Adopt the naming the card's own playlist files already use.
+
+        Reads the card and writes one column. Declining to guess is a
+        result, not an error: a card whose playlists came from elsewhere
+        keeps the template it has.
+        """
+        c = con()
+        d, root, err = _device_and_root(c, did)
+        if err:
+            return err
+        pl_dir = (d["playlist_dir"] or "").strip("/")
+        pl_root = os.path.join(root, pl_dir) if pl_dir else root
+        files = playlists.list_playlist_files(pl_root)
+        names = [r["name"] for r in c.execute("SELECT name FROM playlist")]
+        template, matched, total = playlists.infer_template(files, names)
+        if template:
+            c.execute("UPDATE device SET playlist_template=? WHERE id=?",
+                      (template, did))
+            c.commit()
+        return jsonify({"template": template, "matched": matched,
+                        "total": total, "applied": bool(template)})
 
     @app.post("/api/devices/<int:did>/sync")
     def device_sync(did):
