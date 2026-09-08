@@ -5,6 +5,11 @@ description = "Sync a local music library to portable players"
 requires-python = ">=3.10"
 dependencies = ["mutagen>=1.45", "psutil>=5.9", "click>=8.1", "rich>=13.0", "flask>=3.0"]
 
+[project.optional-dependencies]
+# Downloading is optional: a yt-dlp already on PATH is used in preference to
+# this one, so an install without it still runs everything else.
+youtube = ["yt-dlp>=2024.8.6"]
+
 [project.scripts]
 lemon-zest = "lemonzest.cli:main"
 lz = "lemonzest.cli:main"

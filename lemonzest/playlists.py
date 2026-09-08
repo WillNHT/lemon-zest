@@ -223,6 +223,62 @@ def import_dir(con, directory, recursive=False):
     return results
 
 
+def append_tracks(con, name, track_ids, origin="local"):
+    """Add catalogued tracks to the end of a playlist, creating it if new.
+
+    This is the path a download takes: the file is already in the catalog,
+    so the entry is written by track id rather than by parsing a path back
+    out of a file. Tracks the playlist already holds are not added a second
+    time - the whole reason this project exists is a card whose playlists
+    had grown 17.9x by appending what was already there.
+
+    Returns a summary dict: the playlist name, its id, how many entries were
+    added and how many were already present.
+    """
+    name = norm_name(name)
+    if not name:
+        raise ValueError("a playlist needs a name")
+    con.execute(
+        "INSERT INTO playlist(name, origin, imported_at) VALUES (?,?,?) "
+        "ON CONFLICT(name) DO NOTHING",
+        (name, origin, time.time()),
+    )
+    pid = con.execute("SELECT id FROM playlist WHERE name=?", (name,)).fetchone()["id"]
+
+    have = {r["track_id"] for r in con.execute(
+        "SELECT track_id FROM playlist_entry WHERE playlist_id=?", (pid,))
+        if r["track_id"] is not None}
+    pos = con.execute(
+        "SELECT COALESCE(MAX(pos), -1) + 1 FROM playlist_entry WHERE playlist_id=?",
+        (pid,)).fetchone()[0]
+
+    added = skipped = 0
+    for tid in track_ids:
+        if tid in have:
+            skipped += 1
+            continue
+        t = con.execute(
+            "SELECT path, title, artist, duration, purl FROM track WHERE id=?",
+            (tid,)).fetchone()
+        if t is None:
+            skipped += 1
+            continue
+        title = t["title"] or os.path.splitext(os.path.basename(t["path"]))[0]
+        if t["artist"]:
+            title = f"{t['artist']} - {title}"
+        con.execute(
+            "INSERT INTO playlist_entry(playlist_id,pos,track_id,raw_path,"
+            "title_hint,duration,source_uri) VALUES (?,?,?,?,?,?,?)",
+            (pid, pos, tid, norm(t["path"]), title, t["duration"], t["purl"]),
+        )
+        have.add(tid)
+        pos += 1
+        added += 1
+    con.commit()
+    return {"name": name, "id": pid, "added": added, "skipped": skipped,
+            "entries": pos}
+
+
 DEFAULT_TEMPLATE = "{name}.m3u8"
 _PL_EXT = (".m3u8", ".m3u")
 

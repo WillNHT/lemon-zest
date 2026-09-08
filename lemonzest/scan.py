@@ -27,6 +27,61 @@ def walk_audio(root):
                 yield os.path.join(dirpath, fn)
 
 
+def _upsert(con, root, npath, rec, now):
+    """Write one probed file into the catalog."""
+    rel = norm(os.path.relpath(npath, root))
+    cols = ["path", "rel_path", "root", "seen_at"] + TRACK_FIELDS
+    vals = [npath, rel, root, now] + [rec[f] for f in TRACK_FIELDS]
+    placeholders = ",".join("?" * len(cols))
+    updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "path")
+    con.execute(
+        f"INSERT INTO track({','.join(cols)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(path) DO UPDATE SET {updates}",
+        vals,
+    )
+
+
+def index_paths(con, root, paths):
+    """Index a known handful of files without walking the library.
+
+    A download produces two or three files; finding them again by walking a
+    2,300-file library is work nobody asked for. Same probe, same columns,
+    same conflict handling as ``scan`` - only the set of files differs.
+
+    A file outside ``root`` is counted as failed rather than indexed: the
+    catalog stores a path relative to a library root, and a row claiming a
+    root that does not contain it would go stale on the next scan of that
+    root, which deletes what it did not find.
+
+    Returns ``(counts, track_ids)``, the ids in the order the files were
+    given, so a caller can put them straight into a playlist.
+    """
+    root = norm(os.path.abspath(root))
+    now = time.time()
+    counts = {"added": 0, "updated": 0, "failed": 0}
+    ids = []
+    for path in paths:
+        npath = norm(os.path.abspath(path))
+        if (not is_audio(npath) or not os.path.isfile(path)
+                or not npath.startswith(root.rstrip("/") + "/")):
+            counts["failed"] += 1
+            continue
+        existing = con.execute(
+            "SELECT id FROM track WHERE path=?", (npath,)).fetchone()
+        try:
+            rec = probe(path)
+        except Exception:
+            counts["failed"] += 1
+            continue
+        _upsert(con, root, npath, rec, now)
+        counts["updated" if existing else "added"] += 1
+        row = con.execute("SELECT id FROM track WHERE path=?", (npath,)).fetchone()
+        if row:
+            ids.append(row["id"])
+    con.commit()
+    return counts, ids
+
+
 def scan(con, root, workers=8, progress=None, full=False):
     """Index every audio file under ``root``.
 
@@ -74,16 +129,7 @@ def scan(con, root, workers=8, progress=None, full=False):
                 counts["unchanged"] += 1
                 con.execute("UPDATE track SET seen_at=? WHERE path=?", (now, npath))
             else:
-                rel = norm(os.path.relpath(npath, root))
-                cols = ["path", "rel_path", "root", "seen_at"] + TRACK_FIELDS
-                vals = [npath, rel, root, now] + [rec[f] for f in TRACK_FIELDS]
-                placeholders = ",".join("?" * len(cols))
-                updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "path")
-                con.execute(
-                    f"INSERT INTO track({','.join(cols)}) VALUES ({placeholders}) "
-                    f"ON CONFLICT(path) DO UPDATE SET {updates}",
-                    vals,
-                )
+                _upsert(con, root, npath, rec, now)
                 counts["added" if npath not in known else "updated"] += 1
             if progress and i % 25 == 0:
                 progress(i, len(files))

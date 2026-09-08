@@ -10,6 +10,7 @@ from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
 from rich.table import Table
 
 from . import devices as dev_mod
+from . import download as dl_mod
 from . import executor, planner, playlists, scan
 from .db import connect, default_db_path
 
@@ -45,6 +46,13 @@ def mb(n):
 
 def human(n):
     return gb(n) if n >= 2**30 else mb(n)
+
+
+def dur_text(seconds):
+    if not seconds:
+        return ""
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -111,6 +119,189 @@ def stats(ctx):
               f"{q('SELECT COUNT(*) FROM playlist_entry WHERE track_id IS NULL'):,}")
     t.add_row("devices", f"{q('SELECT COUNT(*) FROM device'):,}")
     console.print(t)
+
+
+# -------------------------------------------------------------- downloads
+
+def _cookie_overrides(cookies, firefox_profile):
+    """Turn --cookies/--firefox-profile into config overrides.
+
+    ``--cookies`` takes a mode or a path, because those are the two things
+    anyone actually wants to say, and a path is unambiguous: no mode looks
+    like one.
+    """
+    out = {}
+    if cookies:
+        value = cookies.strip()
+        if value.lower() in ("auto", "firefox", "none"):
+            out["cookies_mode"] = value.lower()
+        else:
+            out["cookies_mode"] = "file"
+            out["cookies_file"] = os.path.abspath(os.path.expanduser(value))
+    if firefox_profile:
+        out["firefox_profile"] = firefox_profile
+        out.setdefault("cookies_mode", "firefox")
+    return out
+
+
+@cli.command("download")
+@click.argument("urls", nargs=-1, required=True)
+@click.option("--to", "root", default=None,
+              help="Library folder to download into. Defaults to the busiest "
+                   "indexed folder.")
+@click.option("--playlist", "playlist_name", default=None,
+              help="Also add what arrives to this catalog playlist.")
+@click.option("--format", "audio_format", default=None,
+              help="Audio format to extract, e.g. m4a, mp3, opus.")
+@click.option("--quality", "audio_quality", default=None,
+              help="yt-dlp audio quality; 0 is best.")
+@click.option("--cookies", default=None,
+              help="auto, firefox, none, or the path to a cookies.txt.")
+@click.option("--firefox-profile", default=None,
+              help="Which Firefox profile to read cookies from.")
+@click.option("--no-playlist", "single", is_flag=True,
+              help="Fetch only the video, when the URL also names a playlist.")
+@click.option("--no-archive", is_flag=True,
+              help="Do not consult the download archive, so a URL already "
+                   "fetched is fetched again.")
+@click.option("--info", is_flag=True, help="Show what is at the URL and stop.")
+@click.pass_context
+def download_cmd(ctx, urls, root, playlist_name, audio_format, audio_quality,
+                 cookies, firefox_profile, single, no_archive, info):
+    """Download audio from YouTube into the library.
+
+    The file lands in a library folder and is indexed on the spot, so it is
+    ready to tick onto a device without a rescan.
+    """
+    con = _con(ctx)
+    cfg = dict(dl_mod.get_config(con))
+    cfg.update(_cookie_overrides(cookies, firefox_profile))
+
+    if not dl_mod.ytdlp_command():
+        raise click.ClickException(
+            "yt-dlp is not installed. Install it with: pip install yt-dlp")
+
+    status = dl_mod.cookie_status(cfg)
+    colour = "green" if status["source"] != "none" else "yellow"
+    console.print(f"[{colour}]cookies:[/] {status['detail']}")
+
+    if info:
+        for url in urls:
+            try:
+                got = dl_mod.probe(url, cfg)
+            except dl_mod.DownloadError as exc:
+                raise click.ClickException(str(exc))
+            head = f"[bold]{got['title']}[/]"
+            if got["uploader"]:
+                head += f"  [dim]{got['uploader']}[/]"
+            console.print(head)
+            if got["is_playlist"]:
+                console.print(f"  [dim]{got['count']} items[/]")
+                for e in got["entries"][:10]:
+                    console.print(f"    {e['title'] or ''}  "
+                                  f"[dim]{dur_text(e['duration'])}[/]")
+                if got["count"] > 10:
+                    console.print(f"    [dim]... {got['count'] - 10} more[/]")
+            else:
+                console.print(f"  [dim]{dur_text(got['duration'])}[/]")
+        return
+
+    with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"),
+                  BarColumn(), TextColumn("{task.percentage:>3.0f}%"),
+                  console=console) as prog:
+        task = prog.add_task("starting", total=1)
+        done_files = []
+
+        def on_event(kind, detail, done, total):
+            if kind == "progress":
+                prog.update(task, description=detail[:48],
+                            completed=done, total=max(total, done, 1))
+            elif kind == "file":
+                done_files.append(detail)
+                prog.update(task, description=os.path.basename(detail)[:48])
+            elif kind == "error":
+                prog.console.print(f"[red]{detail}[/]")
+            elif kind == "index":
+                prog.update(task, description="indexing " + detail,
+                            completed=1, total=1)
+
+        try:
+            summary = dl_mod.download(
+                con, list(urls), root=root, playlist=playlist_name, cfg=cfg,
+                on_event=on_event, no_playlist=single, archive=not no_archive,
+                audio_format=audio_format, audio_quality=audio_quality)
+        except dl_mod.DownloadError as exc:
+            raise click.ClickException(str(exc))
+
+    if not summary["downloaded"]:
+        console.print("[yellow]nothing new[/] - every URL was already in the "
+                      "download archive, or nothing could be fetched.")
+    else:
+        console.print(f"\n[green]{summary['downloaded']}[/] downloaded into "
+                      f"{summary['root']} - {summary['added']} added to the "
+                      f"catalog, {summary['updated']} updated")
+        for f in summary["files"][:10]:
+            console.print(f"  [green]+[/] {os.path.relpath(f, summary['root'])}")
+        if len(summary["files"]) > 10:
+            console.print(f"  [dim]... {len(summary['files']) - 10} more[/]")
+    if summary["failed_index"]:
+        console.print(f"[yellow]{summary['failed_index']}[/] of the files "
+                      "yt-dlp wrote could not be catalogued - the output "
+                      "template puts them outside the library folder.")
+    if summary["playlist"]:
+        p = summary["playlist"]
+        console.print(f"[cyan]playlist[/] {p['name']}: {p['added']} added"
+                      + (f", {p['skipped']} already there" if p["skipped"] else "")
+                      + f", {p['entries']} entries")
+    for e in summary["errors"]:
+        console.print(f"[red]{e}[/]")
+
+
+@cli.command("download-config")
+@click.option("--cookies", default=None,
+              help="auto, firefox, none, or the path to a cookies.txt.")
+@click.option("--firefox-profile", default=None,
+              help="Which Firefox profile to read cookies from.")
+@click.option("--to", "root", default=None, help="Default download folder.")
+@click.option("--output", default=None,
+              help="yt-dlp output template, relative to the download folder.")
+@click.option("--format", "audio_format", default=None)
+@click.option("--quality", "audio_quality", default=None)
+@click.pass_context
+def download_config(ctx, cookies, firefox_profile, root, output, audio_format,
+                    audio_quality):
+    """Show or change how downloads are fetched."""
+    con = _con(ctx)
+    changes = _cookie_overrides(cookies, firefox_profile)
+    changes.update({"root": root, "output": output,
+                    "audio_format": audio_format,
+                    "audio_quality": audio_quality})
+    changes = {k: v for k, v in changes.items() if v is not None}
+    cfg = dl_mod.set_config(con, **changes) if changes else dl_mod.get_config(con)
+
+    version = dl_mod.ytdlp_version()
+    t = Table(box=None, pad_edge=False)
+    t.add_column("", style="dim")
+    t.add_column("")
+    t.add_row("yt-dlp", version or "[red]not installed[/]")
+    for key in ("cookies_mode", "firefox_profile", "cookies_file", "root",
+                "output", "audio_format", "audio_quality"):
+        t.add_row(key, str(cfg[key] or "-"))
+    console.print(t)
+
+    status = dl_mod.cookie_status(cfg)
+    colour = "green" if status["source"] != "none" else "yellow"
+    console.print(f"\n[{colour}]{status['detail']}[/]")
+    if status["profiles"]:
+        console.print("\n[bold]Firefox profiles with cookies[/]")
+        for p in status["profiles"]:
+            mark = ("[green] <- in use[/]"
+                    if status["profile"] and p["path"] == status["profile"]["path"]
+                    else "")
+            console.print(f"  {p['name']}{mark}\n    [dim]{p['path']}[/]")
+    else:
+        console.print("[dim]no Firefox profile with a cookie database found "
+                      "on this machine.[/]")
 
 
 # -------------------------------------------------------------- playlists

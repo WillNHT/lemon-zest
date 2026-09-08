@@ -44,10 +44,18 @@ The binary is unsigned, so Windows SmartScreen will warn on first run;
 ### From source
 
 Needs Python 3.10+. `ffmpeg` is optional for now (the test suite uses it to
-generate audio; the MVP does no transcoding).
+generate audio; the MVP does no transcoding), but downloading needs it,
+because that is what extracts the audio.
 
 ```bash
 pip install -e .
+```
+
+Downloading from YouTube needs `yt-dlp`. A `yt-dlp` already on PATH is used
+in preference to anything bundled, so it can be upgraded on its own schedule:
+
+```bash
+pip install -e ".[youtube]"     # or: pip install yt-dlp
 ```
 
 Or run it without installing:
@@ -87,6 +95,58 @@ lemon-zest sync "HiBy R1"
 Other commands: `lemon-zest stats`, `lemon-zest device list`, `lemon-zest playlist list`,
 `lemon-zest playlist unmatched`, `lemon-zest log`, `lemon-zest doctor <folder>`.
 
+## Downloading from YouTube
+
+```bash
+# What is at this URL? Nothing is fetched.
+lemon-zest download "https://www.youtube.com/watch?v=..." --info
+
+# Fetch it into a library folder, and put it in a playlist while you are there.
+lemon-zest download "https://www.youtube.com/watch?v=..." --playlist chill
+
+# A playlist or channel URL fetches the lot.
+lemon-zest download "https://www.youtube.com/playlist?list=..." --to "C:/Users/ASUS/Music/hiby/Music"
+```
+
+The file lands **inside a library folder** and is indexed on the spot, so it
+is an ordinary library track immediately: tick it onto a card and sync,
+with no rescan in between. `--embed-metadata` writes the source URL into the
+`purl` tag, which the scanner already reads, so where a track came from
+survives in the catalog.
+
+Two things stop a second run re-fetching what you already have. yt-dlp keeps
+a download archive at `.lemon-zest-downloads.txt` in the folder (pass
+`--no-archive` to ignore it), and adding a track to a playlist it is already
+in does nothing — the same rule the sync obeys, for the same reason.
+
+### Cookies
+
+YouTube refuses a growing share of requests from a signed-out client: age
+gates, the "sign in to confirm" bot check, and members-only material. yt-dlp
+can read the cookies straight out of a local Firefox profile, which needs
+nothing exported and nothing kept in sync:
+
+```bash
+lemon-zest download-config                      # what it would use, and why
+lemon-zest download-config --cookies firefox
+lemon-zest download-config --firefox-profile "7p00fljl.default-release"
+```
+
+Profiles are found by looking for a `cookies.sqlite` on disk rather than by
+reading `profiles.ini`, most recently written first — that is the profile
+you are signed in to. When there is no Firefox to read, a `cookies.txt`
+exported by a browser extension works instead:
+
+```bash
+lemon-zest download-config --cookies "C:/Users/ASUS/cookies.txt"
+lemon-zest download-config --cookies none
+```
+
+The default, `auto`, tries Firefox, falls back to the file, and then
+proceeds without cookies rather than refusing to start: plenty of videos
+need none. When YouTube does refuse, the error says which of these to fix
+rather than repeating yt-dlp's own wording.
+
 ## The interface
 
 ```bash
@@ -104,7 +164,9 @@ jobs run on a worker thread and are reported through a job registry, so a
 sync keeps going if you reload the page, and the catalog stays readable
 while it writes (SQLite in WAL mode).
 
-**Needs attention** collects everything worth a second look in one place:
+**Download** fetches audio from YouTube into a library folder, says up front
+which cookies it will use, and reports what it added. **Needs attention**
+collects everything worth a second look in one place:
 empty files (zero bytes on disk - failed downloads, which Lemon Zest refuses to
 copy rather than putting dead entries on the card), untagged files, and
 playlist entries that resolve to nothing.
@@ -112,7 +174,8 @@ playlist entries that resolve to nothing.
 ## What it guarantees
 
 Each of these is covered by a test in `tests/test_sync.py`; `tests/test_server.py`
-covers the API the interface runs on. 25 tests, no network, no real card:
+covers the API the interface runs on, and `tests/test_download.py` the
+download path against a stub yt-dlp. 58 tests, no network, no real card:
 
 | | |
 |---|---|
@@ -122,6 +185,8 @@ covers the API the interface runs on. 25 tests, no network, no real card:
 | Removals are exact | Unticking removes those files and that playlist file, and nothing else. |
 | It refuses rather than fills | A set larger than the free space is rejected at plan time, before a byte moves. |
 | Writes stay on the device | Any destination that escapes the device root is refused. |
+| A download is a library file | What yt-dlp writes is indexed on the spot, into the folder the scanner watches, and adding it to a playlist twice adds one entry. |
+| A dead video is not a dead run | yt-dlp exiting non-zero after fetching some of a playlist keeps what arrived; a run that fetched nothing raises, naming the cookie fix when that is the cause. |
 | Provenance survives | `#Collection URI` and per-track `#Apple Music URI` comments are read, stored, and written back out. |
 
 ```bash
@@ -150,6 +215,7 @@ an intact card produce no work at all.
 | `paths.py` | Unicode normalisation, FAT-safe names, destination templating |
 | `scan.py` | Library walk and incremental upsert |
 | `playlists.py` | m3u8 read/write, both dialects |
+| `download.py` | yt-dlp as a subprocess: cookies, progress, indexing |
 | `devices.py` | Volume detection, profiles, pairing |
 | `planner.py` | The three-set diff. Pure; touches nothing |
 | `executor.py` | Carries out a plan, safely and resumably |
@@ -206,11 +272,13 @@ Two hazards, both hit in real use:
 
 Deliberately, per the build plan: transcoding (this library is uniformly
 AAC, so there is nothing to convert yet), loudness analysis and ReplayGain,
-streaming imports, iTunesDB for stock-firmware iPods, and playback.
+importing a streaming service's own library, iTunesDB for stock-firmware
+iPods, and playback. Downloading is in: it lands files in the library and
+then gets out of the way.
 
-The interface covers the library, playlists, devices and syncing. It does
-not yet have the loudness or import screens from the prototype, because
-there is nothing behind them to show. Nothing in the core knows the
+The interface covers the library, playlists, devices, syncing and
+downloading. It does not yet have the loudness screen from the prototype,
+because there is nothing behind it to show. Nothing in the core knows the
 interface exists — the planner and executor communicate through plain dicts
 and an event callback — so a Tauri or Electron shell could replace the
 browser later without touching them.

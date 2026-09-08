@@ -19,6 +19,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from . import db as db_mod
 from . import devices as dev_mod
+from . import download as dl_mod
 from . import executor, planner, playlists, scan
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -284,6 +285,98 @@ def create_app(db_path=None):
                             detail=f"{done:,} of {total:,} files")
                 counts = scan.scan(c, root, progress=cb)
                 _update(job_id, state="done", result=counts,
+                        finished=time.time())
+            except Exception as exc:
+                _update(job_id, state="failed", error=str(exc),
+                        finished=time.time())
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+        return jsonify({"job": job_id})
+
+    # ------------------------------------------------------- downloads
+
+    def _download_state(c):
+        cfg = dl_mod.get_config(c)
+        status = dl_mod.cookie_status(cfg)
+        return {
+            "config": cfg,
+            "ytdlp": dl_mod.ytdlp_version(),
+            "cookies": {
+                "mode": status["mode"], "source": status["source"],
+                "detail": status["detail"],
+                "cookies_file": status["cookies_file"],
+                "file_exists": status["file_exists"],
+                "profile": status["profile"],
+                "profiles": [{"name": p["name"], "path": p["path"]}
+                             for p in status["profiles"]],
+            },
+            "roots": [r["root"] for r in
+                      c.execute("SELECT DISTINCT root FROM track ORDER BY root")],
+        }
+
+    @app.get("/api/download/config")
+    def download_config():
+        return jsonify(_download_state(con()))
+
+    @app.post("/api/download/config")
+    def download_config_save():
+        c = con()
+        body = request.json or {}
+        dl_mod.set_config(c, **{k: v for k, v in body.items()
+                                if k in dl_mod.CONFIG_DEFAULTS})
+        return jsonify(_download_state(c))
+
+    @app.post("/api/download/probe")
+    def download_probe():
+        url = ((request.json or {}).get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "no URL given"}), 400
+        c = con()
+        try:
+            return jsonify(dl_mod.probe(url, dl_mod.get_config(c)))
+        except dl_mod.DownloadError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.post("/api/download")
+    def download_start():
+        body = request.json or {}
+        urls = body.get("urls")
+        if isinstance(urls, str):
+            urls = urls.split()
+        urls = [u.strip() for u in (urls or []) if u and u.strip()]
+        if not urls:
+            return jsonify({"error": "no URL given"}), 400
+        if not dl_mod.ytdlp_command():
+            return jsonify({"error": "yt-dlp is not installed. Install it "
+                                     "with: pip install yt-dlp"}), 400
+
+        root = (body.get("root") or "").strip() or None
+        playlist_name = (body.get("playlist") or "").strip() or None
+        single = bool(body.get("no_playlist"))
+        archive = body.get("archive") is not False
+        job_id = _new_job("download", urls[0] if len(urls) == 1
+                          else f"{len(urls)} URLs")
+
+        def work():
+            try:
+                c = db_mod.connect(app.config["DB_PATH"])
+
+                def on_event(kind, detail, done, total):
+                    if kind == "progress":
+                        _update(job_id, done=done, total=total, detail=detail)
+                    elif kind in ("file", "error", "index", "start"):
+                        _update(job_id, detail=detail)
+                        _push_event(job_id, kind, detail)
+
+                summary = dl_mod.download(
+                    c, urls, root=root, playlist=playlist_name,
+                    on_event=on_event, no_playlist=single, archive=archive)
+                _update(job_id, state="done", result=summary,
+                        finished=time.time(),
+                        detail=f"{summary['downloaded']} downloaded")
+            except dl_mod.DownloadError as exc:
+                _update(job_id, state="failed", error=str(exc),
                         finished=time.time())
             except Exception as exc:
                 _update(job_id, state="failed", error=str(exc),
