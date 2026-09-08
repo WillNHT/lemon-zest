@@ -354,6 +354,28 @@ function renderPlaylist() {
 
 // ---------------------------------------------------------------- device
 
+/* Playlist files the sync would leave sitting next to the ones it writes.
+   This happens when the device spells its playlists its own way - HiBy's
+   are "<name>-<owner>.m3u8" - and it is the one thing a dry run listing
+   only its own output cannot tell you: the card ends up showing both, the
+   stale one included. */
+function playlistStrayNotice(d, p) {
+  const strays = (p.playlist_strays || []);
+  const shadowing = strays.filter(x => x.shadows);
+  if (!strays.length) return '';
+  const sample = strays.slice(0, 4).map(x => x.filename).join(', ');
+  const more = strays.length > 4 ? ` and ${num(strays.length - 4)} more` : '';
+  return `<div class="notice warn" style="margin-top:10px">${icon('i-warn')}
+    <div><b>${num(strays.length)} playlist file${strays.length > 1 ? 's' : ''}
+    already on the card would be left in place.</b><br>
+    <span class="mono faint">${h(sample)}</span>${h(more)}
+    ${shadowing.length ? `<br>This device names its playlists differently, so
+      the sync would add a second copy of ${num(shadowing.length)} of them
+      rather than replacing what is there.
+      <button class="btn sm" data-detect-pl="${d.id}">Use the card's naming</button>`
+      : ''}</div></div>`;
+}
+
 function renderDevice() {
   const d = S.devices.find(x => x.id === S.deviceId);
   if (!d) return '<div class="empty">Select a device.</div>';
@@ -386,10 +408,12 @@ function renderDevice() {
         <dt>to copy</dt><dd><b>${num(p.copies_total)}</b> \u00b7 ${bytes(p.bytes_in)}</dd>
         <dt>to remove</dt><dd>${num(p.deletes_total)} \u00b7 ${bytes(p.bytes_out)}</dd>
         <dt>playlists</dt><dd>${num(p.playlists.length)} to write${
-          p.playlist_deletes.length ? `, ${num(p.playlist_deletes.length)} to remove` : ''}</dd>
+          p.playlist_deletes.length ? `, ${num(p.playlist_deletes.length)} to remove` : ''}
+          ${p.playlist_template ? `<span class="faint mono">as ${h(p.playlist_template)}</span>` : ''}</dd>
         ${p.missing_total ? `<dt>skipped</dt><dd style="color:var(--warn)">${num(p.missing_total)}
           <span class="faint">${h([...new Set(p.missing_source.map(m => m.why))].join(', '))}</span></dd>` : ''}
       </dl>
+      ${playlistStrayNotice(d, p)}
       ${!p.space.fits
         ? `<div class="notice bad" style="margin-top:10px">${icon('i-warn')}
             <div><b>This will not fit.</b> Short by ${bytes(p.space.shortfall)}.
@@ -740,6 +764,7 @@ async function guard(fn) {
 document.addEventListener('click', (ev) => {
   const t = ev.target.closest('[data-act],[data-facet],[data-scope],[data-page],'
     + '[data-plan],[data-sync],[data-unset],[data-pick-set],[data-save-set],'
+    + '[data-detect-pl],'
     + '[data-close],[data-scrim],[data-usevol],[data-scan],[data-volumes],'
     + '[data-plsync],[data-playlist],[data-track]');
   if (!t) return;
@@ -788,6 +813,21 @@ document.addEventListener('click', (ev) => {
     return guard(loadLibrary);
   }
   if (d.plan) return guard(() => loadPlan(+d.plan));
+  if (d.detectPl) {
+    const id = +d.detectPl;
+    return guard(async () => {
+      const r = await api('/devices/' + id + '/detect-playlists',
+                          { method: 'POST', body: JSON.stringify({}) });
+      await loadPlan(id);
+      if (!r.applied) {
+        // The re-planned view would otherwise look identical, which reads
+        // as a dead button rather than as a refusal to guess.
+        throw new Error('None of the ' + r.total + ' playlist files on the '
+          + 'card carry a name this catalog knows, so the naming was left '
+          + 'alone. Set it by hand with device config --playlist-template.');
+      }
+    });
+  }
   if (d.sync) {
     const id = +d.sync;
     return guard(async () => {
