@@ -11,3 +11,4 @@ cookies.txt
 .gui.log
 .realdb/
 backups/
+.testdb/
