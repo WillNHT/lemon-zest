@@ -375,6 +375,10 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         # reports the file that was really written, after the audio
         # extraction and the rename.
         "--print", "after_move:" + FILE_PREFIX + "%(filepath)s",
+        # --print also implies --quiet, and that one the WHEN prefix does
+        # not undo: without this the only things yt-dlp says are warnings,
+        # errors and the line above - no progress, and nothing to log.
+        "--no-quiet",
     ]
     if archive:
         args += ["--download-archive", os.path.join(root, ARCHIVE_NAME)]
