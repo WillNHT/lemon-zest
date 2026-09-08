@@ -73,6 +73,9 @@ const S = {
   playlistDetail: null,
   problems: null,
   plan: null, planning: false, planError: null,
+  dl: null,              // /download/config: settings, cookie status, yt-dlp
+  dlResult: null,        // summary of the last finished download
+  dlProbe: null,         // what is at the URL, when asked before downloading
   job: null,
   log: [],
   busy: false,
@@ -123,6 +126,10 @@ async function loadPlan(deviceId) {
   } finally {
     S.planning = false;
   }
+}
+
+async function loadDownload() {
+  S.dl = await api('/download/config');
 }
 
 async function loadLog(deviceId) {
@@ -216,7 +223,10 @@ function renderSidebar() {
 
     sect('Tools', undefined,
       navRow({ act: 'view', arg: 'import', label: 'Scan & import',
-               icon: 'i-clock', on: S.view === 'import' }));
+               icon: 'i-clock', on: S.view === 'import' }) +
+      navRow({ act: 'view', arg: 'download', label: 'Download',
+               icon: 'i-dl', on: S.view === 'download',
+               title: 'Fetch audio from YouTube into the library' }));
 }
 
 // --------------------------------------------------------------- library
@@ -601,6 +611,150 @@ function renderImport() {
   </div>`;
 }
 
+function renderDownload() {
+  const d = S.dl;
+  if (!d) return '<div class="empty"><span class="spin"></span></div>';
+  const cfg = d.config, ck = d.cookies;
+  const job = S.job && S.job.kind === 'download' ? S.job : null;
+  const res = S.dlResult;
+  const field = 'border:1px solid var(--line-2);border-radius:3px;padding:4px 7px';
+  const roots = d.roots.slice();
+  if (cfg.root && !roots.includes(cfg.root)) roots.unshift(cfg.root);
+
+  const cookieTag = ck.source === 'firefox'
+    ? '<span class="tag ok">FIREFOX</span>'
+    : ck.source === 'file' ? '<span class="tag ok">COOKIES.TXT</span>'
+      : '<span class="tag warn">NO COOKIES</span>';
+
+  return `<div class="pad stack">
+    ${d.ytdlp ? '' : `<div class="notice bad">${icon('i-warn')}<div>
+      yt-dlp is not installed, so nothing can be downloaded yet.
+      Install it with <span class="mono">pip install yt-dlp</span>
+      (and ffmpeg, which it uses to extract the audio).</div></div>`}
+
+    <div class="card">
+      <header><h3>Download from YouTube</h3>
+        <span class="muted">audio only, straight into a library folder and
+          into the catalog - no rescan needed.</span></header>
+      <div class="in stack">
+        <form id="dl-form" class="stack">
+          <textarea name="urls" rows="3" required placeholder="https://www.youtube.com/watch?v=...&#10;one URL per line; a playlist or channel URL fetches all of it"
+            style="${field};width:100%;font-family:var(--mono);resize:vertical"></textarea>
+          <div class="hstack">
+            <label class="muted">Into</label>
+            <select name="root" style="${field};flex:1">
+              ${roots.map(r => `<option value="${h(r)}" ${r === cfg.root ? 'selected' : ''}>${h(r)}</option>`).join('')
+                || '<option value="">no library folder indexed yet</option>'}
+            </select>
+            <label class="muted">Playlist</label>
+            <input name="playlist" list="dl-playlists" placeholder="optional"
+              style="${field};width:180px">
+            <datalist id="dl-playlists">
+              ${S.playlists.map(p => `<option value="${h(p.name)}"></option>`).join('')}
+            </datalist>
+          </div>
+          <div class="hstack">
+            <label class="muted"><input type="checkbox" name="single">
+              Just this video, not the playlist it sits in</label>
+            <label class="muted"><input type="checkbox" name="again">
+              Fetch again even if already downloaded</label>
+            <span class="grow"></span>
+            <button class="btn" type="button" data-probe="1">What is at this URL?</button>
+            <button class="btn primary" type="submit" ${d.ytdlp ? '' : 'disabled'}>Download</button>
+          </div>
+        </form>
+
+        ${S.dlProbe ? `<div class="notice ok">${icon('i-check')}<div>
+          <strong>${h(S.dlProbe.title || '')}</strong>
+          ${S.dlProbe.uploader ? ' &middot; ' + h(S.dlProbe.uploader) : ''}
+          &middot; ${S.dlProbe.is_playlist
+            ? num(S.dlProbe.count) + ' items' : dur(S.dlProbe.duration)}
+        </div></div>` : ''}
+
+        ${job ? `<div>
+          <div class="hstack"><span class="${job.state === 'running' ? 'spin' : ''}"></span>
+            <span class="muted clip">${h(job.detail || job.state)}</span></div>
+          <div class="bar" style="margin-top:5px"><i style="width:${
+            job.total ? (100 * job.done / job.total) : 0}%"></i></div>
+          ${job.state === 'failed' ? `<div class="notice bad" style="margin-top:8px">
+            ${icon('i-warn')}<div>${h(job.error)}</div></div>` : ''}
+        </div>` : ''}
+
+        ${res ? (res.downloaded ? `<div class="notice ok">${icon('i-check')}<div>
+            ${num(res.downloaded)} downloaded into
+            <span class="mono">${h(res.root)}</span> -
+            ${num(res.added)} added to the catalog, ${num(res.updated)} updated.
+            ${res.playlist ? `Playlist <strong>${h(res.playlist.name)}</strong>:
+              ${num(res.playlist.added)} added${res.playlist.skipped
+                ? ', ' + num(res.playlist.skipped) + ' already there' : ''}.` : ''}
+          </div></div>
+          <table class="tbl"><tbody>${res.files.map(f => `<tr>
+            <td class="mono clip" title="${h(f)}">${h(f.slice(res.root.length + 1))}</td>
+          </tr>`).join('')}</tbody></table>`
+        : `<div class="notice">${icon('i-warn')}<div>Nothing new - every URL
+            was already in the download archive, or nothing could be fetched.</div></div>`) : ''}
+        ${res && res.errors && res.errors.length ? `<div class="notice bad">
+          ${icon('i-warn')}<div>${res.errors.map(e => h(e)).join('<br>')}</div></div>` : ''}
+      </div>
+    </div>
+
+    <div class="card">
+      <header><h3>Cookies</h3>${cookieTag}
+        <span class="muted">YouTube refuses age-restricted, members-only and
+          bot-checked videos to a signed-out client.</span></header>
+      <div class="in stack">
+        <p class="muted">${h(ck.detail)}</p>
+        <form id="dl-cookie-form" class="stack">
+          <div class="hstack">
+            <label class="muted">Source</label>
+            <select name="cookies_mode" style="${field}">
+              ${[['auto', 'Automatic - Firefox, then a cookies.txt'],
+                 ['firefox', 'Firefox profile'],
+                 ['file', 'cookies.txt file'],
+                 ['none', 'None']].map(([v, t]) =>
+                `<option value="${v}" ${cfg.cookies_mode === v ? 'selected' : ''}>${h(t)}</option>`).join('')}
+            </select>
+            <label class="muted">Firefox profile</label>
+            <select name="firefox_profile" style="${field};flex:1">
+              <option value="">${ck.profiles.length
+                ? 'Most recently used' : 'none found on this machine'}</option>
+              ${ck.profiles.map(p => `<option value="${h(p.name)}"
+                ${cfg.firefox_profile === p.name ? 'selected' : ''}>${h(p.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="hstack">
+            <label class="muted">cookies.txt</label>
+            <input name="cookies_file" value="${h(cfg.cookies_file)}"
+              placeholder="C:/Users/you/cookies.txt - exported by a browser extension"
+              style="${field};flex:1;font-family:var(--mono)">
+            <button class="btn primary" type="submit">Save</button>
+          </div>
+        </form>
+        <p class="muted">Lemon Zest never copies the cookie database; yt-dlp
+          reads it directly when a download runs. Close Firefox first if it
+          refuses to read the profile.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <header><h3>Where files land</h3>
+        <span class="muted">yt-dlp output template, relative to the folder above.</span></header>
+      <div class="in stack">
+        <form id="dl-output-form" class="hstack">
+          <input name="output" value="${h(cfg.output)}"
+            style="${field};flex:1;font-family:var(--mono)">
+          <select name="audio_format" style="${field}">
+            ${['m4a', 'mp3', 'opus', 'flac'].map(f =>
+              `<option ${cfg.audio_format === f ? 'selected' : ''}>${f}</option>`).join('')}
+          </select>
+          <button class="btn" type="submit">Save</button>
+        </form>
+        <span class="faint">yt-dlp ${d.ytdlp ? h(d.ytdlp) : 'not installed'}</span>
+      </div>
+    </div>
+  </div>`;
+}
+
 function renderProblems() {
   const p = S.problems;
   if (!p) return '<div class="empty"><span class="spin"></span></div>';
@@ -689,6 +843,7 @@ const TITLES = {
     ? ('PLAYLIST \u2014 ' + S.playlistDetail.playlist.name).toUpperCase() : 'PLAYLIST',
   addDevice: () => 'ADD DEVICE',
   import: () => 'SCAN & IMPORT',
+  download: () => 'DOWNLOAD',
   problems: () => 'NEEDS ATTENTION',
 };
 
@@ -698,7 +853,9 @@ function renderStatus() {
   if (job && job.state === 'running') {
     meter.classList.remove('idle');
     $('#status-label').textContent =
-      job.kind === 'sync' ? 'Syncing \u2192 ' + job.label : 'Scanning ' + job.label;
+      job.kind === 'sync' ? 'Syncing \u2192 ' + job.label
+        : job.kind === 'download' ? 'Downloading ' + job.label
+          : 'Scanning ' + job.label;
     $('#status-meta').textContent = job.detail || '';
     $('#status-bar').style.width =
       (job.total ? (100 * job.done / job.total) : 0) + '%';
@@ -723,6 +880,7 @@ function render() {
   const body = {
     library: renderLibrary, device: renderDevice, playlist: renderPlaylist,
     addDevice: renderAddDevice, import: renderImport, problems: renderProblems,
+    download: renderDownload,
   }[S.view];
   $('#pane').innerHTML = body ? body() : '';
   renderStatus();
@@ -766,6 +924,7 @@ document.addEventListener('click', (ev) => {
     + '[data-plan],[data-sync],[data-unset],[data-pick-set],[data-save-set],'
     + '[data-detect-pl],'
     + '[data-close],[data-scrim],[data-usevol],[data-scan],[data-volumes],'
+    + '[data-probe],'
     + '[data-plsync],[data-playlist],[data-track]');
   if (!t) return;
 
@@ -780,6 +939,10 @@ document.addEventListener('click', (ev) => {
     if (d.arg === 'problems') {
       S.problems = null;
       return guard(async () => { S.problems = await api('/problems'); });
+    }
+    if (d.arg === 'download') {
+      S.dlProbe = null;
+      return guard(loadDownload);
     }
     return render();
   }
@@ -900,6 +1063,17 @@ document.addEventListener('click', (ev) => {
     }
     return;
   }
+  if (d.probe) {
+    const form = $('#dl-form');
+    const url = ((form && form.urls.value) || '').trim().split(/\s+/)[0];
+    if (!url) return;
+    S.dlProbe = null;
+    return guard(async () => {
+      S.dlProbe = await api('/download/probe', {
+        method: 'POST', body: JSON.stringify({ url }),
+      });
+    });
+  }
   if (d.volumes) return loadVolumes();
   if (d.scan) return startScan(d.scan);
 });
@@ -935,6 +1109,36 @@ document.addEventListener('submit', (ev) => {
       S.deviceId = S.devices[S.devices.length - 1].id;
       await loadLog(S.deviceId);
     });
+  }
+  if (f.id === 'dl-form') {
+    const urls = f.urls.value.split(/\s+/).filter(Boolean);
+    if (!urls.length) return;
+    S.dlProbe = null; S.dlResult = null;
+    return guard(async () => {
+      const res = await api('/download', {
+        method: 'POST',
+        body: JSON.stringify({
+          urls, root: f.root.value, playlist: f.playlist.value.trim(),
+          no_playlist: f.single.checked, archive: !f.again.checked,
+        }),
+      });
+      S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
+                total: 0, label: urls.length === 1 ? urls[0] : urls.length + ' URLs' };
+      watchJob(res.job, async (job) => {
+        S.dlResult = job.result || null;
+        // A download changes the library, the playlists and every device
+        // plan that mentions them, so the whole core is reloaded.
+        await loadCore();
+        await loadDownload();
+      });
+    });
+  }
+  if (f.id === 'dl-cookie-form' || f.id === 'dl-output-form') {
+    const body = {};
+    for (const el of f.elements) if (el.name) body[el.name] = el.value;
+    return guard(async () => { S.dl = await api('/download/config', {
+      method: 'POST', body: JSON.stringify(body),
+    }); });
   }
   if (f.id === 'pl-form') {
     return guard(async () => {

@@ -125,6 +125,26 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(state["state"], "done")
         self.assertEqual(state["result"]["seen"], 4)
 
+    def test_download_config_reports_what_it_would_use(self):
+        d = self.c.get("/api/download/config").get_json()
+        self.assertIn("cookies_mode", d["config"])
+        self.assertIn(d["cookies"]["source"], ("firefox", "file", "none"))
+        self.assertIn(self.lib.replace("\\", "/"),
+                      [r.replace("\\", "/") for r in d["roots"]])
+
+        saved = self.c.post("/api/download/config",
+                            json={"cookies_mode": "none",
+                                  "audio_format": "opus"}).get_json()
+        self.assertEqual(saved["config"]["cookies_mode"], "none")
+        self.assertEqual(saved["config"]["audio_format"], "opus")
+        self.assertEqual(saved["cookies"]["source"], "none")
+
+    def test_a_download_without_a_url_is_rejected(self):
+        r = self.c.post("/api/download", json={"urls": []})
+        self.assertEqual(r.status_code, 400)
+        r = self.c.post("/api/download/probe", json={"url": ""})
+        self.assertEqual(r.status_code, 400)
+
     def test_bad_paths_are_rejected(self):
         r = self.c.post("/api/scan", json={"root": "/no/such/place"})
         self.assertEqual(r.status_code, 400)
