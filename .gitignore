@@ -9,3 +9,5 @@ hoard.db-shm
 cookies.txt
 .testcard/
 .gui.log
+.realdb/
+backups/

@@ -18,7 +18,9 @@ directory listing, which makes it both the dry run and the thing worth
 testing first.
 """
 import os
+import time
 
+from .meta import content_key
 from .paths import dedupe, norm, render_template, resolve_existing
 from .playlists import safe_filename as pl_filename
 
@@ -74,6 +76,62 @@ def desired_tracks(con, device_id):
         list(ids),
     ).fetchall()
     return rows, playlists
+
+
+def adopt(con, device, root, verify="size"):
+    """Record files already on the card that match where the plan wants them.
+
+    A card populated by some earlier tool is not wrong, it is just unknown:
+    the manifest is empty, so every planned file reads as "untracked" and a
+    first sync would recopy the lot. Adoption walks the planned destinations,
+    confirms the file is there and matches, and writes the manifest rows -
+    turning a 20 GB recopy into an empty plan.
+
+    ``verify`` is "size" (fast, compares against the source's byte count) or
+    "content" (reads both files' content keys). Nothing on the card is
+    written or moved either way.
+    """
+    tracks, _ = desired_tracks(con, device["id"])
+    music_dir = device["music_dir"].strip("/")
+    music_root = os.path.join(root, music_dir) if music_dir else root
+    template = device["path_template"]
+
+    taken = set()
+    adopted = mismatched = absent = 0
+    now = time.time()
+    for t in tracks:
+        rel = dedupe(render_template(template, t), taken)
+        dest = resolve_existing(os.path.join(music_root, rel.replace("/", os.sep)))
+        if dest is None:
+            absent += 1
+            continue
+        try:
+            size = os.path.getsize(dest)
+        except OSError:
+            absent += 1
+            continue
+        if verify == "content":
+            try:
+                ok = content_key(dest, size) == t["content_key"]
+            except OSError:
+                ok = False
+        else:
+            ok = size == t["size"]
+        if not ok:
+            mismatched += 1
+            continue
+        con.execute(
+            "INSERT INTO device_manifest(device_id, dest_rel, track_id, "
+            "content_key, size, written_at) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(device_id, dest_rel) DO UPDATE SET "
+            "track_id=excluded.track_id, content_key=excluded.content_key, "
+            "size=excluded.size, written_at=excluded.written_at",
+            (device["id"], rel, t["id"], t["content_key"], size, now),
+        )
+        adopted += 1
+    con.commit()
+    return {"adopted": adopted, "mismatched": mismatched, "absent": absent,
+            "considered": len(tracks)}
 
 
 def plan(con, device, root, prune=False):
@@ -167,6 +225,10 @@ def plan(con, device, root, prune=False):
                                 "size": size, "present": True})
 
     # ---- playlists -----------------------------------------------------
+    # A track we refused to copy must not be referenced by a playlist either.
+    # Otherwise the player follows the entry to a file that is missing, or
+    # worse, to a zero-byte one left behind by an earlier tool.
+    skip_ids = {m["track"]["id"] for m in missing_source}
     playlist_plan = []
     for name in playlist_names:
         row = con.execute("SELECT * FROM playlist WHERE name=?", (name,)).fetchone()
@@ -178,7 +240,8 @@ def plan(con, device, root, prune=False):
             "LEFT JOIN track t ON t.id = e.track_id "
             "WHERE e.playlist_id=? ORDER BY e.pos", (row["id"],)
         ):
-            dest = plan_by_track.get(e["track_id"]) if e["track_id"] else None
+            usable = e["track_id"] and e["track_id"] not in skip_ids
+            dest = plan_by_track.get(e["track_id"]) if usable else None
             if not dest:
                 skipped += 1
                 continue

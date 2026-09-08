@@ -86,27 +86,50 @@ class _Fmt(dict):
         return "Unknown"
 
 
+def _as_component(value, fallback="Unknown"):
+    """Sanitise one substituted value *before* it is joined into a path.
+
+    This has to happen per value, not on the finished path: an artist called
+    "AC/DC" would otherwise turn a single component into two, and the track
+    would land in AC/DC/... instead of AC_DC/... - scattering files into a
+    folder tree nobody asked for. The template's own slashes are what
+    separate components; a slash arriving from tag data is just a character.
+    """
+    text = ("" if value is None else str(value)).strip()
+    return safe_component(text) if text else fallback
+
+
 def render_template(template, track, ext=None):
     """Build a destination relative path for one track row.
 
     ``track`` is any mapping with the catalog's column names. Missing values
     become 'Unknown' rather than blowing up mid-sync.
     """
-    def s(v, fallback="Unknown"):
-        v = ("" if v is None else str(v)).strip()
-        return v or fallback
+    keys = track.keys()
 
-    tno = track["track_no"] if "track_no" in track.keys() else None
-    dno = track["disc_no"] if "disc_no" in track.keys() else None
+    def field(name):
+        return track[name] if name in keys else None
+
+    # "{rel_path}" mirrors the library's own folder layout onto the device.
+    # Useful when the card was populated from that library already: the
+    # destinations then match what is there, and nothing is recopied.
+    if template.strip() == "{rel_path}":
+        rel = field("rel_path")
+        if rel:
+            return safe_relpath(rel)
+
+    tno, dno = field("track_no"), field("disc_no")
     values = _Fmt(
-        artist=s(track["artist"]),
-        album_artist=s(track["album_artist"] or track["artist"]),
-        album=s(track["album"], "Unknown Album"),
-        title=s(track["title"], os.path.splitext(os.path.basename(track["path"]))[0]),
+        artist=_as_component(field("artist")),
+        album_artist=_as_component(field("album_artist") or field("artist")),
+        album=_as_component(field("album"), "Unknown Album"),
+        title=_as_component(
+            field("title"),
+            safe_component(os.path.splitext(os.path.basename(track["path"]))[0])),
         track=int(tno) if tno else 0,
         disc=int(dno) if dno else 0,
-        year=s(track["year"], ""),
-        genre=s(track["genre"], ""),
+        year=_as_component(field("year"), ""),
+        genre=_as_component(field("genre"), ""),
         ext=ext if ext is not None else os.path.splitext(track["path"])[1],
     )
     try:
