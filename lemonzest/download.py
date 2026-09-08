@@ -532,6 +532,67 @@ def _parse_progress(line):
             parts[2].strip() if len(parts) > 2 else "")
 
 
+_ARCHIVED = re.compile(r"has already been recorded in the archive", re.I)
+_VIDEO_ID = re.compile(r"(?:v=|/)([A-Za-z0-9_-]{11})(?:[&?#]|$)")
+
+
+def video_id(text):
+    """The eleven-character id inside a YouTube URL, or the id itself."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    match = _VIDEO_ID.search(text)
+    if match:
+        return match.group(1)
+    return text if re.fullmatch(r"[A-Za-z0-9_-]{11}", text) else None
+
+
+def _requested_track_ids(con, urls, cfg, downloaded, log):
+    """Catalog ids for everything the request named, in the source's order.
+
+    ``--embed-metadata`` writes the source URL into the ``purl`` tag and the
+    scanner reads it, so a track downloaded by an earlier run can be found
+    again by its video id. That is what makes a resumed download put the
+    whole playlist in the playlist, rather than only the part that this run
+    happened to fetch.
+
+    Falls back to what this run downloaded whenever the source cannot be
+    listed - a playlist missing its older half is a worse answer than one
+    built from what is certain.
+    """
+    ids = []
+    for url in urls:
+        try:
+            info = probe(url, cfg)
+        except DownloadError as exc:
+            log.append("could not list %s to order the playlist: %s"
+                       % (url, exc))
+            return downloaded
+        entries = info["entries"] or [{"url": url}]
+        for entry in entries:
+            vid = video_id(entry.get("url"))
+            if vid and vid not in ids:
+                ids.append(vid)
+
+    by_video = {}
+    for row in con.execute(
+            "SELECT id, purl FROM track WHERE purl IS NOT NULL"):
+        vid = video_id(row["purl"])
+        if vid:
+            by_video.setdefault(vid, row["id"])
+
+    found = [by_video[v] for v in ids if v in by_video]
+    missing = len(ids) - len(found)
+    log.append("playlist order: %d of %d items are in the catalog%s"
+               % (len(found), len(ids),
+                  ", %d are not" % missing if missing else ""))
+    # Anything downloaded but without a usable purl still belongs there.
+    for tid in downloaded:
+        if tid not in found:
+            found.append(tid)
+    return found or downloaded
+
+
 def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
              no_playlist=False, archive=True, output=None, audio_format=None,
              audio_quality=None):
@@ -567,6 +628,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
 
     files = []
     tail = []
+    skipped = 0      # already in the download archive
     proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
                             encoding="utf-8", errors="replace", bufsize=1,
@@ -588,6 +650,8 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                     del log[:-MAX_LOG]
                     emit("file", path, len(files), 0)
                 continue
+            if _ARCHIVED.search(line):
+                skipped += 1
             tail.append(line)
             del tail[:-60]
             log.append(line)
@@ -615,13 +679,35 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     log.append("indexed %d added, %d updated, %d not catalogued"
                % (counts["added"], counts["updated"], counts["failed"]))
 
+    # A run that was interrupted leaves audio on disk and a line in the
+    # archive, but no catalog row - the indexing happens here, after yt-dlp
+    # exits. Running it again skips those files, and says so rather than
+    # naming them, so without this they would sit in the library
+    # permanently invisible. A rescan of the root is stat-only for the
+    # thousands of files that have not changed, so it costs little and is
+    # the one thing that cannot miss them.
+    if skipped:
+        log.append("%d already in the download archive; rescanning %s to "
+                   "catalog anything an earlier run left behind"
+                   % (skipped, root))
+        emit("index", "rescanning the library folder", 0, 0)
+        rescan = scan_mod.scan(con, root)
+        log.append("rescan: %d added, %d updated, %d unchanged"
+                   % (rescan["added"], rescan["updated"], rescan["unchanged"]))
+
     added_to = None
-    if playlist and track_ids:
-        added_to = pl_mod.append_tracks(con, playlist, track_ids,
-                                        origin="download")
-        log.append("playlist %s: %d added, %d already there, %d entries"
-                   % (added_to["name"], added_to["added"], added_to["skipped"],
-                      added_to["entries"]))
+    if playlist:
+        # Everything the request asked for, not merely what this run
+        # fetched: the skipped ones belong in the playlist too, and asking
+        # the source for its own order beats the order they downloaded in.
+        wanted = _requested_track_ids(con, urls, cfg, track_ids, log) \
+            if skipped else track_ids
+        if wanted:
+            added_to = pl_mod.append_tracks(con, playlist, wanted,
+                                            origin="download")
+            log.append("playlist %s: %d added, %d already there, %d entries"
+                       % (added_to["name"], added_to["added"],
+                          added_to["skipped"], added_to["entries"]))
     del log[:-MAX_LOG]
 
     summary = {
@@ -633,6 +719,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         "failed_index": counts["failed"],
         "playlist": added_to,
         "exit_code": code,
+        "skipped": skipped,
         "errors": [l for l in tail if "ERROR" in l][-10:],
         "log": log,
         "at": time.time(),
