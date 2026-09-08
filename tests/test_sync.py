@@ -221,6 +221,36 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(summary["copied"], 2)
         self.assertEqual(summary["failed"], 0)
 
+    def test_adopt_recognises_files_already_on_the_card(self):
+        """A card filled by another tool must not be recopied wholesale."""
+        self._sync()
+        # Forget everything: the files stay, the manifest goes.
+        self.con.execute("DELETE FROM device_manifest WHERE device_id=?",
+                         (self.device["id"],))
+        self.con.commit()
+        self.assertEqual(len(self._plan()["copies"]), 3)
+
+        res = planner.adopt(self.con, self.device, self.card, verify="content")
+        self.assertEqual(res["adopted"], 3)
+        self.assertEqual(res["mismatched"], 0)
+
+        p = self._plan()
+        self.assertEqual(p["copies"], [])
+        self.assertEqual(len(p["unchanged"]), 3)
+
+    def test_adopt_rejects_a_file_that_differs(self):
+        self._sync()
+        self.con.execute("DELETE FROM device_manifest WHERE device_id=?",
+                         (self.device["id"],))
+        self.con.commit()
+        victim = os.path.join(self.card, "Music", "Alpha", "First", "01 One.mp3")
+        with open(victim, "ab") as fh:
+            fh.write(bytes(4096))   # same name, different bytes
+        res = planner.adopt(self.con, self.device, self.card, verify="content")
+        self.assertEqual(res["adopted"], 2)
+        self.assertEqual(res["mismatched"], 1)
+        self.assertEqual(len(self._plan()["copies"]), 1)
+
     def test_space_guard_refuses_before_writing(self):
         """AC6: a set that will not fit is refused at plan time."""
         p = self._plan()
@@ -261,6 +291,26 @@ class PathTests(unittest.TestCase):
         taken = set()
         self.assertEqual(dedupe("a/b.mp3", taken), "a/b.mp3")
         self.assertEqual(dedupe("A/B.mp3", taken), "A/B (2).mp3")
+
+    def test_a_slash_in_a_tag_does_not_create_a_folder(self):
+        """An artist called AC/DC must land in AC_DC/, not AC/DC/."""
+        from hoard.paths import render_template
+        track = {"artist": "AC/DC", "album_artist": "AC/DC",
+                 "album": "Back In Black", "title": "Shoot to Thrill",
+                 "track_no": 2, "disc_no": 1, "year": "1980", "genre": "Rock",
+                 "path": "/lib/AC_DC/Back In Black/02 Shoot to Thrill.m4a",
+                 "rel_path": "AC_DC/Back In Black/02 Shoot to Thrill.m4a"}
+        rel = render_template(
+            "{album_artist}/{album}/{track:02d} {title}{ext}", track)
+        self.assertEqual(rel, "AC_DC/Back In Black/02 Shoot to Thrill.m4a")
+        self.assertEqual(rel.count("/"), 2)
+
+    def test_rel_path_template_mirrors_the_library(self):
+        from hoard.paths import render_template
+        track = {"rel_path": "Some Artist/An Album/03 Track.mp3",
+                 "path": "/lib/Some Artist/An Album/03 Track.mp3"}
+        self.assertEqual(render_template("{rel_path}", track),
+                         "Some Artist/An Album/03 Track.mp3")
 
     def test_unicode_normalisation(self):
         from hoard.playlists import norm_name

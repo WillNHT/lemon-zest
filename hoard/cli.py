@@ -278,6 +278,66 @@ def device_set(ctx, device_ref, playlists_, artists, albums, remove, clear):
         console.print(f"   [dim]{r['kind']:9}[/] {r['ref']}")
 
 
+@device.command("config")
+@click.argument("device_ref")
+@click.option("--template", default=None,
+              help="Destination path template, or {rel_path} to mirror the "
+                   "library's own folder layout.")
+@click.option("--music-dir", default=None, help="Folder on the card for audio.")
+@click.option("--playlist-dir", default=None, help="Folder for playlists.")
+@click.option("--name", default=None)
+@click.option("--label", default=None, help="Record the volume label.")
+@click.pass_context
+def device_config(ctx, device_ref, template, music_dir, playlist_dir, name, label):
+    """Show or change how a device is laid out."""
+    con = _con(ctx)
+    d = _require_device(con, device_ref)
+    changes = {"path_template": template, "music_dir": music_dir,
+               "playlist_dir": playlist_dir, "name": name, "label": label}
+    changes = {k: v for k, v in changes.items() if v is not None}
+    for key, val in changes.items():
+        con.execute(f"UPDATE device SET {key}=? WHERE id=?", (val, d["id"]))
+    if changes:
+        con.commit()
+        d = _require_device(con, device_ref)
+    t = Table(box=None, pad_edge=False)
+    t.add_column("", style="dim")
+    t.add_column("")
+    for key in ("name", "label", "profile", "music_dir", "playlist_dir",
+                "path_template", "root", "hoard_id"):
+        t.add_row(key, str(d[key]))
+    console.print(t)
+
+
+@device.command("adopt")
+@click.argument("device_ref")
+@click.option("--root", default=None, help="Where the device is mounted.")
+@click.option("--verify", type=click.Choice(["size", "content"]),
+              default="size", show_default=True,
+              help="How closely to check that a file on the card matches.")
+@click.pass_context
+def device_adopt(ctx, device_ref, root, verify):
+    """Recognise files already on a card instead of recopying them.
+
+    Reads the card and writes only to the catalog. Use it once, after
+    pairing a device that some other tool already filled.
+    """
+    con = _con(ctx)
+    d = _require_device(con, device_ref)
+    root = _resolve_root(con, d, root)
+    with console.status(f"checking {d['name']} against the plan..."):
+        res = planner.adopt(con, d, root, verify=verify)
+    console.print(
+        f"[green]{res['adopted']:,}[/] of {res['considered']:,} files were "
+        f"already in place and have been recorded"
+        + (f", [yellow]{res['mismatched']:,}[/] differ" if res["mismatched"] else "")
+        + (f", {res['absent']:,} not on the card" if res["absent"] else "")
+    )
+    if res["adopted"]:
+        console.print("[dim]those will not be copied again. "
+                      "Run 'hoard plan' to see what is left.[/]")
+
+
 # ------------------------------------------------------------- plan/sync
 
 def _resolve_root(con, d, override):
