@@ -56,10 +56,14 @@ lemon-zest playlist import "C:/Users/ASUS/Music/hiby/playlist_data/Playlists_hib
 lemon-zest device detect
 lemon-zest device add E:/ --name "HiBy R1" --profile hiby
 
-# 4. Say what goes on it.
+# 4. Learn how this player names its own playlist files, so a sync replaces
+#    them instead of adding a second copy beside each one.
+lemon-zest device config "HiBy R1" --detect-playlists
+
+# 5. Say what goes on it.
 lemon-zest device set "HiBy R1" --playlist chill --playlist angsty --artist Radiohead
 
-# 5. Look before you leap, then sync.
+# 6. Look before you leap, then sync.
 lemon-zest plan "HiBy R1"
 lemon-zest sync "HiBy R1"
 ```
@@ -143,9 +147,31 @@ easiest part to test, which is why it was built first.
 ### Device identity
 
 A device is matched by **volume label**, with a `.lemon-zest-id` marker file at
-the card root as the tiebreaker. That is enough for a personal fleet and
+the card root as the tiebreaker. Cards paired before the project was renamed
+carry a `.hoard-id`; that file is still read and the id inside it is kept, so
+a rename never re-pairs a card or re-copies its contents. That is enough for a personal fleet and
 needs no native USB APIs. Give each card a distinct label; the marker keeps
 two cards apart even when the labels collide.
+
+### Playlist filenames
+
+A player names its playlists its own way. HiBy writes
+`chill-Tiến Nguyễn Hữu.m3u8`; something writing plain `chill.m3u8`
+onto that card does not replace the file the player reads, it adds a second
+one, and the player then lists both. So each device stores a
+`playlist_template` in which `{name}` is the playlist and everything around
+it is the device's spelling.
+
+`device config --detect-playlists` reads the card and works the template out
+from the files already there, matching the longest playlist name first so
+that `chill` cannot claim the file belonging to `chill-archive`. When
+nothing on the card carries a name the catalog knows, it declines to guess
+and leaves the stored template alone.
+
+The dry run reports this either way: every playlist line names the file it
+will land on and whether that replaces something, and any playlist file the
+sync would leave behind is listed separately. A dry run that reports only
+what it writes cannot tell you what survives next to it.
 
 ### Path handling
 
