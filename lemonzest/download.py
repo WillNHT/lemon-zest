@@ -214,6 +214,13 @@ def _child_env():
     # yt-dlp prints video titles; a cp1252 stdout on Windows would die on
     # the first non-Latin one.
     env["PYTHONIOENCODING"] = "utf-8"
+    # Python block-buffers stdout when it is a pipe rather than a terminal,
+    # so yt-dlp's output arrives in 8 KB instalments - which on a real
+    # download meant the progress bar sat still and the log stayed empty
+    # for minutes at a time while files were plainly landing on disk. A
+    # stub that exits immediately never shows this, because exiting
+    # flushes.
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 
