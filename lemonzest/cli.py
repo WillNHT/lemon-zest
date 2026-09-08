@@ -231,6 +231,10 @@ def download_cmd(ctx, urls, root, playlist_name, audio_format, audio_quality,
                 on_event=on_event, no_playlist=single, archive=not no_archive,
                 audio_format=audio_format, audio_quality=audio_quality)
         except dl_mod.DownloadError as exc:
+            # The last of the run, so the failure can be read rather than
+            # reproduced with a second download to find out what it said.
+            for line in getattr(exc, "log", [])[-15:]:
+                console.print(f"[dim]{line}[/]")
             raise click.ClickException(str(exc))
 
     if not summary["downloaded"]:

@@ -295,6 +295,7 @@ button { cursor: default; }
   background: var(--chrome); border-bottom: 1px solid var(--line-2); }
 .card > header h3 { font-size: 13px; font-weight: 700; }
 .card > .in { padding: 12px; }
+.card > header .grow { flex: 1 1 auto; }
 .grid { display: grid; gap: 12px; align-items: start; }
 .grid.two { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 
@@ -318,6 +319,21 @@ button { cursor: default; }
   background: #ddd6c8; overflow: hidden; }
 .bar > i { display: block; height: 100%; background: var(--accent);
   transition: width .18s linear; }
+
+/* A run, as text. The app disables selection everywhere else because it is
+   a tool, not a document - but a log exists to be copied into a bug report,
+   so this is the one place that opts back in. Lines wrap rather than
+   scrolling sideways: a truncated path is exactly what nobody can debug. */
+.console {
+  margin: 0; padding: 8px 10px; max-height: 320px; overflow: auto;
+  font: 10.5px/1.55 var(--mono); color: var(--ink-3);
+  background: var(--white); border-top: 1px solid var(--line);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  user-select: text; -webkit-user-select: text; cursor: text;
+}
+.console .err { color: var(--bad); }
+.console .cmd { color: var(--accent-ink); }
+.pick { user-select: text; -webkit-user-select: text; cursor: text; }
 
 .log { font: 10px var(--mono); }
 .log .line { display: flex; gap: 8px; padding: 2px 8px;

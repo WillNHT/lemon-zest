@@ -131,6 +131,17 @@ proceeds without cookies rather than refusing to start: plenty of videos
 need none. When YouTube does refuse, the error says which of these to fix
 rather than repeating yt-dlp's own wording.
 
+### When it goes wrong
+
+Every line yt-dlp writes is kept, along with the command that produced it -
+including which cookie source was chosen - and what Lemon Zest did
+afterwards: what it catalogued, and what went into a playlist. The interface
+shows it live as the download runs and keeps it afterwards, failure
+included; it is the one part of the app you can select and copy, because a
+log exists to be pasted into a bug report. The CLI prints the tail of it
+when a download fails, so a failure need not be reproduced to find out what
+it said.
+
 ## The interface
 
 ```bash
@@ -149,7 +160,8 @@ sync keeps going if you reload the page, and the catalog stays readable
 while it writes (SQLite in WAL mode).
 
 **Download** fetches audio from YouTube into a library folder, says up front
-which cookies it will use, and reports what it added. **Needs attention**
+which cookies it will use, reports what it added, and streams the whole run
+into a log you can select and copy. **Needs attention**
 collects everything worth a second look in one place:
 empty files (zero bytes on disk - failed downloads, which Lemon Zest refuses to
 copy rather than putting dead entries on the card), untagged files, and

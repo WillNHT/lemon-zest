@@ -66,8 +66,22 @@ CONFIG_DEFAULTS = {
 _PREFIX = "download."
 
 
+# How much of a run is kept for the log. A playlist of a few hundred videos
+# is chatty; this is enough to see the whole of a normal run and the end of
+# a long one, and it is held in memory, not on disk.
+MAX_LOG = 500
+
+
 class DownloadError(RuntimeError):
-    """yt-dlp failed. The message is written for the person who ran it."""
+    """yt-dlp failed. The message is written for the person who ran it.
+
+    ``log`` carries the run that produced the failure, so what went wrong
+    can be read - and copied out - rather than guessed at from one line.
+    """
+
+    def __init__(self, message, log=None):
+        super().__init__(message)
+        self.log = log or []
 
 
 # ------------------------------------------------------------------ config
@@ -394,6 +408,15 @@ def _resolve_root(con, cfg, root):
     return candidate
 
 
+def _printable(args):
+    """The command as something that can be pasted back into a shell.
+
+    Only arguments that need quoting get it, so the line stays readable;
+    this is a debugging aid, not a shell escaper.
+    """
+    return " ".join(f'"{a}"' if (" " in a or not a) else a for a in args)
+
+
 def _number(text):
     try:
         return int(float(text))
@@ -435,6 +458,13 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
 
     emit("start", "%d URL%s" % (len(urls), "" if len(urls) == 1 else "s"))
 
+    # The whole run, kept for the person reading it afterwards: the command
+    # first, because "what did it actually run" is the first question asked
+    # of a download that went wrong, and the answer includes which cookie
+    # source was chosen.
+    log = ["$ " + _printable(args)]
+    emit("command", log[0])
+
     files = []
     tail = []
     proc = subprocess.Popen(args, stdout=subprocess.PIPE,
@@ -454,12 +484,15 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                 path = line[len(FILE_PREFIX):].strip()
                 if path:
                     files.append(path)
+                    log.append("wrote " + path)
+                    del log[:-MAX_LOG]
                     emit("file", path, len(files), 0)
                 continue
             tail.append(line)
             del tail[:-60]
-            if "ERROR" in line:
-                emit("error", line)
+            log.append(line)
+            del log[:-MAX_LOG]
+            emit("error" if "ERROR" in line else "output", line)
     finally:
         proc.stdout.close()
         code = proc.wait()
@@ -469,18 +502,27 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     if code != 0 and not files:
         text = "\n".join(tail)
         last = next((l for l in reversed(tail) if l.strip()), "")
+        log.append("yt-dlp exited with status %d, having written nothing"
+                   % code)
         raise DownloadError(explain(text) or last
-                            or "yt-dlp exited with status %d" % code)
+                            or "yt-dlp exited with status %d" % code, log=log)
 
     arrived = [f for f in files if os.path.isfile(f)]
     emit("index", "%d file%s" % (len(arrived), "" if len(arrived) == 1 else "s"),
          len(arrived), len(arrived))
     counts, track_ids = scan_mod.index_paths(con, root, arrived)
+    log.append("yt-dlp exited with status %d" % code)
+    log.append("indexed %d added, %d updated, %d not catalogued"
+               % (counts["added"], counts["updated"], counts["failed"]))
 
     added_to = None
     if playlist and track_ids:
         added_to = pl_mod.append_tracks(con, playlist, track_ids,
                                         origin="download")
+        log.append("playlist %s: %d added, %d already there, %d entries"
+                   % (added_to["name"], added_to["added"], added_to["skipped"],
+                      added_to["entries"]))
+    del log[:-MAX_LOG]
 
     summary = {
         "root": norm(root),
@@ -492,6 +534,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         "playlist": added_to,
         "exit_code": code,
         "errors": [l for l in tail if "ERROR" in l][-10:],
+        "log": log,
         "at": time.time(),
     }
     emit("done", "%d downloaded" % len(arrived), len(arrived), len(arrived))
