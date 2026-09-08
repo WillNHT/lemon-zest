@@ -11,6 +11,7 @@ sense it makes of a failure, and the catalog and playlist state afterwards.
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,7 +22,7 @@ from lemonzest import db, download, playlists  # noqa: E402
 # the -o template's folder), prints a progress line and the after_move line
 # for each, and exits with LZ_FAKE_CODE.
 FAKE = '''
-import os, sys
+import os, sys, time
 args = sys.argv[1:]
 out = args[args.index("-o") + 1]
 paths = [args[i + 1] for i, a in enumerate(args) if a == "-P"]
@@ -51,6 +52,12 @@ for name in names:
         with open(archive, "a", encoding="utf-8") as fh:
             fh.write(name + "\\n")
 sys.stdout.write(os.environ.get("LZ_FAKE_STDERR", ""))
+linger = float(os.environ.get("LZ_FAKE_LINGER", "0"))
+if linger:
+    # Deliberately unflushed: this is what yt-dlp does, and the point of
+    # the test is that the parent asks the child not to buffer.
+    print("[youtube] still working")
+    time.sleep(linger)
 sys.exit(int(os.environ.get("LZ_FAKE_CODE", "0")))
 '''
 
@@ -70,6 +77,7 @@ class DownloadTests(unittest.TestCase):
         os.environ["LZ_FAKE_FILES"] = "Radiohead/Pablo Honey/Creep.m4a"
         os.environ.pop("LZ_FAKE_CODE", None)
         os.environ.pop("LZ_FAKE_STDERR", None)
+        os.environ.pop("LZ_FAKE_LINGER", None)
 
     def tearDown(self):
         download.ytdlp_command = self._real_command
@@ -175,6 +183,27 @@ class DownloadTests(unittest.TestCase):
         self.assertIn("file", kinds)
         self.assertIn("done", kinds)
         self.assertIn(("progress", 2048, 2048), events)
+
+    def test_output_arrives_while_the_download_is_still_running(self):
+        """A log that only appears at the end is not a progress report.
+
+        Iterating a text pipe reads ahead until its buffer fills, which on a
+        real download meant minutes of silence while files landed on disk.
+        The stub holds the pipe open after its first line to catch that.
+        """
+        os.environ["LZ_FAKE_FILES"] = ""
+        os.environ["LZ_FAKE_LINGER"] = "2"
+        seen = []
+        started = time.time()
+        download.download(self.con, ["https://example.test/v"], root=self.root,
+                          cfg=self.cfg(),
+                          on_event=lambda k, d, done, tot: seen.append(
+                              (k, time.time() - started)))
+        first_output = next(t for k, t in seen if k == "output")
+        elapsed = time.time() - started
+        self.assertGreater(elapsed, 1.5, "the stub should have lingered")
+        self.assertLess(first_output, 1.0,
+                        "output was withheld until the process exited")
 
     def test_several_files_from_one_url(self):
         os.environ["LZ_FAKE_FILES"] = "A/Album/one.m4a;A/Album/two.m4a"
