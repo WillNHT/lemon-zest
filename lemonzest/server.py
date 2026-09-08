@@ -29,6 +29,10 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 MAX_JOBS = 50
+# Per job. A download reports every line yt-dlp writes, and the whole run is
+# what someone pastes into a bug report, so the ring has to be long enough
+# to hold one rather than just the tail of one.
+MAX_EVENTS = 500
 
 
 def _new_job(kind, label):
@@ -58,7 +62,7 @@ def _push_event(job_id, kind, text):
         job = JOBS.get(job_id)
         if job is not None:
             job["events"].append({"kind": kind, "text": text, "at": time.time()})
-            del job["events"][:-200]
+            del job["events"][:-MAX_EVENTS]
 
 
 def create_app(db_path=None):
@@ -363,9 +367,12 @@ def create_app(db_path=None):
                 c = db_mod.connect(app.config["DB_PATH"])
 
                 def on_event(kind, detail, done, total):
+                    # Progress moves the bar but is not written down: it is
+                    # one line per chunk, and it would push the run's actual
+                    # output out of the log within seconds.
                     if kind == "progress":
                         _update(job_id, done=done, total=total, detail=detail)
-                    elif kind in ("file", "error", "index", "start"):
+                    else:
                         _update(job_id, detail=detail)
                         _push_event(job_id, kind, detail)
 
@@ -376,8 +383,13 @@ def create_app(db_path=None):
                         finished=time.time(),
                         detail=f"{summary['downloaded']} downloaded")
             except dl_mod.DownloadError as exc:
+                # The log is the point of a failed download: it is what gets
+                # copied into a bug report, so it outlives the job's event
+                # ring rather than only having been streamed past.
                 _update(job_id, state="failed", error=str(exc),
-                        finished=time.time())
+                        finished=time.time(),
+                        result={"log": getattr(exc, "log", []),
+                                "downloaded": 0, "files": []})
             except Exception as exc:
                 _update(job_id, state="failed", error=str(exc),
                         finished=time.time())
@@ -584,7 +596,9 @@ def create_app(db_path=None):
             if not job:
                 return jsonify({"error": "no such job"}), 404
             payload = dict(job)
-            payload["events"] = job["events"][-40:]
+            # The whole ring: a truncated log is the one thing a log must
+            # not be. It is local, and 500 short lines is a few tens of KB.
+            payload["events"] = list(job["events"])
         return jsonify(payload)
 
     @app.get("/api/jobs")

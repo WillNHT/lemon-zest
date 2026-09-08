@@ -122,6 +122,43 @@ class DownloadTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(self.root, download.ARCHIVE_NAME)))
 
+    def test_the_log_holds_the_whole_run(self):
+        """What gets pasted into a bug report: the command, then the run."""
+        summary = download.download(self.con, ["https://example.test/v"],
+                                    root=self.root, playlist="fresh",
+                                    cfg=self.cfg())
+        log = summary["log"]
+        self.assertTrue(log[0].startswith("$ "))
+        self.assertIn("--audio-format", log[0])
+        self.assertTrue(any(l.startswith("wrote ") for l in log))
+        self.assertTrue(any("indexed 1 added" in l for l in log))
+        self.assertTrue(any("playlist fresh: 1 added" in l for l in log))
+
+    def test_a_failure_carries_its_log(self):
+        os.environ["LZ_FAKE_FILES"] = ""
+        os.environ["LZ_FAKE_CODE"] = "1"
+        os.environ["LZ_FAKE_STDERR"] = "ERROR: [youtube] xyz: Private video\n"
+        with self.assertRaises(download.DownloadError) as caught:
+            download.download(self.con, ["https://example.test/v"],
+                              root=self.root, cfg=self.cfg())
+        log = caught.exception.log
+        self.assertTrue(log[0].startswith("$ "))
+        self.assertTrue(any("Private video" in l for l in log))
+        self.assertTrue(any("exited with status 1" in l for l in log))
+
+    def test_every_line_is_reported_as_it_arrives(self):
+        os.environ["LZ_FAKE_STDERR"] = "WARNING: something worth reading\n"
+        seen = []
+        download.download(self.con, ["https://example.test/v"], root=self.root,
+                          cfg=self.cfg(),
+                          on_event=lambda k, d, done, tot: seen.append((k, d)))
+        kinds = [k for k, _ in seen]
+        self.assertEqual(kinds[0], "start")
+        self.assertEqual(kinds[1], "command")
+        self.assertIn("output", kinds)
+        self.assertTrue(any("something worth reading" in d
+                            for k, d in seen if k == "output"))
+
     def test_progress_is_reported(self):
         events = []
         download.download(self.con, ["https://example.test/v"], root=self.root,

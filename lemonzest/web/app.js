@@ -617,6 +617,12 @@ function renderDownload() {
   const cfg = d.config, ck = d.cookies;
   const job = S.job && S.job.kind === 'download' ? S.job : null;
   const res = S.dlResult;
+  const failed = !!(job && job.state === 'failed');
+  // While it runs, the log is the event stream; once it is over, the run's
+  // own log, which also carries what happened after yt-dlp exited - what
+  // was catalogued, and what went into a playlist.
+  const logLines = (res && res.log && res.log.length) ? res.log
+    : (job && job.events ? job.events.map(e => e.text) : []);
   const field = 'border:1px solid var(--line-2);border-radius:3px;padding:4px 7px';
   const roots = d.roots.slice();
   if (cfg.root && !roots.includes(cfg.root)) roots.unshift(cfg.root);
@@ -642,7 +648,7 @@ function renderDownload() {
             style="${field};width:100%;font-family:var(--mono);resize:vertical"></textarea>
           <div class="hstack">
             <label class="muted">Into</label>
-            <select name="root" style="${field};flex:1">
+            <select name="root" style="${field};flex:1 1 12em;min-width:0">
               ${roots.map(r => `<option value="${h(r)}" ${r === cfg.root ? 'selected' : ''}>${h(r)}</option>`).join('')
                 || '<option value="">no library folder indexed yet</option>'}
             </select>
@@ -680,22 +686,37 @@ function renderDownload() {
             ${icon('i-warn')}<div>${h(job.error)}</div></div>` : ''}
         </div>` : ''}
 
-        ${res ? (res.downloaded ? `<div class="notice ok">${icon('i-check')}<div>
+        ${res && !failed ? (res.downloaded ? `<div class="notice ok">${icon('i-check')}<div>
             ${num(res.downloaded)} downloaded into
-            <span class="mono">${h(res.root)}</span> -
+            <span class="mono pick">${h(res.root)}</span> -
             ${num(res.added)} added to the catalog, ${num(res.updated)} updated.
             ${res.playlist ? `Playlist <strong>${h(res.playlist.name)}</strong>:
               ${num(res.playlist.added)} added${res.playlist.skipped
                 ? ', ' + num(res.playlist.skipped) + ' already there' : ''}.` : ''}
           </div></div>
           <table class="tbl"><tbody>${res.files.map(f => `<tr>
-            <td class="mono clip" title="${h(f)}">${h(f.slice(res.root.length + 1))}</td>
+            <td class="mono clip pick" title="${h(f)}">${h(f.slice(res.root.length + 1))}</td>
           </tr>`).join('')}</tbody></table>`
         : `<div class="notice">${icon('i-warn')}<div>Nothing new - every URL
-            was already in the download archive, or nothing could be fetched.</div></div>`) : ''}
+            was already in the download archive, or nothing could be fetched.
+            The log below says which.</div></div>`) : ''}
         ${res && res.errors && res.errors.length ? `<div class="notice bad">
-          ${icon('i-warn')}<div>${res.errors.map(e => h(e)).join('<br>')}</div></div>` : ''}
+          ${icon('i-warn')}<div class="pick">${res.errors.map(e => h(e)).join('<br>')}</div></div>` : ''}
       </div>
+    </div>
+
+    <div class="card">
+      <header><h3>Log</h3>
+        <span class="tag">${num(logLines.length)} lines</span>
+        <span class="muted">everything yt-dlp printed, plus what Lemon Zest
+          did with it. Selectable - copy it into a bug report.</span>
+        <span class="grow"></span>
+        <button class="btn sm" data-copylog="1"
+          ${logLines.length ? '' : 'disabled'}>Copy</button></header>
+      <pre class="console" id="dl-console">${logLines.map(line => {
+        const cls = /^\$ /.test(line) ? 'cmd' : /ERROR|error:/.test(line) ? 'err' : '';
+        return cls ? `<span class="${cls}">${h(line)}</span>` : h(line);
+      }).join('\n') || '<span class="faint">Nothing has run yet.</span>'}</pre>
     </div>
 
     <div class="card">
@@ -715,7 +736,7 @@ function renderDownload() {
                 `<option value="${v}" ${cfg.cookies_mode === v ? 'selected' : ''}>${h(t)}</option>`).join('')}
             </select>
             <label class="muted">Firefox profile</label>
-            <select name="firefox_profile" style="${field};flex:1">
+            <select name="firefox_profile" style="${field};flex:1 1 12em;min-width:0">
               <option value="">${ck.profiles.length
                 ? 'Most recently used' : 'none found on this machine'}</option>
               ${ck.profiles.map(p => `<option value="${h(p.name)}"
@@ -885,6 +906,21 @@ function render() {
   $('#pane').innerHTML = body ? body() : '';
   renderStatus();
   if (S.view === 'addDevice') loadVolumes();
+  // Follow a running download; leave a finished one where the reader put it,
+  // so scrolling back through a failure is not undone by the next poll.
+  if (S.view === 'download' && S.job && S.job.kind === 'download'
+      && S.job.state === 'running') {
+    const el = $('#dl-console');
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+}
+
+function selectNode(el) {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
 }
 
 async function loadVolumes() {
@@ -924,7 +960,7 @@ document.addEventListener('click', (ev) => {
     + '[data-plan],[data-sync],[data-unset],[data-pick-set],[data-save-set],'
     + '[data-detect-pl],'
     + '[data-close],[data-scrim],[data-usevol],[data-scan],[data-volumes],'
-    + '[data-probe],'
+    + '[data-probe],[data-copylog],'
     + '[data-plsync],[data-playlist],[data-track]');
   if (!t) return;
 
@@ -1060,6 +1096,27 @@ document.addEventListener('click', (ev) => {
       form.root.value = d.usevol;
       if (!form.name.value) form.name.value = d.label || d.usevol;
       form.name.focus();
+    }
+    return;
+  }
+  if (d.copylog) {
+    const el = $('#dl-console');
+    if (!el) return;
+    const text = el.innerText;
+    // The clipboard API needs a secure context; 127.0.0.1 counts as one.
+    // Selecting the text is the fallback, and is what a user would have
+    // done by hand anyway.
+    const say = (ok) => {
+      t.textContent = ok ? 'Copied' : 'Select and copy';
+      setTimeout(() => { t.textContent = 'Copy'; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => say(true), () => {
+        selectNode(el); say(false);
+      });
+    } else {
+      selectNode(el);
+      say(false);
     }
     return;
   }
