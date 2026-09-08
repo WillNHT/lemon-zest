@@ -14,8 +14,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hoard import db, devices, executor, planner, playlists, scan  # noqa: E402
-from hoard.paths import dedupe, safe_component  # noqa: E402
+from lemonzest import db, devices, executor, planner, playlists, scan  # noqa: E402
+from lemonzest.paths import dedupe, safe_component  # noqa: E402
 
 FFMPEG = shutil.which("ffmpeg")
 
@@ -59,7 +59,7 @@ class SyncTests(unittest.TestCase):
     def setUp(self):
         if not FFMPEG:
             self.skipTest("ffmpeg is needed to generate test audio")
-        self.tmp = tempfile.mkdtemp(prefix="hoard-test-")
+        self.tmp = tempfile.mkdtemp(prefix="lz-test-")
         self.lib = os.path.join(self.tmp, "library")
         self.card = os.path.join(self.tmp, "card")
         os.makedirs(self.card)
@@ -74,7 +74,7 @@ class SyncTests(unittest.TestCase):
                          title=title, track=i)
                 self.files.append(p)
 
-        self.con = db.connect(os.path.join(self.tmp, "hoard.db"))
+        self.con = db.connect(os.path.join(self.tmp, "lemon-zest.db"))
         scan.scan(self.con, self.lib)
 
         # A playlist over three of the five tracks.
@@ -210,7 +210,7 @@ class SyncTests(unittest.TestCase):
             executor._copy_one = real_copy
 
         stray = [f for _, _, fs in os.walk(self.card) for f in fs
-                 if f.endswith(".hoard-tmp")]
+                 if f.endswith(".lz-tmp")]
         self.assertEqual(stray, [], "a partial file was left on the card")
 
         # Resume: the one file that landed is kept, the rest are copied.
@@ -275,8 +275,8 @@ class SyncTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "escape.mp3")))
 
     def test_marker_identifies_the_device(self):
-        self.assertTrue(os.path.exists(os.path.join(self.card, ".hoard-id")))
-        self.assertEqual(devices.read_marker(self.card), self.device["hoard_id"])
+        self.assertTrue(os.path.exists(os.path.join(self.card, ".lemon-zest-id")))
+        self.assertEqual(devices.read_marker(self.card), self.device["device_uid"])
         found = devices.locate(self.con, self.device)
         self.assertEqual(os.path.abspath(found), os.path.abspath(self.card))
 
@@ -294,7 +294,7 @@ class PathTests(unittest.TestCase):
 
     def test_a_slash_in_a_tag_does_not_create_a_folder(self):
         """An artist called AC/DC must land in AC_DC/, not AC/DC/."""
-        from hoard.paths import render_template
+        from lemonzest.paths import render_template
         track = {"artist": "AC/DC", "album_artist": "AC/DC",
                  "album": "Back In Black", "title": "Shoot to Thrill",
                  "track_no": 2, "disc_no": 1, "year": "1980", "genre": "Rock",
@@ -306,14 +306,14 @@ class PathTests(unittest.TestCase):
         self.assertEqual(rel.count("/"), 2)
 
     def test_rel_path_template_mirrors_the_library(self):
-        from hoard.paths import render_template
+        from lemonzest.paths import render_template
         track = {"rel_path": "Some Artist/An Album/03 Track.mp3",
                  "path": "/lib/Some Artist/An Album/03 Track.mp3"}
         self.assertEqual(render_template("{rel_path}", track),
                          "Some Artist/An Album/03 Track.mp3")
 
     def test_unicode_normalisation(self):
-        from hoard.playlists import norm_name
+        from lemonzest.playlists import norm_name
         nfc = "Tiến"          # precomposed
         nfd = "Tiến"  # decomposed
         self.assertEqual(norm_name(nfc), norm_name(nfd))

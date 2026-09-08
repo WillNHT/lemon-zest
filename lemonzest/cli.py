@@ -32,7 +32,7 @@ def human(n):
 @click.option("--db", "db_path", default=None, help="Catalog path.")
 @click.pass_context
 def cli(ctx, db_path):
-    """Hoard - sync a local music library to portable players."""
+    """Lemon Zest - sync a local music library to portable players."""
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db_path or default_db_path()
 
@@ -181,7 +181,7 @@ def device_detect(show_all):
     for v in vols:
         t.add_row(v["mountpoint"], v["label"] or "[dim]unlabelled[/]",
                   v["fstype"], gb(v["total"]), gb(v["free"]),
-                  "[green]yes[/]" if v["hoard_id"] else "no")
+                  "[green]yes[/]" if v["device_uid"] else "no")
     console.print(t)
 
 
@@ -197,7 +197,7 @@ def device_add(ctx, root, name, profile):
     row = dev_mod.register(con, root, name=name, profile=profile)
     console.print(
         f"[green]paired[/] {row['name']}  label={row['label'] or '-'}  "
-        f"profile={row['profile']}  id={row['hoard_id'][:8]}"
+        f"profile={row['profile']}  id={row['device_uid'][:8]}"
     )
     if not row["label"]:
         console.print("[yellow]note:[/] this volume has no label. Give it one "
@@ -213,7 +213,7 @@ def device_list(ctx):
     rows = con.execute("SELECT * FROM device ORDER BY name").fetchall()
     if not rows:
         console.print("[yellow]no devices paired yet.[/] "
-                      "Try: hoard device detect")
+                      "Try: lemon-zest device detect")
         return
     t = Table("name", "label", "profile", "set", "on card", "mounted", "last sync",
               box=None)
@@ -304,7 +304,7 @@ def device_config(ctx, device_ref, template, music_dir, playlist_dir, name, labe
     t.add_column("", style="dim")
     t.add_column("")
     for key in ("name", "label", "profile", "music_dir", "playlist_dir",
-                "path_template", "root", "hoard_id"):
+                "path_template", "root", "device_uid"):
         t.add_row(key, str(d[key]))
     console.print(t)
 
@@ -335,7 +335,7 @@ def device_adopt(ctx, device_ref, root, verify):
     )
     if res["adopted"]:
         console.print("[dim]those will not be copied again. "
-                      "Run 'hoard plan' to see what is left.[/]")
+                      "Run 'lemon-zest plan' to see what is left.[/]")
 
 
 # ------------------------------------------------------------- plan/sync
@@ -403,7 +403,7 @@ def _print_plan(p, space):
 @click.argument("device_ref")
 @click.option("--root", default=None, help="Where the device is mounted.")
 @click.option("--prune", is_flag=True,
-              help="Also remove files under the music folder that Hoard did "
+              help="Also remove files under the music folder that Lemon Zest did "
                    "not put there.")
 @click.pass_context
 def plan_cmd(ctx, device_ref, root, prune):
@@ -420,7 +420,7 @@ def plan_cmd(ctx, device_ref, root, prune):
 @click.argument("device_ref")
 @click.option("--root", default=None, help="Where the device is mounted.")
 @click.option("--prune", is_flag=True,
-              help="Also remove files under the music folder that Hoard did "
+              help="Also remove files under the music folder that Lemon Zest did "
                    "not put there.")
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
 @click.pass_context
@@ -535,7 +535,7 @@ def doctor_cmd(ctx, directory):
         factor = tot / max(uniq_tot, 1)
         console.print(
             f"[red]these playlists have grown {factor:.1f}x[/] - each sync "
-            "appended instead of replacing. Hoard rewrites playlists in "
+            "appended instead of replacing. Lemon Zest rewrites playlists in "
             "place, so syncing with it once will collapse them back."
         )
 
@@ -552,7 +552,7 @@ def gui_cmd(ctx, port, host, no_browser):
     except ImportError:
         raise click.ClickException(
             "the interface needs Flask: pip install flask")
-    console.print(f"[green]Hoard[/] running at http://{host}:{port}/  "
+    console.print(f"[green]Lemon Zest[/] running at http://{host}:{port}/  "
                   f"[dim](ctrl-c to stop)[/]")
     serve(db_path=ctx.obj["db_path"], host=host, port=port,
           open_browser=not no_browser)

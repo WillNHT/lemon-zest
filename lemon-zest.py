@@ -1,4 +1,4 @@
-from hoard.cli import main
+from lemonzest.cli import main
 
 if __name__ == "__main__":
     main()

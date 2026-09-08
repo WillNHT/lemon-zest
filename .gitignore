@@ -5,6 +5,9 @@ __pycache__/
 hoard.db
 hoard.db-wal
 hoard.db-shm
+lemon-zest.db
+lemon-zest.db-wal
+lemon-zest.db-shm
 *.log
 cookies.txt
 .testcard/

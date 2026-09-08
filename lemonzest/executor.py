@@ -37,7 +37,7 @@ def _inside(root, path):
 def _copy_one(src, dst, expect_size=None):
     """Copy with a temp name and an atomic rename. Returns bytes written."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    tmp = dst + ".hoard-tmp"
+    tmp = dst + ".lz-tmp"
     written = 0
     try:
         with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:

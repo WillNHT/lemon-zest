@@ -138,9 +138,9 @@ def plan(con, device, root, prune=False):
     """Compute the full action list for one device.
 
     ``root`` is where the device is mounted right now. ``prune`` widens
-    deletion from "files Hoard put there" to "anything under the music
+    deletion from "files Lemon Zest put there" to "anything under the music
     folder that is not planned" - off by default, because deleting files a
-    user placed by hand is not Hoard's call.
+    user placed by hand is not Lemon Zest's call.
     """
     tracks, playlist_names = desired_tracks(con, device["id"])
     music_dir = device["music_dir"].strip("/")
@@ -170,7 +170,7 @@ def plan(con, device, root, prune=False):
         for dirpath, dirnames, filenames in os.walk(music_root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for fn in filenames:
-                if fn.startswith(".") or fn.endswith(".hoard-tmp"):
+                if fn.startswith(".") or fn.endswith((".lz-tmp", ".hoard-tmp")):
                     continue
                 full = os.path.join(dirpath, fn)
                 rel = norm(os.path.relpath(full, music_root))
@@ -252,7 +252,7 @@ def plan(con, device, root, prune=False):
                               "entries": entries, "skipped": skipped,
                               "filename": pl_filename(name)})
 
-    # Playlist files Hoard wrote that this plan no longer includes.
+    # Playlist files Lemon Zest wrote that this plan no longer includes.
     planned_files = {p["filename"] for p in playlist_plan}
     playlist_deletes = [
         {"filename": r["filename"], "name": r["name"]}

@@ -2,7 +2,7 @@
 import os
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -64,7 +64,7 @@ CREATE INDEX IF NOT EXISTS ix_pe_track ON playlist_entry(track_id);
 
 CREATE TABLE IF NOT EXISTS device (
     id            INTEGER PRIMARY KEY,
-    hoard_id      TEXT NOT NULL UNIQUE,  -- uuid in .hoard-id at the device root
+    device_uid    TEXT NOT NULL UNIQUE,  -- uuid in the marker file at the device root
     label         TEXT,                  -- volume label, the everyday lookup
     name          TEXT NOT NULL,
     root          TEXT,                  -- last known mount point
@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS device (
     music_dir     TEXT NOT NULL DEFAULT 'Music',
     playlist_dir  TEXT NOT NULL DEFAULT 'Music',
     path_template TEXT NOT NULL DEFAULT '{album_artist}/{album}/{track:02d} {title}{ext}',
+    -- How the player names its own playlist files. Writing to any other
+    -- spelling adds a second playlist beside the one already there.
+    playlist_template TEXT NOT NULL DEFAULT '{name}.m3u8',
     created_at    REAL,
     last_seen     REAL,
     last_sync     REAL
@@ -86,7 +89,7 @@ CREATE TABLE IF NOT EXISTS device_set (
     PRIMARY KEY (device_id, kind, ref)
 );
 
--- Observed set: what Hoard believes is physically on the card.
+-- Observed set: what Lemon Zest believes is physically on the card.
 CREATE TABLE IF NOT EXISTS device_manifest (
     device_id   INTEGER NOT NULL REFERENCES device(id) ON DELETE CASCADE,
     dest_rel    TEXT NOT NULL,
@@ -98,7 +101,7 @@ CREATE TABLE IF NOT EXISTS device_manifest (
 );
 CREATE INDEX IF NOT EXISTS ix_dm_track ON device_manifest(device_id, track_id);
 
--- Playlist files Hoard has written to a device, so that unticking a
+-- Playlist files Lemon Zest has written to a device, so that unticking a
 -- playlist removes its file instead of leaving a stale one behind.
 CREATE TABLE IF NOT EXISTS device_playlist (
     device_id  INTEGER NOT NULL REFERENCES device(id) ON DELETE CASCADE,
@@ -121,10 +124,47 @@ CREATE INDEX IF NOT EXISTS ix_log_dev ON sync_log(device_id, id DESC);
 """
 
 
+# Where the catalog lived when the project was called Hoard. A user who
+# already has one keeps using it: the file holds the scanned library, the
+# device pairings and the manifest, and moving it silently would be a worse
+# outcome than a slightly stale path.
+LEGACY_DB = os.path.join(os.path.expanduser("~"), ".hoard", "hoard.db")
+
+
 def default_db_path():
-    return os.environ.get("HOARD_DB") or os.path.join(
-        os.path.expanduser("~"), ".hoard", "hoard.db"
-    )
+    env = os.environ.get("LEMONZEST_DB") or os.environ.get("HOARD_DB")
+    if env:
+        return env
+    current = os.path.join(os.path.expanduser("~"), ".lemon-zest", "lemon-zest.db")
+    if not os.path.exists(current) and os.path.exists(LEGACY_DB):
+        return LEGACY_DB
+    return current
+
+
+def _columns(con, table):
+    try:
+        return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return set()
+
+
+def migrate(con):
+    """Bring an older catalog up to the current shape.
+
+    Runs before the schema script, because CREATE TABLE IF NOT EXISTS will
+    not touch a table that is already there. Each step is guarded by what
+    the database actually holds rather than by a stored version number, so
+    a half-applied upgrade finishes on the next open.
+    """
+    cols = _columns(con, "device")
+    if not cols:
+        return
+    if "hoard_id" in cols and "device_uid" not in cols:
+        con.execute("ALTER TABLE device RENAME COLUMN hoard_id TO device_uid")
+    if "playlist_template" not in cols:
+        con.execute("ALTER TABLE device ADD COLUMN playlist_template "
+                    "TEXT NOT NULL DEFAULT '{name}.m3u8'")
+    con.commit()
 
 
 def connect(path=None):
@@ -135,9 +175,11 @@ def connect(path=None):
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.execute("PRAGMA foreign_keys=ON")
+    migrate(con)
     con.executescript(SCHEMA)
     con.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
+        "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(SCHEMA_VERSION),),
     )
     con.commit()

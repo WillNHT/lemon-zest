@@ -1,4 +1,4 @@
-/* Hoard UI.
+/* Lemon Zest UI.
    Plain ES modules-free JavaScript, no build step, no CDN: the app is served
    from the same local process that owns the catalog, so it should work with
    the network unplugged. State lives in one object; every mutation calls
@@ -371,7 +371,7 @@ function renderDevice() {
   if (!d.mounted_at) {
     planBody = `<div class="notice warn">${icon('i-warn')}
       <div><b>${h(d.name)} is not mounted.</b><br>
-      Plug it in; Hoard finds it by its volume label and the marker file at
+      Plug it in; Lemon Zest finds it by its volume label and the marker file at
       the card root. Last seen at <span class="mono">${h(d.root || 'unknown')}</span>.</div></div>`;
   } else if (S.planning) {
     planBody = '<div class="hstack"><span class="spin"></span> working out what needs to change...</div>';
@@ -507,8 +507,8 @@ function renderAddDevice() {
         <button class="btn" data-volumes="1">Rescan volumes</button></header>
       <div class="in stack">
         <p class="muted">Pick a mounted volume, or type a folder to treat as
-          one. Hoard identifies a device by its volume label and writes a
-          <span class="mono">.hoard-id</span> marker at the root, so two cards
+          one. Lemon Zest identifies a device by its volume label and writes a
+          <span class="mono">.lemon-zest-id</span> marker at the root, so two cards
           with the same name never get their plans crossed.</p>
         <div id="volumes"><span class="spin"></span></div>
         <form id="add-device-form" class="grid two" style="align-items:end">
@@ -601,7 +601,7 @@ function renderProblems() {
     </div>` : '';
 
   return `<div class="pad stack">
-    ${fileCard('Empty files', 'zero bytes on disk - failed downloads. Hoard skips these when syncing rather than putting dead entries on the card.', p.empty, p.empty_total)}
+    ${fileCard('Empty files', 'zero bytes on disk - failed downloads. Lemon Zest skips these when syncing rather than putting dead entries on the card.', p.empty, p.empty_total)}
     ${fileCard('Untagged files', 'no title tag, so they sort last and their destination path falls back to the filename.', p.untagged, p.untagged_total)}
     ${p.unmatched.length ? `<div class="card">
       <header><h3>Unmatched playlist entries</h3>
@@ -719,7 +719,7 @@ async function loadVolumes() {
         <td class="mono">${h(v.fstype)}</td>
         <td class="num">${bytes(v.total)}</td>
         <td class="num">${bytes(v.free)}</td>
-        <td class="right">${v.hoard_id
+        <td class="right">${v.device_uid
           ? '<span class="tag ok">paired</span>'
           : `<button class="btn sm" data-usevol="${h(v.mountpoint)}"
                data-label="${h(v.label || '')}">Use this</button>`}</td>

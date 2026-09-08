@@ -4,7 +4,7 @@ Two hazards this module exists to contain, both observed in the real library:
 
   * Unicode normalisation. Vietnamese filenames round-trip as NFC on one
     filesystem and NFD on another, so a literal string compare reports a
-    missing file that is plainly there. Every path Hoard stores or compares
+    missing file that is plainly there. Every path Lemon Zest stores or compares
     goes through ``norm`` first.
   * FAT32/exFAT naming. The card rejects characters Windows and Linux allow,
     dislikes trailing dots and spaces, and is case-insensitive, so two tracks
