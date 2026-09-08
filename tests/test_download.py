@@ -334,6 +334,12 @@ class DownloadTests(unittest.TestCase):
                             and download.INCOMPLETE_DIR in p for p in paths))
         # A user's own yt-dlp.conf must not redirect the output.
         self.assertIn("--ignore-config", args)
+        # --print implies --quiet, which the WHEN prefix does not undo, and
+        # a quiet yt-dlp emits no progress at all: the bar never moved and
+        # the log held only warnings. A stub cannot catch this, since it
+        # prints whatever it likes regardless.
+        self.assertIn("--no-quiet", args)
+        self.assertLess(args.index("--print"), args.index("--no-quiet"))
         self.assertEqual(args[-1], "u")
 
     # --------------------------------------------------- javascript runtime
