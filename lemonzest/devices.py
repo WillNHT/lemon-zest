@@ -35,6 +35,7 @@ PROFILES = {
         "playlist_dir": "Music",
         "music_dir": "Music",
         "encode_playlist_paths": False,
+        "playlist_template": "{name}.m3u8",
         "notes": "Folders and m3u8. No format ceiling enforced.",
     },
     "hiby": {
@@ -43,6 +44,10 @@ PROFILES = {
         "playlist_dir": "Music",
         "music_dir": "Music",
         "encode_playlist_paths": True,
+        # HiBy names its own playlists "<name>-<owner>.m3u8", where the owner
+        # is whatever the account is called - so the suffix cannot be a
+        # constant here. Pair, then run "device config --detect-playlists".
+        "playlist_template": "{name}.m3u8",
         "notes": "Reads m3u8 with percent-encoded relative paths from the music folder.",
     },
     "rockbox": {
@@ -51,6 +56,7 @@ PROFILES = {
         "playlist_dir": "Playlists",
         "music_dir": "Music",
         "encode_playlist_paths": False,
+        "playlist_template": "{name}.m3u8",
         "notes": "Plain relative paths; playlists in their own folder.",
     },
 }
@@ -168,13 +174,15 @@ def register(con, root, name=None, profile="ums", label=None):
     now = time.time()
     con.execute(
         "INSERT INTO device(device_uid, label, name, root, profile, music_dir, "
-        "playlist_dir, created_at, last_seen) VALUES (?,?,?,?,?,?,?,?,?) "
+        "playlist_dir, playlist_template, created_at, last_seen) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(device_uid) DO UPDATE SET label=excluded.label, "
         "name=excluded.name, root=excluded.root, profile=excluded.profile, "
         "music_dir=excluded.music_dir, playlist_dir=excluded.playlist_dir, "
         "last_seen=excluded.last_seen",
         (device_uid, label, name, root, profile, spec["music_dir"],
-         spec["playlist_dir"], now, now),
+         spec["playlist_dir"], spec.get("playlist_template", "{name}.m3u8"),
+         now, now),
     )
     con.commit()
     return con.execute("SELECT * FROM device WHERE device_uid=?", (device_uid,)).fetchone()

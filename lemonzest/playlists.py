@@ -223,5 +223,89 @@ def import_dir(con, directory, recursive=False):
     return results
 
 
+DEFAULT_TEMPLATE = "{name}.m3u8"
+_PL_EXT = (".m3u8", ".m3u")
+
+
+def filename_for(name, template=DEFAULT_TEMPLATE):
+    """Render a playlist's filename the way the player itself spells it.
+
+    A player writes its own playlists under its own convention - HiBy's are
+    "chill-<owner>.m3u8" - and a writer that ignores that convention does
+    not fix the file it was meant to replace, it adds a second one beside
+    it. The device therefore owns a filename template, of which "{name}" is
+    the playlist's own name; everything around it is the device's spelling.
+
+    The name is sanitised as a single path component before substitution,
+    so a playlist called "AC/DC live" cannot turn the filename into a path.
+    """
+    template = (template or DEFAULT_TEMPLATE).strip() or DEFAULT_TEMPLATE
+    try:
+        rendered = template.replace("{name}", safe_component(norm_name(name)))
+    except Exception:
+        rendered = safe_component(norm_name(name)) + ".m3u8"
+    if not rendered.lower().endswith(_PL_EXT):
+        rendered += ".m3u8"
+    return safe_component(rendered)
+
+
 def safe_filename(name):
-    return safe_component(name + ".m3u8")
+    """Back-compatible default spelling: "<name>.m3u8"."""
+    return filename_for(name, DEFAULT_TEMPLATE)
+
+
+def template_of(device):
+    """Read a device row's playlist template, tolerating an older row."""
+    try:
+        keys = device.keys()
+    except AttributeError:
+        keys = device
+    if "playlist_template" in keys:
+        return device["playlist_template"] or DEFAULT_TEMPLATE
+    return DEFAULT_TEMPLATE
+
+
+def list_playlist_files(directory):
+    """Playlist filenames sitting directly in a folder. Never recurses."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n.lower().endswith(_PL_EXT)
+                  and os.path.isfile(os.path.join(directory, n)))
+
+
+def infer_template(filenames, known_names):
+    """Work out a device's own playlist naming from what is already there.
+
+    Every filename that contains one of the catalog's playlist names votes
+    for the prefix and suffix wrapped around it; the winning pair is the
+    device's template. Returns (template, matches, total) - or (None, 0, n)
+    when nothing lines up, which is the honest answer for a card whose
+    playlists came from somewhere else entirely.
+
+    Longest name first, so "chill" does not claim a file belonging to
+    "chill winter" and report a suffix of " winter".
+    """
+    names = sorted({norm_name(n) for n in known_names if norm_name(n)},
+                   key=len, reverse=True)
+    votes = {}
+    matched = 0
+    for fn in filenames:
+        stem, dot, ext = norm_name(fn).rpartition(".")
+        if not dot:
+            continue
+        low = stem.casefold()
+        for n in names:
+            i = low.find(n.casefold())
+            if i < 0:
+                continue
+            key = (stem[:i], stem[i + len(n):], ext)
+            votes[key] = votes.get(key, 0) + 1
+            matched += 1
+            break
+    if not votes:
+        return None, 0, len(filenames)
+    (prefix, suffix, ext), count = max(votes.items(), key=lambda kv: kv[1])
+    return f"{prefix}{{name}}{suffix}.{ext}", count, len(filenames)

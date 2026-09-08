@@ -274,6 +274,80 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(any("outside device" in e for e in summary["errors"]))
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "escape.mp3")))
 
+    # -- the device's own playlist naming -------------------------------
+
+    def _set_template(self, template):
+        self.con.execute("UPDATE device SET playlist_template=? WHERE id=?",
+                         (template, self.device["id"]))
+        self.con.commit()
+        self.device = devices.find(self.con, "Card")
+
+    def _card_playlists(self):
+        return playlists.list_playlist_files(os.path.join(self.card, "Music"))
+
+    def test_sync_replaces_the_players_own_playlist_file(self):
+        """The whole point: one playlist in, one playlist file out.
+
+        The card arrives with a playlist the player itself wrote, under the
+        player's own naming. Syncing must land on that file, not beside it.
+        """
+        self._set_template("{name}-Owner.m3u8")
+        os.makedirs(os.path.join(self.card, "Music"), exist_ok=True)
+        stale = os.path.join(self.card, "Music", "mix-Owner.m3u8")
+        with open(stale, "w", encoding="utf-8", newline="") as fh:
+            fh.write("#EXTM3U\r\n" + "Alpha/First/01 One.mp3\r\n" * 40)
+
+        p = self._plan()
+        self.assertEqual([x["filename"] for x in p["playlists"]],
+                         ["mix-Owner.m3u8"])
+        self.assertEqual(p["playlists"][0]["replaces"], "mix-Owner.m3u8")
+        self.assertEqual(p["playlist_strays"], [])
+
+        self._sync()
+        self.assertEqual(self._card_playlists(), ["mix-Owner.m3u8"])
+        parsed = playlists.read(stale)
+        self.assertEqual(len(parsed["entries"]), 3)
+
+    def test_plan_reports_the_playlist_it_would_leave_behind(self):
+        """The defect the first dry run could not see.
+
+        With the default naming against a card that spells playlists its own
+        way, a sync adds a second file rather than replacing the first. The
+        plan has to say so - reporting only what it will write is what made
+        this invisible.
+        """
+        os.makedirs(os.path.join(self.card, "Music"), exist_ok=True)
+        theirs = os.path.join(self.card, "Music", "mix-Owner.m3u8")
+        with open(theirs, "w", encoding="utf-8", newline="") as fh:
+            fh.write("#EXTM3U\r\n")
+
+        p = self._plan()
+        self.assertEqual(p["playlists"][0]["filename"], "mix.m3u8")
+        self.assertIsNone(p["playlists"][0]["replaces"])
+        self.assertEqual([(x["filename"], x["shadows"])
+                          for x in p["playlist_strays"]],
+                         [("mix-Owner.m3u8", "mix")])
+
+        self._sync()
+        self.assertEqual(self._card_playlists(),
+                         ["mix-Owner.m3u8", "mix.m3u8"])
+
+    def test_detecting_the_template_from_the_card(self):
+        files = ["chill-Owner.m3u8", "mix-Owner.m3u8", "unrelated.m3u8"]
+        template, matched, total = playlists.infer_template(
+            files, ["mix", "chill", "absent"])
+        self.assertEqual((template, matched, total), ("{name}-Owner.m3u8", 2, 3))
+
+    def test_detection_prefers_the_longer_playlist_name(self):
+        """"chill" must not claim a file that belongs to "chill winter"."""
+        template, matched, _ = playlists.infer_template(
+            ["chill winter-Owner.m3u8"], ["chill", "chill winter"])
+        self.assertEqual((template, matched), ("{name}-Owner.m3u8", 1))
+
+    def test_detection_declines_to_guess(self):
+        self.assertEqual(playlists.infer_template(["something.m3u8"], ["mix"]),
+                         (None, 0, 1))
+
     def test_marker_identifies_the_device(self):
         self.assertTrue(os.path.exists(os.path.join(self.card, ".lemon-zest-id")))
         self.assertEqual(devices.read_marker(self.card), self.device["device_uid"])
@@ -311,6 +385,17 @@ class PathTests(unittest.TestCase):
                  "path": "/lib/Some Artist/An Album/03 Track.mp3"}
         self.assertEqual(render_template("{rel_path}", track),
                          "Some Artist/An Album/03 Track.mp3")
+
+    def test_playlist_filename_follows_the_device_template(self):
+        from lemonzest.playlists import filename_for
+        self.assertEqual(filename_for("mix"), "mix.m3u8")
+        self.assertEqual(filename_for("mix", "{name}-Owner.m3u8"),
+                         "mix-Owner.m3u8")
+        # A template without an extension still produces a playlist file.
+        self.assertEqual(filename_for("mix", "{name}"), "mix.m3u8")
+        # A slash in a playlist name is a character, never a path separator.
+        self.assertEqual(filename_for("rock/pop", "{name}.m3u8"),
+                         "rock_pop.m3u8")
 
     def test_unicode_normalisation(self):
         from lemonzest.playlists import norm_name

@@ -13,7 +13,26 @@ from . import devices as dev_mod
 from . import executor, planner, playlists, scan
 from .db import connect, default_db_path
 
-console = Console()
+def _utf8_console():
+    """Print Vietnamese on a Windows console without dying.
+
+    The library this is built for is full of Vietnamese titles, and the
+    device's own playlists are named after its owner. A default Windows
+    console encodes stdout as cp1252, so the first attempt to print one of
+    those names raises UnicodeEncodeError and takes the command down with
+    it - a crash for the exact data the project exists to handle. Ask for
+    UTF-8, and fall back to replacing what the terminal cannot draw, since
+    an approximate character is a better outcome than no output.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    return Console()
+
+
+console = _utf8_console()
 
 
 def gb(n):
@@ -278,6 +297,28 @@ def device_set(ctx, device_ref, playlists_, artists, albums, remove, clear):
         console.print(f"   [dim]{r['kind']:9}[/] {r['ref']}")
 
 
+def _detect_playlist_template(con, d):
+    """Read a mounted card and report the naming its own playlists use.
+
+    Returns the template, or None when the card holds no playlist file
+    carrying a name this catalog knows - in which case the stored template
+    is left alone rather than replaced with a guess.
+    """
+    root = _resolve_root(con, d, None)
+    pl_dir = (d["playlist_dir"] or "").strip("/")
+    pl_root = os.path.join(root, pl_dir) if pl_dir else root
+    files = playlists.list_playlist_files(pl_root)
+    names = [r["name"] for r in con.execute("SELECT name FROM playlist")]
+    template, matched, total = playlists.infer_template(files, names)
+    if not template:
+        console.print(f"[yellow]none of the {total} playlist files in "
+                      f"{pl_root} carry a name this catalog knows[/]")
+        return None
+    console.print(f"[green]{matched} of {total}[/] playlist files on the card "
+                  f"are named [bold]{template}[/]")
+    return template
+
+
 @device.command("config")
 @click.argument("device_ref")
 @click.option("--template", default=None,
@@ -285,15 +326,24 @@ def device_set(ctx, device_ref, playlists_, artists, albums, remove, clear):
                    "library's own folder layout.")
 @click.option("--music-dir", default=None, help="Folder on the card for audio.")
 @click.option("--playlist-dir", default=None, help="Folder for playlists.")
+@click.option("--playlist-template", default=None,
+              help="How this player names its playlist files, with {name} "
+                   "standing for the playlist itself.")
+@click.option("--detect-playlists", is_flag=True,
+              help="Read the mounted card and adopt its own playlist naming.")
 @click.option("--name", default=None)
 @click.option("--label", default=None, help="Record the volume label.")
 @click.pass_context
-def device_config(ctx, device_ref, template, music_dir, playlist_dir, name, label):
+def device_config(ctx, device_ref, template, music_dir, playlist_dir,
+                  playlist_template, detect_playlists, name, label):
     """Show or change how a device is laid out."""
     con = _con(ctx)
     d = _require_device(con, device_ref)
+    if detect_playlists:
+        playlist_template = _detect_playlist_template(con, d) or playlist_template
     changes = {"path_template": template, "music_dir": music_dir,
-               "playlist_dir": playlist_dir, "name": name, "label": label}
+               "playlist_dir": playlist_dir, "name": name, "label": label,
+               "playlist_template": playlist_template}
     changes = {k: v for k, v in changes.items() if v is not None}
     for key, val in changes.items():
         con.execute(f"UPDATE device SET {key}=? WHERE id=?", (val, d["id"]))
@@ -304,7 +354,7 @@ def device_config(ctx, device_ref, template, music_dir, playlist_dir, name, labe
     t.add_column("", style="dim")
     t.add_column("")
     for key in ("name", "label", "profile", "music_dir", "playlist_dir",
-                "path_template", "root", "device_uid"):
+                "path_template", "playlist_template", "root", "device_uid"):
         t.add_row(key, str(d[key]))
     console.print(t)
 
@@ -383,10 +433,30 @@ def _print_plan(p, space):
         if len(p["deletes"]) > 10:
             console.print(f"  [dim]... {len(p['deletes']) - 10:,} more[/]")
     if p["playlists"]:
-        console.print("\n[bold]playlists[/]")
+        console.print(f"\n[bold]playlists[/] [dim]as "
+                      f"{p.get('playlist_template', '{name}.m3u8')}[/]")
         for pl in p["playlists"]:
             skip = f"  [yellow]{pl['skipped']} not in set[/]" if pl["skipped"] else ""
-            console.print(f"  {pl['name']}  [dim]{len(pl['entries'])} entries[/]{skip}")
+            verb = "[green]replaces[/]" if pl.get("replaces") else "[dim]new[/]"
+            console.print(f"  {pl['filename']}  [dim]{len(pl['entries'])} "
+                          f"entries[/]  {verb}{skip}")
+    if p.get("playlist_strays"):
+        shadowing = [x for x in p["playlist_strays"] if x["shadows"]]
+        console.print("\n[bold yellow]playlist files this sync would leave "
+                      "behind[/]")
+        for x in p["playlist_strays"][:10]:
+            why = (f"[yellow]the player would list this beside "
+                   f"{x['shadows']}[/]" if x["shadows"]
+                   else "[dim]not in the set[/]")
+            console.print(f"  [yellow]![/] {x['filename']}  {why}")
+        if len(p["playlist_strays"]) > 10:
+            console.print(f"  [dim]... {len(p['playlist_strays']) - 10:,} more[/]")
+        if shadowing:
+            console.print(
+                "  [dim]this device spells its playlists differently, so the "
+                "sync would add rather than replace. Fix it with:[/]\n"
+                f"  [dim]  lemon-zest device config \"{d['name']}\" "
+                f"--detect-playlists[/]")
     if p["missing_source"]:
         console.print("\n[yellow]skipped - not usable as a source[/]")
         for m in p["missing_source"][:10]:

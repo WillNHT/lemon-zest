@@ -22,7 +22,7 @@ import time
 
 from .meta import content_key
 from .paths import dedupe, norm, render_template, resolve_existing
-from .playlists import safe_filename as pl_filename
+from . import playlists as pl_mod
 
 
 def desired_tracks(con, device_id):
@@ -229,6 +229,11 @@ def plan(con, device, root, prune=False):
     # Otherwise the player follows the entry to a file that is missing, or
     # worse, to a zero-byte one left behind by an earlier tool.
     skip_ids = {m["track"]["id"] for m in missing_source}
+    pl_template = pl_mod.template_of(device)
+    pl_dir = (device["playlist_dir"] or "").strip("/")
+    pl_root = os.path.join(root, pl_dir) if pl_dir else root
+    on_card_playlists = pl_mod.list_playlist_files(pl_root)
+    by_fold = {norm(f).casefold(): f for f in on_card_playlists}
     playlist_plan = []
     for name in playlist_names:
         row = con.execute("SELECT * FROM playlist WHERE name=?", (name,)).fetchone()
@@ -248,9 +253,12 @@ def plan(con, device, root, prune=False):
             title = e["title_hint"] or (
                 f"{e['artist']} - {e['title']}" if e["artist"] else e["title"])
             entries.append((dest, title, e["duration"], e["source_uri"]))
+        fname = pl_mod.filename_for(name, pl_template)
+        existing = by_fold.get(norm(fname).casefold())
         playlist_plan.append({"name": name, "source_uri": row["source_uri"],
                               "entries": entries, "skipped": skipped,
-                              "filename": pl_filename(name)})
+                              "filename": fname,
+                              "replaces": existing})
 
     # Playlist files Lemon Zest wrote that this plan no longer includes.
     planned_files = {p["filename"] for p in playlist_plan}
@@ -262,6 +270,28 @@ def plan(con, device, root, prune=False):
         )
         if r["filename"] not in planned_files
     ]
+
+    # Playlist files already on the card that this plan will neither
+    # overwrite nor remove. When the device's template is wrong, this is
+    # where it shows: the card's own "chill-<owner>.m3u8" stays put and the
+    # sync adds a second "chill.m3u8" beside it, so the player lists both.
+    # A dry run that reports only what it will write cannot say that, which
+    # is exactly how the first real sync would have doubled 23 playlists.
+    written_by_us = {norm(r["filename"]).casefold() for r in con.execute(
+        "SELECT filename FROM device_playlist WHERE device_id=?",
+        (device["id"],))}
+    planned_folded = {norm(p["filename"]).casefold() for p in playlist_plan}
+    planned_folded |= {norm(p["filename"]).casefold()
+                       for p in playlist_deletes}
+    playlist_strays = []
+    for fn in on_card_playlists:
+        fold = norm(fn).casefold()
+        if fold in planned_folded or fold in written_by_us:
+            continue
+        stem = norm(os.path.splitext(fn)[0]).casefold()
+        shadows = next((p["name"] for p in playlist_plan
+                        if norm(p["name"]).casefold() in stem), None)
+        playlist_strays.append({"filename": fn, "shadows": shadows})
 
     bytes_in = sum(c["size"] for c in copies)
     bytes_out = sum(d["size"] for d in deletes if d["present"])
@@ -277,6 +307,8 @@ def plan(con, device, root, prune=False):
         "missing_source": missing_source,
         "playlists": playlist_plan,
         "playlist_deletes": playlist_deletes,
+        "playlist_template": pl_template,
+        "playlist_strays": playlist_strays,
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
         "net_bytes": bytes_in - bytes_out,
