@@ -27,6 +27,9 @@ out = args[args.index("-o") + 1]
 paths = [args[i + 1] for i, a in enumerate(args) if a == "-P"]
 home = next((p[len("home:"):] for p in paths if p.startswith("home:")), "")
 root = os.path.join(home, out.split("%(")[0])
+# Never write relative to the caller's working directory: a stub that
+# guesses its destination wrong once wrote test files into the repo.
+assert os.path.isabs(root), "refusing to write to a relative root: " + root
 names = [n for n in os.environ.get("LZ_FAKE_FILES", "").split(";") if n]
 archive = None
 if "--download-archive" in args:
