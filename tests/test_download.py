@@ -28,8 +28,24 @@ from lemonzest import db, download, playlists  # noqa: E402
 # the -o template's folder), prints a progress line and the after_move line
 # for each, and exits with LZ_FAKE_CODE.
 FAKE = '''
-import os, sys, time
+import json, os, sys, time
 args = sys.argv[1:]
+names = [n for n in os.environ.get("LZ_FAKE_FILES", "").split(";") if n]
+
+# Listing mode: what `probe` and the batch counter ask for. One entry per
+# file this stub would write, which is what makes "3 of 5" testable.
+if "-J" in args:
+    if os.environ.get("LZ_FAKE_LIST_FAILS"):
+        sys.stderr.write("ERROR: cannot list")
+        sys.exit(1)
+    entries = [{"title": os.path.basename(n),
+                "url": "https://example.test/%d" % i, "duration": 1}
+               for i, n in enumerate(names)]
+    one = len(entries) == 1 and not os.environ.get("LZ_FAKE_PLAYLIST")
+    print(json.dumps({"title": "stub", "uploader": "stub", "duration": 1}
+                     if one else {"title": "stub list", "entries": entries}))
+    sys.exit(0)
+
 out = args[args.index("-o") + 1]
 paths = [args[i + 1] for i, a in enumerate(args) if a == "-P"]
 home = next((p[len("home:"):] for p in paths if p.startswith("home:")), "")
@@ -37,7 +53,6 @@ root = os.path.join(home, out.split("%(")[0])
 # Never write relative to the caller's working directory: a stub that
 # guesses its destination wrong once wrote test files into the repo.
 assert os.path.isabs(root), "refusing to write to a relative root: " + root
-names = [n for n in os.environ.get("LZ_FAKE_FILES", "").split(";") if n]
 archive = None
 if "--download-archive" in args:
     archive = args[args.index("--download-archive") + 1]
@@ -52,8 +67,11 @@ for name in names:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
         fh.write(b"\\0" * 2048)
-    print("[lz-progress]1024|2048|" + os.path.basename(name))
-    print("[lz-progress]2048|2048|" + os.path.basename(name))
+    idx = names.index(name) + 1
+    print("[lz-progress]1024|2048|%d|%d|512000|3|%s"
+          % (idx, len(names), os.path.basename(name)))
+    print("[lz-progress]2048|2048|%d|%d|512000|0|%s"
+          % (idx, len(names), os.path.basename(name)))
     print("[lz-file]" + path)
     if archive:
         with open(archive, "a", encoding="utf-8") as fh:
@@ -174,7 +192,10 @@ class DownloadTests(unittest.TestCase):
                           on_event=lambda k, d, done, tot: seen.append((k, d)))
         kinds = [k for k, _ in seen]
         self.assertEqual(kinds[0], "start")
-        self.assertEqual(kinds[1], "command")
+        # The URLs are listed before anything is fetched, which is where the
+        # batch gets its denominator from.
+        self.assertEqual(kinds[1], "listing")
+        self.assertEqual(kinds[2], "command")
         self.assertIn("output", kinds)
         self.assertTrue(any("something worth reading" in d
                             for k, d in seen if k == "output"))
@@ -220,17 +241,111 @@ class DownloadTests(unittest.TestCase):
         self.assertIsNone(download.video_id("not a video"))
         self.assertIsNone(download.video_id(""))
 
-    def test_progress_is_reported(self):
-        events = []
+    # ------------------------------------------------------------ batch
+
+    def test_the_batch_knows_how_many_items_it_set_out_to_fetch(self):
+        """The number a progress bar needs and the old one could not give:
+        counted by listing the URLs before anything is downloaded."""
+        os.environ["LZ_FAKE_FILES"] = ("A/Album/One.m4a;A/Album/Two.m4a;"
+                                       "A/Album/Three.m4a")
+        seen = []
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root, cfg=self.cfg(),
+                                    on_batch=seen.append)
+        batch = summary["batch"]
+        self.assertEqual(batch["total"], 3)
+        self.assertEqual(batch["done"], 3)
+        self.assertEqual(batch["downloaded"], 3)
+        self.assertEqual(batch["failed"], 0)
+        self.assertIsNone(batch["current"])
+        self.assertIsNotNone(batch["finished"])
+
+        # The caller was told as it happened, not only at the end - and the
+        # denominator was there before the first file arrived.
+        self.assertGreater(len(seen), 3)
+        self.assertTrue(any(b["total"] == 3 and b["done"] == 0 for b in seen))
+        self.assertEqual([b["done"] for b in seen][-1], 3)
+        # Each report is a snapshot; a live dict would make them all equal.
+        self.assertEqual(sorted({b["done"] for b in seen}), [0, 1, 2, 3])
+
+    def test_the_batch_counts_what_the_archive_already_had(self):
+        os.environ["LZ_FAKE_FILES"] = "A/Album/One.m4a;A/Album/Two.m4a"
+        first = download.download(self.con, ["https://example.test/list"],
+                                  root=self.root, cfg=self.cfg())
+        self.assertEqual(first["batch"]["downloaded"], 2)
+
+        again = download.download(self.con, ["https://example.test/list"],
+                                  root=self.root, cfg=self.cfg())
+        batch = again["batch"]
+        self.assertEqual(batch["total"], 2)
+        self.assertEqual(batch["skipped"], 2)
+        self.assertEqual(batch["downloaded"], 0)
+        # Everything the run set out to do is accounted for, whichever way
+        # each item ended.
+        self.assertEqual(batch["done"], batch["total"])
+
+    def test_a_url_that_cannot_be_listed_still_counts_as_one_item(self):
+        os.environ["LZ_FAKE_LIST_FAILS"] = "1"
+        summary = download.download(self.con, ["https://example.test/v"],
+                                    root=self.root, cfg=self.cfg())
+        self.assertEqual(summary["batch"]["total"], 1)
+        self.assertEqual(summary["batch"]["downloaded"], 1)
+        self.assertTrue(any("could not list" in line
+                            for line in summary["log"]))
+
+    def test_the_current_item_carries_its_bytes_and_position(self):
+        os.environ["LZ_FAKE_FILES"] = "A/Album/One.m4a;A/Album/Two.m4a"
+        seen = []
+        download.download(self.con, ["https://example.test/list"],
+                          root=self.root, cfg=self.cfg(),
+                          on_batch=seen.append)
+        current = [b["current"] for b in seen if b["current"]]
+        self.assertTrue(current)
+        self.assertEqual(current[-1]["count"], 2)
+        self.assertEqual(current[-1]["bytes_total"], 2048)
+        self.assertEqual(current[-1]["speed"], 512000)
+        self.assertIn("m4a", current[-1]["title"])
+
+    def test_a_short_progress_line_from_an_older_yt_dlp_still_parses(self):
+        p = download._parse_progress("[lz-progress]1024|2048|Some Title")
+        self.assertEqual(p["bytes"], 1024)
+        self.assertEqual(p["bytes_total"], 2048)
+        self.assertEqual(p["title"], "Some Title")
+        self.assertIsNone(p["index"])
+
+    def test_a_title_with_a_pipe_in_it_survives_the_split(self):
+        p = download._parse_progress("[lz-progress]1|2|3|4|5|6|A | B")
+        self.assertEqual(p["title"], "A | B")
+        self.assertEqual(p["index"], 3)
+
+    def test_progress_counts_items_rather_than_bytes(self):
+        """What a progress event carries is the batch, not the file.
+
+        Bytes describe whichever file yt-dlp happens to be fetching and
+        reset to zero at every track, so a bar drawn from them says nothing
+        about a playlist. The bytes are still reported - on the current item,
+        through on_batch, where they describe what they actually describe."""
+        events, batches = [], []
         download.download(self.con, ["https://example.test/v"], root=self.root,
                           cfg=self.cfg(),
                           on_event=lambda k, d, done, tot: events.append(
-                              (k, done, tot)))
+                              (k, done, tot)),
+                          on_batch=batches.append)
         kinds = [e[0] for e in events]
         self.assertIn("progress", kinds)
         self.assertIn("file", kinds)
         self.assertIn("done", kinds)
-        self.assertIn(("progress", 2048, 2048), events)
+        # One item, fetched: the last word on the batch is 1 of 1.
+        self.assertEqual(("file", 1, 1), events[[e[0] for e in events]
+                                                .index("file")])
+        for kind, done, total in events:
+            if kind == "progress":
+                self.assertLessEqual(done, total)
+                self.assertEqual(total, 1)
+
+        current = [b["current"] for b in batches if b["current"]]
+        self.assertEqual(current[-1]["bytes"], 2048)
+        self.assertEqual(current[-1]["bytes_total"], 2048)
 
     def test_output_arrives_while_the_download_is_still_running(self):
         """A log that only appears at the end is not a progress report.

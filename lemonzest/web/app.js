@@ -27,6 +27,17 @@ function dur(sec) {
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 function num(n) { return (n || 0).toLocaleString(); }
+function rate(bps) { return bps ? bytes(bps) + '/s' : ''; }
+// A duration as a person says it. Used for elapsed and for what is left,
+// which are the two numbers a long download is actually watched for.
+function span(secs) {
+  if (secs === null || secs === undefined || !isFinite(secs)) return '';
+  secs = Math.max(0, Math.round(secs));
+  if (secs < 60) return secs + 's';
+  const m = Math.floor(secs / 60), sec = secs % 60;
+  if (m < 60) return m + 'm ' + String(sec).padStart(2, '0') + 's';
+  return Math.floor(m / 60) + 'h ' + String(m % 60).padStart(2, '0') + 'm';
+}
 function when(ts) {
   if (!ts) return 'never';
   const d = new Date(ts * 1000);
@@ -962,6 +973,73 @@ function renderImport() {
   </div>`;
 }
 
+/* A download of forty tracks, as one picture.
+
+   The old page had two numbers - the bytes of whatever file yt-dlp happened
+   to be fetching, and a log - and neither answers "how far through is it".
+   This one counts items: how many the batch set out to fetch, how many are
+   done, and what became of each. The bytes are still here, but where they
+   belong: on the line describing the track being fetched right now. */
+function renderBatch(batch, running) {
+  if (!batch) return '';
+  const total = batch.total || 0;
+  const done = Math.min(batch.done || 0, total || batch.done || 0);
+  const pct = total ? Math.min(100, (100 * done) / total) : 0;
+  const elapsed = (batch.finished || Date.now() / 1000) - batch.started;
+  // Per-item average rather than per-byte: items are what is left to do,
+  // and a three-minute track and a twenty-second one average out over a
+  // playlist in a way bytes-per-second never does mid-file.
+  const left = done > 0 && total > done && running
+    ? (elapsed / done) * (total - done) : null;
+
+  const c = batch.current;
+  const cpct = c && c.bytes_total ? (100 * c.bytes) / c.bytes_total : 0;
+  const counted = [
+    batch.downloaded ? `${num(batch.downloaded)} downloaded` : '',
+    batch.skipped ? `${num(batch.skipped)} already had` : '',
+    batch.failed ? `${num(batch.failed)} failed` : '',
+  ].filter(Boolean).join(' \u00b7 ');
+
+  return `<div class="card batch">
+    <header>
+      <h3>${running ? 'Downloading' : 'Batch'}</h3>
+      ${running ? '<span class="spin"></span>' : ''}
+      <span class="count">${num(done)} <span class="of">of</span> ${
+        total ? num(total) : '?'}</span>
+      <span class="muted">item${total === 1 ? '' : 's'}${
+        batch.urls > 1 ? ` from ${num(batch.urls)} URLs` : ''}</span>
+      <span class="grow" style="flex:1"></span>
+      <span class="faint mono" style="font-size:10px">${
+        h(span(elapsed))} elapsed${left !== null ? ` \u00b7 ~${h(span(left))} left` : ''}</span>
+    </header>
+    <div class="in">
+      <div class="bar big"><i style="width:${pct.toFixed(1)}%"></i></div>
+      <div class="hstack" style="margin-top:6px">
+        <span class="muted">${counted || (batch.listed
+          ? 'nothing fetched yet' : 'listing what is at the URLs...')}</span>
+        <span class="grow" style="flex:1"></span>
+        <span class="faint mono" style="font-size:10px">${pct.toFixed(0)}%</span>
+      </div>
+      ${c ? `<div class="now">
+        <div class="hstack">
+          <span class="tag">NOW</span>
+          <span class="clip" style="flex:1" title="${h(c.title)}">${h(c.title)}</span>
+          ${c.index && c.count ? `<span class="faint mono" style="font-size:10px"
+            >#${num(c.index)} of ${num(c.count)} in this list</span>` : ''}
+        </div>
+        <div class="bar" style="margin-top:5px"><i style="width:${cpct.toFixed(1)}%"></i></div>
+        <div class="hstack faint mono" style="font-size:10px;margin-top:4px">
+          <span>${h(bytes(c.bytes))}${c.bytes_total
+            ? ' of ' + h(bytes(c.bytes_total)) : ''}</span>
+          <span class="grow" style="flex:1"></span>
+          <span>${h([rate(c.speed), c.eta ? span(c.eta) + ' left' : '']
+            .filter(Boolean).join(' \u00b7 '))}</span>
+        </div>
+      </div>` : ''}
+    </div>
+  </div>`;
+}
+
 function renderDownload() {
   const d = S.dl;
   if (!d) {
@@ -1050,11 +1128,12 @@ function renderDownload() {
             ? num(S.dlProbe.count) + ' items' : dur(S.dlProbe.duration)}
         </div></div>` : ''}
 
+        ${renderBatch((job && job.batch) || (res && res.batch),
+                      !!(job && job.state === 'running'))}
+
         ${job ? `<div>
           <div class="hstack"><span class="${job.state === 'running' ? 'spin' : ''}"></span>
             <span class="muted clip">${h(job.detail || job.state)}</span></div>
-          <div class="bar" style="margin-top:5px"><i style="width:${
-            job.total ? (100 * job.done / job.total) : 0}%"></i></div>
           ${job.state === 'failed' ? `<div class="notice bad" style="margin-top:8px">
             ${icon('i-warn')}<div>${h(job.error)}</div></div>` : ''}
         </div>` : ''}
@@ -1310,7 +1389,14 @@ function renderStatus() {
     };
     $('#status-label').textContent =
       (VERB[job.kind] || 'Working on ') + job.label;
-    $('#status-meta').textContent = job.detail || '';
+    // A download says where it is in the batch, everywhere in the app: the
+    // status strip is the only part of the interface visible from the
+    // Library page, and "12 of 47" is the whole question.
+    const b = job.batch;
+    $('#status-meta').textContent = b && b.total
+      ? `${num(b.done)} of ${num(b.total)}`
+        + (b.current ? ' \u00b7 ' + b.current.title : '')
+      : (job.detail || '');
     $('#status-bar').style.width =
       (job.total ? (100 * job.done / job.total) : 0) + '%';
   } else {

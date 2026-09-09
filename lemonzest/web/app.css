@@ -370,6 +370,16 @@ button { cursor: default; }
   font-size: 12px; }
 .empty h3 { font-size: 15px; color: var(--ink-2); margin-bottom: 6px; }
 
+/* -------------------------------------------------------- download batch */
+
+.batch > header .count { font: 15px/1 var(--mono); font-weight: 600;
+  color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.batch > header .count .of { font-size: 10px; color: var(--fainter);
+  font-weight: 400; }
+.bar.big { height: 12px; border-radius: 3px; }
+.batch .now { margin-top: 10px; padding-top: 8px;
+  border-top: 1px solid var(--line); }
+
 /* ---------------------------------------------------------- inspector */
 
 /* The table and the one-track panel share the pane: the table keeps the
