@@ -60,6 +60,29 @@ def recording(rid, title, artists, album=None, date=None, length=None,
     return rec
 
 
+# A stand-in for the fpcalc binary: prints the JSON the real one prints.
+# Written as a script and invoked through this interpreter so the same test
+# works on Windows and on Linux without a shell.
+_FAKE_FPCALC_SRC = """import json, sys
+print(json.dumps({"duration": 2.0, "fingerprint": "AQABz0mUkZK4oOfhL-CPc4e5C_"}))
+"""
+
+
+class StubAcoustID:
+    """Stands in for the AcoustID client. Counts what was asked of it."""
+
+    def __init__(self, results=None, error=None):
+        self._results = results or []
+        self._error = error
+        self.calls = 0
+
+    def lookup(self, duration, fp):
+        self.calls += 1
+        if self._error:
+            raise self._error
+        return list(self._results)
+
+
 class StubMB:
     """Stands in for the MusicBrainz client. Counts what was asked for."""
 
@@ -235,6 +258,10 @@ class EnrichTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="lz-enrich-")
         self.lib = os.path.join(self.tmp, "library")
         self.con = db.connect(os.path.join(self.tmp, "lz.db"))
+        script = os.path.join(self.tmp, "fake_fpcalc.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(_FAKE_FPCALC_SRC)
+        self.fpcalc = [sys.executable, script]
 
     def tearDown(self):
         self.con.close()
@@ -469,6 +496,97 @@ class EnrichTests(unittest.TestCase):
         client = StubMB(search=[])
         enrich.enrich_track(self.con, self.row("Blue"), client)
         self.assertEqual(len(client.search_calls), 1)
+
+    # -- fingerprinting ---------------------------------------------------
+
+    def fp_client(self, records):
+        """A MusicBrainz stub that answers recording-by-id lookups."""
+
+        class ByID(StubMB):
+            def recording(self, mbid):
+                return records.get(mbid)
+
+        return ByID(search=[])
+
+    def test_a_fingerprint_identifies_a_file_the_tags_cannot(self):
+        # The Nemu case: artist is a channel, title is a video title, and a
+        # text search has nothing to work with.
+        self.add("Nemu/Singles/x.mp3", seconds=2.0,
+                 title="KIRINJI - Jikanga Nai", artist="Nemu")
+        scan.scan(self.con, self.lib)
+        rec = recording("r-fp", "時間がない", ["KIRINJI"], album="Ai wo Aru Dake",
+                        date="2016-01-01", length=2.0, isrc="JPXX01600001")
+
+        status = enrich.enrich_track(
+            self.con, self.row("x.mp3"), self.fp_client({"r-fp": rec}),
+            acoustid=StubAcoustID([(0.97, ["r-fp"])]),
+            fpcalc=self.fpcalc)
+        # The tags disagree with the audio, which is the whole reason this
+        # file was unmatched - so it waits for a person rather than being
+        # applied on the strength of a fingerprint alone.
+        self.assertEqual(status, "candidate")
+        row = self.con.execute(
+            "SELECT source, confidence, fields FROM enrichment").fetchone()
+        self.assertEqual(row["source"], "acoustid")
+        self.assertAlmostEqual(row["confidence"], 0.97, places=3)
+        self.assertEqual(json.loads(row["fields"])["artist"], "KIRINJI")
+
+    def test_audio_and_tags_agreeing_is_applied_without_review(self):
+        self.add("A/Album/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha")
+        scan.scan(self.con, self.lib)
+        rec = recording("r-fp", "Blue", ["Alpha"], album="First",
+                        date="1999-01-01", length=2.0, isrc="GBAAA0000009")
+        status = enrich.enrich_track(
+            self.con, self.row("Blue"), self.fp_client({"r-fp": rec}),
+            acoustid=StubAcoustID([(0.99, ["r-fp"])]), fpcalc=self.fpcalc)
+        self.assertEqual(status, "applied")
+        self.assertEqual(self.row("Blue")["isrc"], "GBAAA0000009")
+
+    def test_a_weak_fingerprint_is_not_an_answer(self):
+        self.add("Nemu/Singles/x.mp3", seconds=2.0, title="Whatever",
+                 artist="Nemu")
+        scan.scan(self.con, self.lib)
+        rec = recording("r-fp", "Something", ["Someone"], length=2.0)
+        status = enrich.enrich_track(
+            self.con, self.row("x.mp3"), self.fp_client({"r-fp": rec}),
+            acoustid=StubAcoustID([(0.30, ["r-fp"])]), fpcalc=self.fpcalc)
+        self.assertEqual(status, "none")
+
+    def test_fingerprinting_is_only_reached_when_the_tags_were_not_enough(self):
+        self.add("A/Album/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha")
+        scan.scan(self.con, self.lib)
+
+        class Searching(StubMB):
+            def recording(self, mbid):
+                raise AssertionError("fingerprint rung should not be reached")
+
+        client = Searching(search=[
+            recording("r1", "Blue", ["Alpha"], album="First",
+                      date="1999-01-01", length=2.0)])
+        acoustid = StubAcoustID([(0.99, ["r-fp"])])
+        self.assertEqual(
+            enrich.enrich_track(self.con, self.row("Blue"), client,
+                                acoustid=acoustid, fpcalc=self.fpcalc),
+            "applied")
+        self.assertEqual(acoustid.calls, 0)
+
+    def test_a_file_fpcalc_cannot_read_does_not_end_the_run(self):
+        self.add("Nemu/Singles/x.mp3", seconds=2.0, title="Whatever",
+                 artist="Nemu")
+        scan.scan(self.con, self.lib)
+        status = enrich.enrich_track(
+            self.con, self.row("x.mp3"), self.fp_client({}),
+            acoustid=StubAcoustID([(0.99, ["r-fp"])]),
+            fpcalc=[sys.executable, os.path.join(self.tmp, "no-such-fpcalc.py")])
+        self.assertEqual(status, "none")
+
+    def test_fingerprinting_reports_what_it_is_missing(self):
+        status = enrich.fingerprint_status(self.con)
+        self.assertIn("acoustid_key", status["missing"])
+        self.assertFalse(status["ready"])
+        enrich.set_config(self.con, acoustid_key="abc123")
+        self.assertNotIn("acoustid_key",
+                         enrich.fingerprint_status(self.con)["missing"])
 
     # -- decisions --------------------------------------------------------
 

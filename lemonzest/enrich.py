@@ -20,11 +20,13 @@ The ladder, in the order it is tried:
      with a duration window. Fuzzy, so it is gated on confidence and anything
      doubtful lands in the review queue rather than in the tags.
 
-Rung 4 - AcoustID fingerprinting - is the only source that ignores what a
-file claims and listens to it instead, which is exactly the untagged-download
-case. It is deliberately not here: it needs the ``fpcalc`` binary bundled
-alongside the app, which is a packaging change rather than a code one. The
-``Source`` seam below is where it slots in.
+  4. **Fingerprint**. AcoustID, via Chromaprint's ``fpcalc``. The only source
+     that ignores what the file claims and listens to it instead, which is
+     the whole of the untagged-download case: a file whose artist is a
+     channel name and whose title is a video title gives a text search
+     nothing to work with, and gives a fingerprint everything. Needs
+     ``fpcalc`` on PATH and a free AcoustID application key, so it is opt-in
+     and the ladder above still works without it.
 
 Nothing in this module writes to an audio file. Applying an enrichment to the
 catalog is one call; writing it back into the file is a separate, explicit
@@ -32,7 +34,11 @@ one in ``tags.py``, because those have very different blast radii.
 """
 import difflib
 import json
+import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 import unicodedata
 import urllib.error
@@ -288,6 +294,11 @@ class MusicBrainz:
                         inc="artist-credits+releases")
         return (data or {}).get("recordings") or []
 
+    def recording(self, mbid):
+        """One recording in full, by id. How a fingerprint result is read."""
+        return self.get(f"recording/{urllib.parse.quote(mbid)}",
+                        inc="artist-credits+releases+isrcs")
+
     def search(self, artist, title, duration=None, limit=15):
         """Lucene search over recordings.
 
@@ -315,6 +326,138 @@ def _lucene(text):
     return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r"\\\1", str(text or ""))
 
 
+# ------------------------------------------------------- AcoustID (rung 4)
+
+ACOUSTID_ROOT = "https://api.acoustid.org/v2/lookup"
+# AcoustID's published limit is three requests a second per key.
+ACOUSTID_INTERVAL = 0.34
+# Chromaprint's own similarity, 0..1. Below this the audio is not the same
+# recording and the answer is worth nothing.
+FP_MIN = 0.80
+# How many of a fingerprint's recordings to look up in full. A popular track
+# resolves to a dozen; the ranking only ever picks one, and each costs a
+# rate-limited MusicBrainz request.
+FP_MAX_RECORDINGS = 3
+FPCALC_TIMEOUT = 120.0
+
+
+def fpcalc_command():
+    """How to invoke ``fpcalc`` here, as an argv prefix, or None.
+
+    Located rather than bundled, for the same reason yt-dlp is: it is a
+    separate project on its own release schedule, it is LGPL and shipping it
+    inside the binary would drag its licence along, and a user who already
+    has Chromaprint installed should not carry a second copy. PATH first,
+    then beside the frozen executable, so dropping fpcalc.exe next to
+    lemon-zest.exe is enough to enable it.
+
+    A list rather than a string, matching ``ytdlp_command``: it is what
+    subprocess wants, and it lets a test substitute an interpreter and a
+    script for the real binary.
+    """
+    exe = shutil.which("fpcalc")
+    if exe:
+        return [exe]
+    if getattr(sys, "frozen", False):
+        beside = os.path.join(os.path.dirname(sys.executable),
+                              "fpcalc.exe" if os.name == "nt" else "fpcalc")
+        if os.path.isfile(beside):
+            return [beside]
+    return None
+
+
+class FingerprintError(RuntimeError):
+    """This one file could not be fingerprinted. Never ends a run."""
+
+
+def fingerprint(path, command=None):
+    """Chromaprint fingerprint for one file: ``(duration, fingerprint)``.
+
+    Runs fpcalc as a subprocess rather than binding the C library, which
+    keeps this an optional dependency a user installs with one command and
+    means a codec fpcalc chokes on cannot take the process down.
+    """
+    cmd = command or fpcalc_command()
+    if not cmd:
+        raise FingerprintError(
+            "fpcalc is not installed. Install Chromaprint - on Windows: "
+            "winget install AcoustID.Chromaprint")
+    if isinstance(cmd, str):
+        cmd = [cmd]
+    try:
+        out = subprocess.run(list(cmd) + ["-json", path], capture_output=True,
+                             text=True, timeout=FPCALC_TIMEOUT,
+                             encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FingerprintError(str(exc)) from exc
+    if out.returncode != 0:
+        raise FingerprintError((out.stderr or "").strip().splitlines()[-1:]
+                               and out.stderr.strip().splitlines()[-1]
+                               or f"fpcalc exited {out.returncode}")
+    try:
+        data = json.loads(out.stdout)
+        return float(data["duration"]), data["fingerprint"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise FingerprintError("fpcalc produced no fingerprint") from exc
+
+
+class AcoustID:
+    """Look a Chromaprint fingerprint up against AcoustID.
+
+    Returns MusicBrainz recording ids and lets the MusicBrainz client fetch
+    them in full, rather than reading AcoustID's own abbreviated metadata.
+    One reason: the release-choosing rules above are the delicate part of
+    this module, and they need a whole recording to work on. Having one path
+    into them is worth an extra request.
+    """
+
+    def __init__(self, key, interval=ACOUSTID_INTERVAL, opener=None):
+        self.key = key
+        self.interval = interval
+        self._last = 0.0
+        self._opener = opener or urllib.request.urlopen
+
+    def _wait(self):
+        gap = time.monotonic() - self._last
+        if gap < self.interval:
+            time.sleep(self.interval - gap)
+        self._last = time.monotonic()
+
+    def lookup(self, duration, fp):
+        """``[(score, [recording_id, ...]), ...]``, best score first."""
+        if not self.key:
+            raise LookupError_("no AcoustID key configured")
+        body = urllib.parse.urlencode({
+            "client": self.key, "duration": str(int(duration)),
+            "fingerprint": fp, "meta": "recordingids",
+        }).encode("ascii")
+        # POST, not GET: a fingerprint is a few kilobytes of base64 and
+        # overflows the URL length limit on a longer track.
+        req = urllib.request.Request(
+            ACOUSTID_ROOT, data=body,
+            headers={"User-Agent": USER_AGENT,
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        self._wait()
+        try:
+            with self._opener(req, timeout=HTTP_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise LookupError_(f"AcoustID returned {exc.code}") from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise LookupError_(str(exc)) from exc
+
+        if data.get("status") != "ok":
+            raise LookupError_(
+                (data.get("error") or {}).get("message") or "AcoustID refused")
+        out = []
+        for result in data.get("results") or []:
+            ids = [r["id"] for r in result.get("recordings") or [] if r.get("id")]
+            if ids:
+                out.append((float(result.get("score") or 0.0), ids))
+        out.sort(key=lambda p: p[0], reverse=True)
+        return out
+
+
 # ------------------------------------------------------- reading a recording
 
 _SKIP_TYPES = {"compilation", "live", "remix", "dj-mix", "mixtape/street",
@@ -326,6 +469,11 @@ _SKIP_TYPES = {"compilation", "live", "remix", "dj-mix", "mixtape/street",
 # genuine album should still beat a mislabelled compilation on the checks
 # above it.
 BIG_RELEASE = 30
+
+# Names that stand for "no single artist" rather than naming one. Never
+# written into album_artist, which is what a path is built from.
+_PLACEHOLDER_ARTISTS = {"various artists", "various", "va", "unknown artist",
+                        "verschiedene interpreten", "soundtrack"}
 
 
 def _release_credit(release):
@@ -436,9 +584,14 @@ def recording_fields(recording, prefer_album=None):
         date = release.get("date")
         if date:
             release_fields["year"] = str(date)[:10]
-        credit = release.get("artist-credit") or []
-        if credit and isinstance(credit[0], dict) and credit[0].get("artist"):
-            release_fields["album_artist"] = credit[0]["artist"]["name"]
+        credit = _release_credit(release)
+        # "Various Artists" is a placeholder standing in for the fact that a
+        # compilation has no single artist. Writing it into album_artist
+        # would file Alphaville under V, and album_artist is the first thing
+        # the path template reads - so it is refused and the recording's own
+        # artist is used instead.
+        if credit and fold(credit) not in _PLACEHOLDER_ARTISTS:
+            release_fields["album_artist"] = credit
         tno, dno = _track_position(release)
         if tno:
             release_fields["track_no"] = tno
@@ -562,6 +715,53 @@ def backfill_isrc(con, dry_run=False):
     return counts
 
 
+# -------------------------------------------------------------------- config
+
+CONFIG_DEFAULTS = {
+    # MusicBrainz asks that a client identify itself with a way to get in
+    # touch. Blank falls back to the project's own repository URL.
+    "contact": "",
+    # A free AcoustID application key. Without one, rung four is unavailable
+    # and the ladder stops at text search.
+    "acoustid_key": "",
+}
+_PREFIX = "enrich."
+
+
+def get_config(con):
+    cfg = dict(CONFIG_DEFAULTS)
+    for row in con.execute("SELECT key, value FROM meta WHERE key LIKE ?",
+                           (_PREFIX + "%",)):
+        key = row["key"][len(_PREFIX):]
+        if key in cfg and row["value"] is not None:
+            cfg[key] = row["value"]
+    return cfg
+
+
+def set_config(con, **changes):
+    for key, value in changes.items():
+        if key not in CONFIG_DEFAULTS or value is None:
+            continue
+        con.execute(
+            "INSERT INTO meta(key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_PREFIX + key, str(value)))
+    con.commit()
+
+
+def fingerprint_status(con):
+    """Whether rung four is usable here, and what is missing if not."""
+    cfg = get_config(con)
+    cmd = fpcalc_command()
+    return {
+        "fpcalc": " ".join(cmd) if cmd else None,
+        "has_key": bool(cfg["acoustid_key"]),
+        "ready": bool(cmd and cfg["acoustid_key"]),
+        "missing": ([] if cmd else ["fpcalc"])
+                   + ([] if cfg["acoustid_key"] else ["acoustid_key"]),
+    }
+
+
 # -------------------------------------------------------------- the enricher
 
 def _store(con, content_key, source, confidence, fields, mbid, release_id,
@@ -606,7 +806,46 @@ def pending(con, limit=None, root=None, redo=False):
     return con.execute(sql, params).fetchall()
 
 
-def enrich_track(con, row, client, now=None):
+def _fingerprint_candidate(row, client, acoustid, fpcalc=None):
+    """Identify a file by its audio. Returns ``(candidate, fp_score)``.
+
+    The tags play no part in getting here, which is the point: a file whose
+    artist is a channel name and whose title is a video title tells a text
+    search nothing and tells Chromaprint everything.
+
+    They do decide how much of the answer is applied, though. When the tags
+    corroborate what the audio says, the two agreeing is as good as evidence
+    gets. When they disagree - and for the files this rung exists for they
+    will, because the tags are what is wrong - the answer still wants a
+    person, since "trust the sound over the tag" is a judgement call about
+    somebody's library, not a fact.
+    """
+    duration, fp = fingerprint(row["path"], command=fpcalc)
+    results = acoustid.lookup(duration, fp)
+    if not results or results[0][0] < FP_MIN:
+        return None, 0.0
+    fp_score, ids = results[0]
+
+    album = row["album"] if "album" in row.keys() else None
+    records = []
+    for mbid in ids[:FP_MAX_RECORDINGS]:
+        rec = client.recording(mbid)
+        if rec:
+            records.append(rec)
+    if not records:
+        return None, fp_score
+
+    # Score against the local row as usual, but never let a disagreeing tag
+    # veto the match: the fingerprint already established it is this audio.
+    best, tag_score = _best_candidate(records, row, album)
+    if best is None:
+        best = recording_fields(records[0], prefer_album=album)
+        tag_score = 0.0
+    best["tag_score"] = tag_score
+    return best, fp_score
+
+
+def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None):
     """Look one track up and store the best candidate. Returns its status.
 
     ``'applied'`` means the match was certain enough to write into the
@@ -642,6 +881,26 @@ def enrich_track(con, row, client, now=None):
         # because the first one found nothing.
         if best_score >= AUTO:
             break
+
+    if (not best or best_score < REVIEW) and acoustid is not None:
+        # Rung four. Only reached when the tags were not enough, which is
+        # exactly the population it was added for.
+        try:
+            cand, fp_score = _fingerprint_candidate(row, client, acoustid,
+                                                    fpcalc=fpcalc)
+        except FingerprintError:
+            cand, fp_score = None, 0.0
+        if cand is not None:
+            fields = {**cand["fields"], **cand["release_fields"]}
+            # Audio and tags agreeing is the strongest evidence available;
+            # audio alone still wants a person to look.
+            status = "applied" if cand["tag_score"] >= AUTO else "candidate"
+            _store(con, row["content_key"], "acoustid", round(fp_score, 4),
+                   fields, cand["mbid"], cand["release_id"], now, status)
+            if status == "applied":
+                _apply_fields(con, row["content_key"], fields, now)
+            con.commit()
+            return status
 
     if not best or best_score < REVIEW:
         _store(con, row["content_key"], "musicbrainz", best_score or 0.0, {},
@@ -854,7 +1113,8 @@ def summary(con):
 
 
 def run(con, client=None, root=None, limit=None, redo=False, write_tags=False,
-        artwork=False, progress=None, contact=None):
+        artwork=False, progress=None, contact=None, use_fingerprint=False,
+        acoustid=None):
     """Enrich a library: backfill, then look up, then optionally write back.
 
     One pass, in the order that costs least. The offline backfill runs first
@@ -870,7 +1130,15 @@ def run(con, client=None, root=None, limit=None, redo=False, write_tags=False,
     Returns counts, including what was written to disk. Nothing is written to
     an audio file unless ``write_tags`` is set.
     """
-    client = client or MusicBrainz(contact=contact)
+    cfg = get_config(con)
+    client = client or MusicBrainz(contact=contact or cfg["contact"] or None)
+    # Named use_fingerprint rather than fingerprint: the module-level
+    # fingerprint() is what eventually does the work, and shadowing it here
+    # would be a trap for the next person to add a call.
+    if use_fingerprint and acoustid is None:
+        acoustid = AcoustID(cfg["acoustid_key"])
+    if not use_fingerprint:
+        acoustid = None
     counts = dict(backfilled=0, applied=0, candidates=0, unmatched=0,
                   written=0, write_failed=0, failed=0, stopped=None)
 
@@ -881,7 +1149,7 @@ def run(con, client=None, root=None, limit=None, redo=False, write_tags=False,
     consecutive = 0
     for i, row in enumerate(rows, 1):
         try:
-            status = enrich_track(con, row, client)
+            status = enrich_track(con, row, client, acoustid=acoustid)
         except LookupError_ as exc:
             counts["failed"] += 1
             consecutive += 1
