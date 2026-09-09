@@ -51,12 +51,21 @@ datas = [(WORK, os.path.join("lemonzest", "web"))]
 # Flask and Click are imported directly; the rest are pulled in by name at
 # runtime and would otherwise be missed by the import graph.
 hiddenimports = [
+    # Imported inside functions rather than at module scope - the interface
+    # so a CLI-only run does not pay for Flask, the rest so enrichment stays
+    # optional - which is exactly the shape the import graph does not always
+    # follow.
     "lemonzest.server",
+    "lemonzest.enrich",
+    "lemonzest.organise",
+    "lemonzest.tags",
     "mutagen",
     "mutagen.easyid3",
     "mutagen.flac",
+    "mutagen.id3",
     "mutagen.mp3",
     "mutagen.mp4",
+    "mutagen.oggopus",
     "mutagen.oggvorbis",
     "psutil",
 ]

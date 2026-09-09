@@ -158,6 +158,130 @@ log exists to be pasted into a bug report. The CLI prints the tail of it
 when a download fails, so a failure need not be reproduced to find out what
 it said.
 
+## Metadata quality
+
+A file's tags are only as good as whatever wrote them, and a downloaded one
+is often wrong in a specific way: with no `artist` tag to read, yt-dlp falls
+back to the channel name, so a KIRINJI track lands in a folder called
+"Nemu". `enrich` reconciles what a file claims with what MusicBrainz knows.
+
+```bash
+# Free and offline: copy ISRCs onto untagged twins already in the library.
+lemon-zest enrich backfill
+
+# Look the rest up. One request per second, as MusicBrainz asks.
+lemon-zest enrich run
+
+# What it was not sure about, least confident first.
+lemon-zest enrich review
+lemon-zest enrich accept 41
+lemon-zest enrich reject 42
+
+# Say it yourself. Outranks every source, now and on every later run.
+lemon-zest enrich set 43 --album "Kirinji" --artist "KIRINJI"
+
+# How much of the library is identified.
+lemon-zest enrich status
+```
+
+Four rungs, cheapest first. **Backfill** matches a file with no ISRC against
+one that has an ISRC on folded artist, folded title and a duration inside two
+seconds — no network at all, and it promotes files onto the rung above.
+**ISRC lookup** is an exact identifier, so a hit is certain. **Text search**
+is fuzzy, scored on title, artist and a duration window; above 0.90 it is
+applied, between 0.62 and 0.90 it waits for you, below that it is discarded.
+
+**Fingerprinting** is the last rung, and the only source that ignores what a
+file claims and listens to it instead — which is the whole of the untagged
+download case. It is opt-in, because it needs two things this repo does not
+ship:
+
+```bash
+winget install AcoustID.Chromaprint          # fpcalc, found on PATH
+lemon-zest enrich config --acoustid-key <key>   # free: acoustid.org/new-application
+lemon-zest enrich run --fingerprint
+```
+
+`fpcalc` is located rather than bundled, the same way `yt-dlp` and `ffmpeg`
+are: it keeps an LGPL binary out of the distribution and lets it be upgraded
+on its own schedule. Dropping `fpcalc.exe` beside `lemon-zest.exe` works too.
+`enrich config` says what is missing.
+
+How much of a fingerprint match is applied still depends on the tags, even
+though getting there did not. Audio and tags agreeing is the strongest
+evidence available, and is applied. Audio alone goes to the review queue —
+"trust the sound over the tag" is a judgement about your library, not a fact.
+
+Four rules make it safe to run over a library you care about:
+
+- **Nothing is overwritten in place.** The proposal lives in its own table
+  with its source, its confidence and its date, so a wrong answer is
+  reversible and auditable.
+- **A release-derived field only fills a blank.** Identifying a *recording*
+  and choosing which of its forty *releases* this copy came from are
+  different questions with very different certainties, and one confidence
+  score describes only the first. Without this rule a correctly tagged
+  "Cigarettes After Sex" track, matched with total confidence to its own
+  recording, gets relabelled with the HBO soundtrack that recording also
+  appears on. Title, artist and ISRC come from the recording and are taken;
+  album, year and track number are filled in only where the file was silent.
+- **A hand-typed value wins.** `enrich set` outranks every source, survives a
+  re-run, and is re-applied after any later match.
+- **Audio files are not touched** unless you pass `--write-tags`, which asks
+  first. When you do, each file is rewritten to a copy and swapped in, so an
+  interruption leaves the original — and the content key is recomputed in the
+  same transaction, or the next scan would see every corrected file as new
+  and the card would recopy the lot.
+
+`--write-tags --artwork` also replaces the embedded cover with the release's
+own front cover from the Cover Art Archive. That is worth knowing about: the
+artwork a download embeds is whatever yt-dlp scraped, which for one of
+YouTube's auto-generated art tracks is the real square cover and for an
+ordinary upload is a 16:9 video frame.
+
+Everything is keyed by content key rather than by track id, so moving or
+rescanning a file keeps its enrichment and costs no further lookups.
+
+### Making the folders agree
+
+`enrich` fixes what the catalog believes. `organise` fixes what is on disk —
+the folder still named after seven credited writers, because that was the
+only thing yt-dlp had to build a path from.
+
+```bash
+lemon-zest organise plan  "C:/Users/nhti/Music/nhaccuatui/music"
+lemon-zest organise apply "C:/Users/nhti/Music/nhaccuatui/music"
+lemon-zest organise undo          # lists past runs
+lemon-zest organise undo organise-1789012345.json
+```
+
+```
+Joji, Kurtis McKenzie, Linden Jay, Chelsea Lena, George Miller, …/Nectar/Like You Do.m4a
+  -> Joji/Nectar/Like You Do.m4a
+
+3 to move, 2 skipped for having no artist to file them under
+```
+
+It plans by default and asks before it moves anything, because this is the
+most destructive thing the program can be asked to do. Every run writes a
+journal that `organise undo` replays backwards.
+
+The default template changes **folders only** and leaves every filename
+exactly as it is — the two halves of this library spell filenames
+differently, one with track numbers and one without, so renaming them too is
+a much larger diff than the problem calls for. `--template` if you want it.
+
+Two refusals worth knowing about. A track with no artist is left where it is,
+and so is any move whose destination would contain `Unknown Album` or
+`Unknown Artist`: a folder reading *someday you'll wake up, and you'll be 26*
+carries more than one reading *Unknown Album*, and tidiness that destroys
+information is not tidiness.
+
+Moving a file does not change its content key — the bytes did not change — so
+the device manifest still matches and a replug stays a no-op. A device whose
+template mirrors the library layout (`{rel_path}`) is named before anything
+moves, because its next sync will move the same files on the card.
+
 ## The interface
 
 ```bash
@@ -187,7 +311,9 @@ playlist entries that resolve to nothing.
 
 Each of these is covered by a test in `tests/test_sync.py`; `tests/test_server.py`
 covers the API the interface runs on, and `tests/test_download.py` the
-download path against a stub yt-dlp. 58 tests, no network, no real card:
+download path against a stub yt-dlp, and `tests/test_enrich.py` the metadata
+ladder against a stub MusicBrainz and `tests/test_organise.py` the file moves.
+137 tests, no network, no real card:
 
 | | |
 |---|---|
@@ -200,6 +326,13 @@ download path against a stub yt-dlp. 58 tests, no network, no real card:
 | A download is a library file | What yt-dlp writes is indexed on the spot, into the folder the scanner watches, and adding it to a playlist twice adds one entry. |
 | A dead video is not a dead run | yt-dlp exiting non-zero after fetching some of a playlist keeps what arrived; a run that fetched nothing raises, naming the cookie fix when that is the cause. |
 | Provenance survives | `#Collection URI` and per-track `#Apple Music URI` comments are read, stored, and written back out. |
+| A right album is not overwritten by a guess | A recording matched with confidence 1.00 whose best release is a soundtrack leaves a correctly tagged album alone, and still takes the recording's own ISRC. |
+| A correction outranks the source | `enrich set` survives a later match that disagrees with it. |
+| A tag write is atomic | A failed write leaves the original file byte-for-byte; a successful one moves the content key, so a rescan reports no change and the card recopies nothing. |
+| One bad lookup is not a bad run | An isolated request failure is skipped and counted; three in a row stop the run. |
+| A placeholder is not a destination | `organise` refuses to move a file into `Unknown Album`, and refuses `Various Artists` as an album artist. |
+| A move is reversible | Every `organise` run writes a journal; undoing it puts every file back and leaves the catalog matching the disk. |
+| A move does not recopy the card | The content key survives a move, so the device manifest still matches and a replug stays a no-op. |
 
 ```bash
 python -m unittest discover -s tests -v

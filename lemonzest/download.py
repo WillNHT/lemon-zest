@@ -44,9 +44,17 @@ FILE_PREFIX = "[lz-file]"
 
 # Where a download lands under the library root, in yt-dlp's own output
 # syntax: alternates are comma-separated, the fallback follows a pipe.
+#
+# album_artist comes first because it is the one name a person would look
+# under. YouTube's auto-generated art tracks put every credited writer in
+# `artist` - which is how the library grew a folder named for seven people -
+# and the single performer in `album_artist`. `uploader` stays as the last
+# resort, and it is the reason a KIRINJI track can land under the channel
+# that posted it; the enricher exists to correct that afterwards, but
+# preferring the better field first means it happens less often.
 DEFAULT_OUTPUT = (
-    "%(artist,uploader|Unknown Artist)s/%(album,playlist_title|Singles)s/"
-    "%(title)s.%(ext)s"
+    "%(album_artist,artist,uploader|Unknown Artist)s/"
+    "%(album,playlist_title|Singles)s/%(title)s.%(ext)s"
 )
 
 # Kept out of the library walk by the scanner's dotfile rule.
@@ -354,6 +362,16 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         "-f", "bestaudio/best",
         "-x", "--audio-format", fmt, "--audio-quality", quality,
         "--embed-metadata", "--embed-thumbnail",
+        # YouTube serves thumbnails as WebP. Several players - and some tag
+        # readers - show nothing at all for a WebP cover, so the picture is
+        # there and invisible. Converting on the way in costs one ffmpeg call
+        # and makes the embedded art readable everywhere.
+        #
+        # What this cannot fix is *which* picture it is: for an art track the
+        # thumbnail is the real square cover, and for an ordinary upload it
+        # is a 16:9 video frame. Replacing that with the release's own front
+        # cover needs the recording identified first - see enrich.py.
+        "--convert-thumbnails", "jpg",
         # Long titles become path components; keep them inside what the
         # card's filesystem will accept later.
         "--trim-filenames", "120",
