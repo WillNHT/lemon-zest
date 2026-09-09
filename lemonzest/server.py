@@ -111,12 +111,30 @@ def create_app(db_path=None):
                 + one("SELECT COUNT(*) FROM track WHERE (title IS NULL OR "
                       "title = '') AND size > 0")
                 + one("SELECT COUNT(*) FROM enrichment WHERE status='candidate'")),
+            "enrich_states": _enrich_states(c),
+            "fingerprint": _fingerprint_state(c),
             "roots": db_mod.roots(c),
         })
 
-    def _library_where(args):
+    def _enrich_states(c):
+        from . import enrich as en
+        return en.state_counts(c)
+
+    def _fingerprint_state(c):
+        """Whether rung four is available. The interface offers it when a
+        text search comes back empty, which is the case it exists for."""
+        from . import enrich as en
+        return en.fingerprint_status(c)
+
+    def _library_where(args, with_state=True):
         """Build the WHERE clause shared by the track list and the facets."""
+        from . import enrich as en
+
         clauses, params = [], []
+        state = (args.get("state") or "").strip()
+        if with_state and state in en.STATES:
+            clauses.append(en.STATE_SQL + " = ?")
+            params.append(state)
         q = (args.get("q") or "").strip()
         if q:
             clauses.append("(t.title LIKE ? OR t.artist LIKE ? OR t.album LIKE ?)")
@@ -136,19 +154,32 @@ def create_app(db_path=None):
 
     @app.get("/api/library")
     def library():
+        from . import enrich as en
+
         c = con()
         where, params = _library_where(request.args)
         limit = min(int(request.args.get("limit", 200)), 1000)
         offset = int(request.args.get("offset", 0))
         device_id = request.args.get("device")
 
+        # The enrichment join is on every library query rather than fetched
+        # separately per page: the state is a column in the table and a filter
+        # in the toolbar, so it has to be sortable, pageable and countable in
+        # the same statement as the rest.
+        join = " LEFT JOIN enrichment e ON e.content_key = t.content_key "
+
         total = c.execute(
-            f"SELECT COUNT(*) FROM track t WHERE {where}", params
+            f"SELECT COUNT(*) FROM track t {join} WHERE {where}", params
         ).fetchone()[0]
         # Untagged files sort last rather than first: SQLite puts NULLs at the
         # top, which would fill the first screen with the least useful rows.
         rows = c.execute(
-            f"SELECT t.* FROM track t WHERE {where} "
+            f"SELECT t.*, {en.STATE_SQL} AS enrich_state, "
+            "e.status AS enrich_status, e.source AS enrich_source, "
+            "e.confidence AS enrich_confidence, "
+            "(SELECT COUNT(*) FROM track_override o "
+            "   WHERE o.content_key = t.content_key) AS overrides "
+            f"FROM track t {join} WHERE {where} "
             "ORDER BY (t.album_artist IS NULL), t.album_artist, t.album, "
             "t.disc_no, t.track_no, t.title, t.rel_path "
             "LIMIT ? OFFSET ?", params + [limit, offset]
@@ -174,11 +205,38 @@ def create_app(db_path=None):
                 "bitrate": r["bitrate"], "sample_rate": r["sample_rate"],
                 "isrc": r["isrc"], "purl": r["purl"], "path": r["path"],
                 "rel_path": r["rel_path"],
+                "content_key": r["content_key"],
+                "state": r["enrich_state"],
+                "enrich_source": r["enrich_source"],
+                "confidence": r["enrich_confidence"],
+                "overrides": r["overrides"],
                 "empty": r["size"] == 0,
                 "untagged": not r["title"],
                 "on_device": r["id"] in on_device,
             } for r in rows],
         })
+
+    @app.get("/api/library/keys")
+    def library_keys():
+        """Every content key the current filter matches, not just this page.
+
+        What "select all 2,306" has to mean when the table only ever holds
+        200 rows. Capped, because an action over an unbounded selection is
+        one the interface cannot honestly show or undo.
+        """
+        c = con()
+        where, params = _library_where(request.args)
+        cap = min(int(request.args.get("cap", 5000)), 20000)
+        rows = c.execute(
+            "SELECT DISTINCT t.content_key FROM track t "
+            "LEFT JOIN enrichment e ON e.content_key = t.content_key "
+            f"WHERE {where} LIMIT ?", params + [cap]).fetchall()
+        total = c.execute(
+            "SELECT COUNT(DISTINCT t.content_key) FROM track t "
+            "LEFT JOIN enrichment e ON e.content_key = t.content_key "
+            f"WHERE {where}", params).fetchone()[0]
+        return jsonify({"keys": [r["content_key"] for r in rows],
+                        "total": total, "capped": total > len(rows)})
 
     @app.get("/api/problems")
     def problems():
@@ -238,26 +296,238 @@ def create_app(db_path=None):
             "proposed": r["proposed"],
         } for r in rows]})
 
+    def _keys(body):
+        """The content keys an action was asked to work on.
+
+        One key or many arrive through the same door: every action in this
+        section is a bulk action with a selection of one as its ordinary
+        case, and two code paths is how the single-item one quietly grows a
+        different meaning.
+        """
+        keys = body.get("content_keys")
+        if isinstance(keys, str):
+            keys = [keys]
+        if not keys and body.get("content_key"):
+            keys = [body["content_key"]]
+        return [k for k in (keys or []) if k]
+
+    @app.get("/api/enrich/track/<path:content_key>")
+    def enrich_track_detail(content_key):
+        """Current values, the stored proposal and any hand-typed override."""
+        from . import enrich as en
+        out = en.proposal_for(con(), content_key)
+        if not out:
+            return jsonify({"error": "no such track"}), 404
+        return jsonify(out)
+
     @app.post("/api/enrich/<action>")
     def enrich_decide(action):
-        """Accept or reject one candidate.
+        """Accept or reject a selection of candidates.
 
-        Writing to the audio file is not reachable from here on purpose: the
-        interface decides what the catalog believes, and rewriting two
-        thousand files is a deliberate command with a confirmation on it.
+        Writing the values into the audio files is not done here. Accepting
+        settles what the catalog believes, which is cheap and reversible;
+        rewriting the files is neither, so it is its own request with its own
+        confirmation - see /api/enrich/write.
         """
         from . import enrich as en
         if action not in ("accept", "reject"):
             return jsonify({"error": "unknown action"}), 404
-        key = (request.json or {}).get("content_key")
-        if not key:
+        keys = _keys(request.json or {})
+        if not keys:
             return jsonify({"error": "content_key required"}), 400
         c = con()
-        if action == "accept":
-            ok = en.accept(c, key)
-            return jsonify({"ok": bool(ok)}), (200 if ok else 404)
-        en.reject(c, key)
-        return jsonify({"ok": True})
+        fn = en.accept if action == "accept" else en.reject
+        done = sum(1 for k in keys if fn(c, k))
+        return jsonify({"ok": True, "changed": done, "asked": len(keys)})
+
+    @app.post("/api/enrich/state")
+    def enrich_state():
+        """Move a selection between states by hand.
+
+        Only `skipped` and `raw` are settable: the other two are outcomes,
+        and a button that declared a file `enriched` with no answer behind it
+        would be writing a claim rather than recording one.
+        """
+        from . import enrich as en
+        body = request.json or {}
+        state = (body.get("state") or "").strip()
+        keys = _keys(body)
+        if not keys:
+            return jsonify({"error": "content_key required"}), 400
+        try:
+            changed = en.set_state(con(), keys, state)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "changed": changed, "state": state})
+
+    @app.post("/api/enrich/edit")
+    def enrich_edit():
+        """Type metadata by hand, over one file or a whole selection.
+
+        Only the fields actually sent are touched, which is what makes one
+        form usable for a selection: filling in `album_artist` alone fixes a
+        folder full of tracks without flattening their titles to one value.
+        An empty string clears the hand-typed value and lets whatever the
+        source said show through again.
+        """
+        from . import enrich as en
+        body = request.json or {}
+        keys = _keys(body)
+        fields = body.get("fields") or {}
+        if not keys:
+            return jsonify({"error": "content_key required"}), 400
+        fields = {k: v for k, v in fields.items() if k in en.ENRICHABLE}
+        if not fields:
+            return jsonify({"error": "no editable field given"}), 400
+        clear = [k for k, v in fields.items() if v is None or v == ""]
+        set_ = {k: v for k, v in fields.items() if k not in clear}
+        c = con()
+        for key in keys:
+            if clear:
+                en.clear_overrides(c, key, clear)
+            if set_:
+                en.override(c, key, **set_)
+        return jsonify({"ok": True, "changed": len(keys),
+                        "fields": sorted(fields)})
+
+    @app.post("/api/enrich/run")
+    def enrich_run():
+        """Look up a hand-picked selection again, by hand.
+
+        New files go through this on their own when they arrive; this is the
+        deliberate second ask.
+
+        MusicBrainz answers one request a second, so even a modest selection
+        outlives a click: this runs on a worker and reports progress the way
+        a scan or a sync does.
+        """
+        from . import enrich as en
+        body = request.json or {}
+        keys = _keys(body)
+        if not keys:
+            return jsonify({"error": "content_key required"}), 400
+        write_tags = bool(body.get("write_tags"))
+        artwork = bool(body.get("artwork"))
+        use_fp = bool(body.get("fingerprint"))
+        if use_fp and not en.fingerprint_status(con())["ready"]:
+            return jsonify({"error": "fingerprinting needs fpcalc and an "
+                                     "AcoustID key; set them up first"}), 400
+        job_id = _new_job("enrich", "%d track%s" % (len(keys),
+                                                   "" if len(keys) == 1 else "s"))
+
+        def work():
+            try:
+                c = db_mod.connect(app.config["DB_PATH"])
+
+                def cb(done, total, status):
+                    _update(job_id, done=done, total=total,
+                            detail="%d of %d - %s" % (done, total, status))
+
+                counts = en.run_tracks(
+                    c, keys, write_tags=write_tags, artwork=artwork,
+                    use_fingerprint=use_fp, progress=cb)
+                bits = ["%d enriched" % counts["applied"],
+                        "%d to review" % counts["candidates"]]
+                if counts["unmatched"]:
+                    bits.append("%d not found" % counts["unmatched"])
+                if counts["failed"]:
+                    bits.append("%d failed" % counts["failed"])
+                if counts["skipped"]:
+                    bits.append("%d skipped" % counts["skipped"])
+                _update(job_id, state="done", result=counts,
+                        finished=time.time(), detail=", ".join(bits))
+            except Exception as exc:
+                _update(job_id, state="failed", error=str(exc),
+                        finished=time.time())
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+        return jsonify({"job": job_id})
+
+    @app.post("/api/enrich/write/preview")
+    def enrich_write_preview():
+        """Exactly what a write would put in each file, before it happens."""
+        from . import enrich as en
+        keys = _keys(request.json or {})
+        if not keys:
+            return jsonify({"error": "content_key required"}), 400
+        c = con()
+        # Capped: the dialog is something a person reads, and a preview of
+        # two thousand files is not read, it is scrolled past.
+        out = [en.pending_write(c, k) for k in keys[:50]]
+        out = [o for o in out if o]
+        writable = sum(1 for o in out if o["fields"] and not o["missing"])
+        return jsonify({
+            "files": out,
+            "shown": len(out),
+            "total": len(keys),
+            "writable": writable,
+            "missing": sum(1 for o in out if o["missing"]),
+            "nothing_to_write": sum(1 for o in out if not o["fields"]),
+            # Files whose tags already say what the catalog says. Writing them
+            # is harmless and pointless, and saying so is the difference
+            # between "it did nothing" and "there was nothing to do".
+            "no_change": sum(1 for o in out
+                             if o["fields"] and not o["missing"]
+                             and not o["changes"]),
+            "renormalised": sum(1 for o in out if o["renormalised"]),
+            "no_artwork": sum(1 for o in out if not o["artwork_available"]),
+        })
+
+    @app.post("/api/enrich/write")
+    def enrich_write():
+        """Write what the catalog believes into the audio files themselves.
+
+        Its own endpoint rather than a flag on accept. Every other action
+        here edits a database row; this one rewrites files on disk, changes
+        their content keys, and cannot be undone by pressing the other
+        button - so it is asked for separately and confirmed separately.
+        """
+        from . import enrich as en
+        body = request.json or {}
+        keys = _keys(body)
+        if not keys:
+            return jsonify({"error": "content_key required"}), 400
+        artwork = bool(body.get("artwork"))
+        job_id = _new_job("write-tags", "%d file%s" % (len(keys),
+                                                       "" if len(keys) == 1 else "s"))
+
+        def work():
+            try:
+                c = db_mod.connect(app.config["DB_PATH"])
+                written = failed = 0
+                notes = []
+                for i, key in enumerate(keys, 1):
+                    res = en.write_back_result(c, key, artwork=artwork)
+                    if res["ok"]:
+                        written += 1
+                    else:
+                        failed += 1
+                    if res["reason"]:
+                        # Folded the same way a run folds its lookup errors:
+                        # fifty files in one unwritable folder is one sentence
+                        # with a count, not fifty lines to scroll past.
+                        for n in notes:
+                            if n["message"] == res["reason"]:
+                                n["count"] += 1
+                                break
+                        else:
+                            if len(notes) < en.MAX_REPORTED_ERRORS:
+                                notes.append({"message": res["reason"],
+                                              "count": 1})
+                    _update(job_id, done=i, total=len(keys),
+                            detail="%d written" % written)
+                _update(job_id, state="done", finished=time.time(),
+                        result={"written": written, "failed": failed,
+                                "errors": notes},
+                        detail="%d written, %d not written" % (written, failed))
+            except Exception as exc:
+                _update(job_id, state="failed", error=str(exc),
+                        finished=time.time())
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+        return jsonify({"job": job_id})
 
     @app.get("/api/facets")
     def facets():
@@ -272,8 +542,12 @@ def create_app(db_path=None):
             col = ("COALESCE(t.album_artist, t.artist)" if field == "artist"
                    else f"t.{field}")
             rows = c.execute(
-                f"SELECT {col} AS v, COUNT(*) n FROM track t WHERE {where} "
-                f"AND {col} IS NOT NULL AND {col} <> '' "
+                f"SELECT {col} AS v, COUNT(*) n FROM track t "
+                # Joined even when no state filter is set: _library_where may
+                # put `e.status` in the clause, and the facet counts have to
+                # narrow with the table rather than describe a different set.
+                "LEFT JOIN enrichment e ON e.content_key = t.content_key "
+                f"WHERE {where} AND {col} IS NOT NULL AND {col} <> '' "
                 "GROUP BY v COLLATE NOCASE ORDER BY v COLLATE NOCASE",
                 params
             ).fetchall()
@@ -327,6 +601,51 @@ def create_app(db_path=None):
 
     # ----------------------------------------------------------- scan
 
+    def _start_auto_enrich(root=None, content_keys=None, label=None):
+        """Kick off the automatic pass that follows a scan or a download.
+
+        Its own job rather than a tail on the caller's: a scan of a folder
+        finishes in seconds and an identification pass over it is
+        rate-limited to one request a second, so tying them together would
+        leave the scan looking like it was still running for half an hour.
+        Two jobs, two progress bars, and the scan reports what it did when it
+        did it.
+        """
+        from . import enrich as en
+        if not en.auto_enabled():
+            return None
+        job_id = _new_job("enrich", label or root or "new files")
+        _update(job_id, detail="looking for anything new to identify")
+
+        def work():
+            try:
+                c = db_mod.connect(app.config["DB_PATH"])
+
+                def cb(done, total, status):
+                    _update(job_id, done=done, total=total,
+                            detail="%d of %d - %s" % (done, total, status))
+
+                counts = en.auto_after_ingest(
+                    c, root=root, content_keys=content_keys, progress=cb)
+                bits = ["%d enriched" % counts["applied"],
+                        "%d to review" % counts["candidates"]]
+                if counts["written"]:
+                    bits.append("%d file%s tagged" % (
+                        counts["written"], "" if counts["written"] == 1 else "s"))
+                if counts["unmatched"]:
+                    bits.append("%d not found" % counts["unmatched"])
+                if counts["failed"]:
+                    bits.append("%d failed" % counts["failed"])
+                _update(job_id, state="done", result=counts,
+                        finished=time.time(), detail=", ".join(bits))
+            except Exception as exc:
+                _update(job_id, state="failed", error=str(exc),
+                        finished=time.time())
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+        return job_id
+
     @app.post("/api/scan")
     def start_scan():
         root = (request.json or {}).get("root", "").strip()
@@ -341,6 +660,9 @@ def create_app(db_path=None):
                     _update(job_id, done=done, total=total,
                             detail=f"{done:,} of {total:,} files")
                 counts = scan.scan(c, root, progress=cb)
+                # Whatever the scan found that has never been looked at is
+                # looked at now, without being asked.
+                counts["enrich_job"] = _start_auto_enrich(root=root)
                 _update(job_id, state="done", result=counts,
                         finished=time.time())
             except Exception as exc:
@@ -395,6 +717,17 @@ def create_app(db_path=None):
         except dl_mod.DownloadError as exc:
             return jsonify({"error": str(exc)}), 400
 
+    def _keys_for_paths(c, paths):
+        """Content keys for files named by path, in the order given."""
+        out, seen = [], set()
+        for path in paths:
+            row = c.execute("SELECT content_key FROM track WHERE path = ?",
+                            (path,)).fetchone()
+            if row and row["content_key"] not in seen:
+                seen.add(row["content_key"])
+                out.append(row["content_key"])
+        return out
+
     @app.post("/api/download")
     def download_start():
         body = request.json or {}
@@ -432,6 +765,15 @@ def create_app(db_path=None):
                 summary = dl_mod.download(
                     c, urls, root=root, playlist=playlist_name,
                     on_event=on_event, no_playlist=single, archive=archive)
+                # Scoped to the files this run actually fetched, not to the
+                # whole folder: a download into a library of two thousand
+                # would otherwise start an hours-long pass over all of them.
+                keys = _keys_for_paths(c, summary.get("files") or [])
+                summary["enrich_job"] = _start_auto_enrich(
+                    content_keys=keys,
+                    label="%d new file%s" % (len(keys),
+                                             "" if len(keys) == 1 else "s")
+                ) if keys else None
                 _update(job_id, state="done", result=summary,
                         finished=time.time(),
                         detail=f"{summary['downloaded']} downloaded")

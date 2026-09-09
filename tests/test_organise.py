@@ -6,8 +6,14 @@ supposed to relocate, and that the journal really does put everything back.
 
     python -m unittest discover -s tests -v
 """
-import json
 import os
+
+# Automatic enrichment follows every scan and download. Switched off for the
+# suite: these tests are about the catalog and the sync, and none of them
+# should be making rate-limited calls to somebody else's service.
+os.environ["LEMONZEST_AUTO_ENRICH"] = "0"
+
+import json
 import shutil
 import subprocess
 import sys

@@ -165,6 +165,22 @@ is often wrong in a specific way: with no `artist` tag to read, yt-dlp falls
 back to the channel name, so a KIRINJI track lands in a folder called
 "Nemu". `enrich` reconciles what a file claims with what MusicBrainz knows.
 
+**It runs on its own.** A scan and a download each finish by identifying
+whatever they brought in and writing the tags into those files — no flag, no
+button, no setting. Identifying a file is part of taking it into the library,
+not a chore to remember afterwards. The commands below are for the parts that
+still want a person: seeing what it decided, correcting it, and telling it to
+leave something alone.
+
+It runs as its own job rather than as a tail on the scan, because MusicBrainz
+allows one request a second: a scan that finishes in seconds should say so
+rather than appearing to grind for an hour. Three things bound what it will do
+unattended — a **skipped** file is never looked at, only a **certain** match
+(exact ISRC, or a text match at or above 0.90, or a fingerprint the tags
+agree with) is written to disk, and the fill-only rule and hand-typed
+overrides still win. Doubtful matches wait in the review queue and no file is
+rewritten for them.
+
 ```bash
 # Free and offline: copy ISRCs onto untagged twins already in the library.
 lemon-zest enrich backfill
@@ -180,9 +196,33 @@ lemon-zest enrich reject 42
 # Say it yourself. Outranks every source, now and on every later run.
 lemon-zest enrich set 43 --album "Kirinji" --artist "KIRINJI"
 
+# Leave a track out of it entirely. Never looked up again until you unskip.
+lemon-zest enrich skip 44 45
+lemon-zest enrich unskip 44
+
 # How much of the library is identified.
 lemon-zest enrich status
+lemon-zest enrich states
 ```
+
+### The four states
+
+Every file is in exactly one of them, and the Music page shows which in a
+column of its own.
+
+| State | Means | What a run does with it |
+| --- | --- | --- |
+| **raw** | never looked up, or a lookup that came back empty | picks it up |
+| **awaiting review** | a match is stored and wants your decision | leaves it alone |
+| **enriched** | values are in the catalog - matched, accepted or typed | leaves it alone unless you ask again |
+| **skipped** | deliberately excluded | **never** looks at it, even with `--redo`, even when you select it by hand |
+
+`skipped` is the one with teeth. A live bootleg MusicBrainz will never have,
+a podcast episode, a file whose tags are right and whose match keeps coming
+back wrong — mark it and it stops costing a request forever. Rejecting a
+proposal lands in the same place, because "not this one" has always meant
+"stop asking". `enrich unskip`, or **Mark raw** in the interface, is the way
+back, and it forgets the stored answer as well as the state.
 
 Four rungs, cheapest first. **Backfill** matches a file with no ISRC against
 one that has an ISRC on folded artist, folded title and a duration inside two
@@ -241,6 +281,63 @@ ordinary upload is a 16:9 video frame.
 
 Everything is keyed by content key rather than by track id, so moving or
 rescanning a file keeps its enrichment and costs no further lookups.
+
+One more rule, learned the hard way. **A stored path is resolved to the
+spelling the filesystem actually has** before any file is opened. The catalog
+stores NFC, because a path needs one spelling to be comparable; NTFS keeps
+whatever bytes wrote the file, and a yt-dlp download of a Japanese title
+arrives as NFD — `か` plus a combining dakuten where the catalog holds the
+single character `が`. The two read identically and open differently, so
+without this a write fails with *no such file* over a file that is plainly
+sitting there. `paths.resolve_existing` tries the whole path in both
+normalisations and then walks it component by component, which is what a
+hand-made folder holding a downloaded file needs.
+
+### From the interface
+
+The same four states, the same rules, on the **Music** page — where picking
+which tracks to identify is much easier than typing their ids.
+
+Rows select the way a file manager's do: click one, shift-click for a run,
+ctrl-click (cmd on a Mac) to add one, `ctrl+A` for the page, and **Select all
+N matching** for everything behind the current filter rather than everything
+on screen. Arrow keys walk the list, shift extends. With something selected:
+
+| Key | Does |
+| --- | --- |
+| `E` | look the selection up |
+| `A` / `R` | accept or reject the stored match |
+| `S` | skip |
+| `U` | mark raw |
+| `Enter` | edit the metadata by hand |
+| `W` | write the tags into the files |
+| `Esc` | clear the selection |
+
+Enrichment is automatic, so most of the time there is nothing to press: the
+selection is for asking again, correcting by hand, or skipping. The
+**Metadata** chips above the table filter to one state, so "show me the 23
+awaiting review" is one click.
+
+**Edit metadata** opens on one track with three tiers side by side — what the
+catalog says now, what the source proposed (click a proposal to drop it into
+the box), and anything already typed by hand. On a selection of many it edits
+one field across all of them: filling in only *Album artist* fixes a folder
+full of tracks without flattening their titles to one value. An empty box
+means "leave this alone" over a selection, and "forget what I typed" on a
+single track.
+
+**Write tags to files** is the only button on that page that touches your
+audio. Everything else edits the catalog and can be undone by clicking the
+other button; that one cannot, so it asks separately — and it shows the exact
+diff first: every field, what the file holds now, what it would become. If
+nothing would change, or the files are not where the catalog thinks, or the
+cover box has no release to fetch from, the dialog says so instead of running
+and reporting a zero.
+
+Every run leaves a result on the page until it is dismissed — what was
+enriched, what is waiting, what failed and *why*. A lookup that comes back
+empty says so; if the reason is that fingerprinting is not set up, it says
+that too, because a channel-name artist gives a text search nothing to match.
 
 ### Making the folders agree
 
@@ -311,7 +408,10 @@ playlist entries that resolve to nothing.
 
 Each of these is covered by a test in `tests/test_sync.py`; `tests/test_server.py`
 covers the API the interface runs on, and `tests/test_download.py` the
-download path against a stub yt-dlp, and `tests/test_enrich.py` the metadata
+download path against a stub yt-dlp, `tests/test_enrich_states.py` the four
+states and the endpoints the Music page drives them with (no ffmpeg needed),
+`tests/test_paths_unicode.py` the NFC/NFD path resolution,
+and `tests/test_enrich.py` the metadata
 ladder against a stub MusicBrainz and `tests/test_organise.py` the file moves.
 137 tests, no network, no real card:
 
@@ -328,6 +428,11 @@ ladder against a stub MusicBrainz and `tests/test_organise.py` the file moves.
 | Provenance survives | `#Collection URI` and per-track `#Apple Music URI` comments are read, stored, and written back out. |
 | A right album is not overwritten by a guess | A recording matched with confidence 1.00 whose best release is a soundtrack leaves a correctly tagged album alone, and still takes the recording's own ISRC. |
 | A correction outranks the source | `enrich set` survives a later match that disagrees with it. |
+| A skip is honoured everywhere | A skipped file is not looked up by `enrich run`, not by `--redo`, not by selecting it in the interface and pressing Enrich, and not by the automatic pass after a scan. |
+| Automation writes only what is certain | The pass that follows a scan writes tags for `applied` matches only; a candidate waits for a person and no file is touched for it. |
+| A scan survives a dead service | MusicBrainz being down is reported by the enrichment job, and never raised into the scan that started it. |
+| A failure says why | A run that could not reach MusicBrainz, or a file that could not be written, reports the reason, not just a count. |
+| A stored path finds its file | An NFC path resolves an NFD file on disk and the reverse, including a folder and filename in different normalisations. |
 | A tag write is atomic | A failed write leaves the original file byte-for-byte; a successful one moves the content key, so a rescan reports no change and the card recopies nothing. |
 | One bad lookup is not a bad run | An isolated request failure is skipped and counted; three in a row stop the run. |
 | A placeholder is not a destination | `organise` refuses to move a file into `Unknown Album`, and refuses `Various Artists` as an album artist. |

@@ -66,10 +66,23 @@ const S = {
   scopeId: null,         // device the library's tick column edits
   playlistId: null,
   facets: { genre: [], artist: [], album: [] },
-  filter: { q: '', genre: '', artist: '', album: '' },
+  filter: { q: '', genre: '', artist: '', album: '', state: '' },
   paneFilter: { genre: '', artist: '', album: '' },
   navFilter: { device: '', playlist: '' },
   tracks: [], tracksTotal: 0, offset: 0, limit: 200,
+  // The library selection, kept as content keys rather than track ids:
+  // enrichment is keyed by content key, and two copies of one recording are
+  // one thing to identify, so ticking either has to mean the same row.
+  sel: new Set(),
+  anchor: null,          // row index a shift-click measures its range from
+  detail: null,          // /enrich/track/<key>: the proposal being judged
+  dialogKeys: [],        // what the open dialog acts on, fixed when it opened
+  writePreview: null,    // what a write would put in each file, before it runs
+  // The last finished enrich or write, kept on screen until it is dismissed.
+  // A job that takes 200ms is otherwise invisible: the status strip has moved
+  // on by the time anyone looks at it, and "nothing happened" is what the
+  // user is left with whether it worked or not.
+  outcome: null,
   playlistDetail: null,
   problems: null,
   plan: null, planning: false, planError: null,
@@ -96,11 +109,16 @@ async function loadCore() {
   if (!S.scopeId && devices.length) S.scopeId = devices[0].id;
 }
 
-async function loadLibrary() {
+function libraryParams() {
   const p = new URLSearchParams();
-  for (const k of ['q', 'genre', 'artist', 'album']) {
+  for (const k of ['q', 'genre', 'artist', 'album', 'state']) {
     if (S.filter[k]) p.set(k, S.filter[k]);
   }
+  return p;
+}
+
+async function loadLibrary() {
+  const p = libraryParams();
   p.set('limit', S.limit); p.set('offset', S.offset);
   if (S.scopeId) p.set('device', S.scopeId);
   const [lib, facets] = await Promise.all([
@@ -254,10 +272,35 @@ function renderBrowser() {
   return `<div class="browser">${pane('genre', 'Genre')}${pane('artist', 'Artist')}${pane('album', 'Album')}</div>`;
 }
 
+// The four enrichment states, and how each one reads in the table. The
+// wording is the promise: `skipped` says "never" because that is literally
+// what the backend does with it, and a softer word would be a lie the next
+// run tells.
+const STATE_TAG = {
+  raw:      { cls: '',     label: 'raw',      hint: 'never looked up. A run will pick this one up.' },
+  awaiting: { cls: 'warn', label: 'review',   hint: 'a match is waiting for your decision.' },
+  enriched: { cls: 'ok',   label: 'enriched', hint: 'values are in the catalog.' },
+  skipped:  { cls: 'bad',  label: 'skipped',  hint: 'excluded. Never looked up again until you change it.' },
+};
+
+function stateTag(t) {
+  const st = STATE_TAG[t.state] || STATE_TAG.raw;
+  const conf = (t.state === 'awaiting' || t.state === 'enriched') && t.confidence
+    ? ` ${t.confidence >= 1 ? '1.00' : t.confidence.toFixed(2)}` : '';
+  const via = t.enrich_source ? ` via ${t.enrich_source}` : '';
+  return `<span class="tag ${st.cls}" title="${h(st.label + ': ' + st.hint + via)}"
+    >${st.label}${conf}</span>`
+    + (t.overrides ? '<span class="tag" title="carries hand-typed values">edited</span>' : '');
+}
+
 function renderLibrary() {
   const scope = S.devices.find(d => d.id === S.scopeId);
-  const rows = S.tracks.map(t => `
-    <tr data-track="${t.id}">
+  const counts = (S.stats && S.stats.enrich_states) || {};
+  const rows = S.tracks.map((t, i) => `
+    <tr data-track="${t.id}" data-row="${i}" data-key="${h(t.content_key)}"
+        class="${S.sel.has(t.content_key) ? 'sel' : ''}">
+      <td class="tick"><input type="checkbox" data-pick="${i}" tabindex="-1"
+        ${S.sel.has(t.content_key) ? 'checked' : ''}></td>
       <td class="tick">${scope
         ? `<span title="${t.on_device ? 'on ' + h(scope.name) : 'not on ' + h(scope.name)}"
              style="color:${t.on_device ? 'var(--accent)' : 'var(--line-2)'}">
@@ -270,12 +313,19 @@ function renderLibrary() {
       <td class="num">${dur(t.duration)}</td>
       <td class="clip">${h(t.artist || '')}</td>
       <td class="clip">${h(t.album || '')}</td>
+      <td>${stateTag(t)}</td>
       <td class="mono">${h((t.ext || '').replace('.', '').toUpperCase())}
         ${t.bitrate ? Math.round(t.bitrate / 1000) : ''}</td>
       <td class="mono">${h(t.isrc || '')}</td>
     </tr>`).join('');
 
+  const shown = S.tracks.length;
+  const allShown = shown > 0 && S.tracks.every(t => S.sel.has(t.content_key));
   const from = S.offset + 1, to = Math.min(S.offset + S.limit, S.tracksTotal);
+  const stateChip = (key, label) => `<button class="chip ${S.filter.state === key ? 'on' : ''}"
+      data-state-filter="${key}">${label}${key
+        ? `<span class="n">${num(counts[key] || 0)}</span>` : ''}</button>`;
+
   return renderBrowser() + `
     <div class="hstack" style="padding:6px 10px;border-bottom:1px solid var(--line-2)">
       <span class="faint mono" style="font-size:9px;letter-spacing:.1em">SYNC COLUMN</span>
@@ -290,25 +340,128 @@ function renderLibrary() {
         <svg width="11" height="11" style="position:absolute;left:6px;top:5px;color:var(--faint)"><use href="#i-search"/></svg>
       </span>
     </div>
-    <table class="tbl">
+    <div class="hstack" style="padding:6px 10px;border-bottom:1px solid var(--line-2)">
+      <span class="faint mono" style="font-size:9px;letter-spacing:.1em">METADATA</span>
+      ${stateChip('', 'All')}
+      ${stateChip('raw', 'Raw')}
+      ${stateChip('awaiting', 'Awaiting review')}
+      ${stateChip('enriched', 'Enriched')}
+      ${stateChip('skipped', 'Skipped')}
+      <span class="grow" style="flex:1"></span>
+      <span class="faint" style="font-size:10px">New files are identified and
+        tagged automatically. Pick tracks to redo, correct or skip them.</span>
+    </div>
+    ${renderOutcome()}
+    ${renderSelectionBar(allShown)}
+    <table class="tbl" id="lib-table">
       <thead><tr>
+        <th class="tick"><input type="checkbox" id="pick-all"
+          title="Select everything on this page" ${allShown ? 'checked' : ''}></th>
         <th class="tick" title="On the device selected above">ON</th>
         <th class="num" style="width:34px">#</th>
-        <th style="width:30%">Name</th>
+        <th style="width:26%">Name</th>
         <th class="num" style="width:48px">Time</th>
-        <th style="width:22%">Artist</th>
-        <th style="width:22%">Album</th>
-        <th style="width:88px">Format</th>
+        <th style="width:19%">Artist</th>
+        <th style="width:19%">Album</th>
+        <th style="width:120px" title="Enrichment state">Metadata</th>
+        <th style="width:82px">Format</th>
         <th style="width:104px">ISRC</th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="8" class="empty">No tracks match.</td></tr>'}</tbody>
+      <tbody>${rows || '<tr><td colspan="10" class="empty">No tracks match.</td></tr>'}</tbody>
     </table>
     <div class="footnote hstack">
       <span>${S.tracksTotal ? `SHOWING ${num(from)}\u2013${num(to)} OF ${num(S.tracksTotal)}` : 'NOTHING TO SHOW'}</span>
       <span style="flex:1"></span>
+      <span style="text-transform:none;letter-spacing:0">click select \u00b7 shift+click range \u00b7
+        ctrl+click add \u00b7 ctrl+A page \u00b7 E enrich \u00b7 A accept \u00b7
+        R reject \u00b7 S skip \u00b7 U raw \u00b7 Enter edit \u00b7 Esc clear</span>
+      <span style="flex:1"></span>
       <button class="btn sm" data-page="-1" ${S.offset === 0 ? 'disabled' : ''}>Previous</button>
       <button class="btn sm" data-page="1" ${to >= S.tracksTotal ? 'disabled' : ''}>Next</button>
     </div>`;
+}
+
+// A finished job, said out loud. Errors are the point: a run that failed
+// used to report `0 enriched` and leave the reason in a counter nobody sees.
+function fingerprintReady() {
+  return !!(S.stats && S.stats.fingerprint && S.stats.fingerprint.ready);
+}
+
+function renderOutcome() {
+  const o = S.outcome;
+  if (!o) return '';
+  const r = o.result || {};
+  const errors = r.errors || [];
+  const bad = o.state === 'failed' || errors.length
+    || (o.kind === 'write-tags' && r.failed);
+  const line = o.kind === 'enrich'
+    ? [`${num(r.applied || 0)} enriched`,
+       `${num(r.candidates || 0)} awaiting review`,
+       r.unmatched ? `${num(r.unmatched)} nothing found` : '',
+       r.failed ? `${num(r.failed)} failed` : '',
+       r.skipped ? `${num(r.skipped)} left alone (skipped)` : '',
+      ].filter(Boolean).join(' \u00b7 ')
+    : [`${num(r.written || 0)} file${r.written === 1 ? '' : 's'} rewritten`,
+       r.failed ? `${num(r.failed)} not written` : '',
+      ].filter(Boolean).join(' \u00b7 ');
+  const title = o.state === 'failed'
+    ? (o.kind === 'enrich' ? 'Lookup failed' : 'Writing tags failed')
+    : o.kind === 'enrich' ? 'Lookup finished' : 'Finished writing tags';
+  return `<div class="notice ${bad ? 'warn' : 'ok'}"
+      style="margin:8px 10px;align-items:flex-start">
+    ${icon(bad ? 'i-warn' : 'i-check')}
+    <div style="flex:1;min-width:0">
+      <strong>${h(title)}</strong> \u2014 ${h(line)}
+      ${o.error ? `<div style="margin-top:4px">${h(o.error)}</div>` : ''}
+      ${errors.length ? `<ul style="margin:6px 0 0 16px;padding:0">
+        ${errors.map(e => `<li style="margin-bottom:2px">${h(e.message)}${
+          e.count > 1 ? ` <span class="faint">(${num(e.count)} files)</span>` : ''}${
+          e.track ? ` <span class="faint mono" style="font-size:10px">${h(e.track)}</span>` : ''
+        }</li>`).join('')}</ul>` : ''}
+      ${o.kind === 'enrich' && r.unmatched && !fingerprintReady()
+        ? `<div style="margin-top:6px">MusicBrainz had nothing under that
+             artist and title. For a download whose artist is a channel name
+             the text search has nothing to work with - identifying it by
+             sound is what that case needs.
+             <code>enrich config --acoustid-key</code> and
+             <code>fpcalc</code> turn it on.</div>`
+        : ''}
+      ${o.kind === 'enrich' && r.candidates
+        ? `<div style="margin-top:6px"><button class="btn sm"
+             data-state-filter="awaiting">Show the ${num(r.candidates)} awaiting review</button></div>`
+        : ''}
+    </div>
+    <button class="btn sm" data-dismiss-outcome="1">Dismiss</button>
+  </div>`;
+}
+
+function renderSelectionBar(allShown) {
+  const n = S.sel.size;
+  if (!n) return '';
+  // Which actions make sense is decided by what is actually selected: an
+  // Accept over a selection with no candidate in it would be a button that
+  // does nothing, which reads as broken rather than as inapplicable.
+  const picked = S.tracks.filter(t => S.sel.has(t.content_key));
+  const has = (st) => picked.some(t => t.state === st);
+  const offPage = n - picked.length;
+  const btn = (act, label, key, cls, on) => `<button class="btn sm ${cls || ''}"
+      data-sel-act="${act}" ${on === false ? 'disabled' : ''}
+      title="${h(label)} (${key})">${label} <span class="faint">${key}</span></button>`;
+  return `<div class="hstack" style="padding:6px 10px;gap:6px;
+      border-bottom:1px solid var(--line-2);background:var(--sel-2)">
+    <strong style="font-size:11px">${num(n)} selected</strong>
+    ${offPage ? `<span class="faint" style="font-size:10px">(${num(offPage)} not on this page)</span>` : ''}
+    <button class="btn sm" data-sel-act="all-matching">Select all ${num(S.tracksTotal)} matching</button>
+    <button class="btn sm" data-sel-act="clear">Clear</button>
+    <span class="grow" style="flex:1"></span>
+    ${btn('enrich', 'Enrich', 'E', 'primary')}
+    ${btn('accept', 'Accept', 'A', '', offPage > 0 || has('awaiting'))}
+    ${btn('reject', 'Reject', 'R', '', offPage > 0 || has('awaiting'))}
+    ${btn('skip', 'Skip', 'S')}
+    ${btn('raw', 'Mark raw', 'U')}
+    ${btn('edit', 'Edit metadata', '\u21b5')}
+    ${btn('write', 'Write tags to files', 'W', 'danger')}
+  </div>`;
 }
 
 // -------------------------------------------------------------- playlist
@@ -902,10 +1055,13 @@ function renderStatus() {
   const meter = $('#meter');
   if (job && job.state === 'running') {
     meter.classList.remove('idle');
+    const VERB = {
+      sync: 'Syncing \u2192 ', download: 'Downloading ',
+      enrich: 'Identifying ', 'write-tags': 'Writing tags to ',
+      scan: 'Scanning ',
+    };
     $('#status-label').textContent =
-      job.kind === 'sync' ? 'Syncing \u2192 ' + job.label
-        : job.kind === 'download' ? 'Downloading ' + job.label
-          : 'Scanning ' + job.label;
+      (VERB[job.kind] || 'Working on ') + job.label;
     $('#status-meta').textContent = job.detail || '';
     $('#status-bar').style.width =
       (job.total ? (100 * job.done / job.total) : 0) + '%';
@@ -976,6 +1132,405 @@ async function loadVolumes() {
   }
 }
 
+// ------------------------------------------------------------- selection
+
+// Selection is deliberately not a checkbox-only affair. A library is browsed
+// the way a file manager is - click, shift-click a run, ctrl-click the odd
+// extra - and an enrichment pass over "this album except the two live
+// takes" is the ordinary case, not an advanced one.
+
+function selectRow(index, ev) {
+  const t = S.tracks[index];
+  if (!t) return;
+  const key = t.content_key;
+  if (ev && ev.shiftKey && S.anchor !== null) {
+    const [a, b] = S.anchor <= index ? [S.anchor, index] : [index, S.anchor];
+    // A shift-click extends rather than replaces, so two ranges can be
+    // collected without holding a third modifier down.
+    if (!ev.ctrlKey && !ev.metaKey) S.sel.clear();
+    for (let i = a; i <= b; i++) {
+      if (S.tracks[i]) S.sel.add(S.tracks[i].content_key);
+    }
+  } else if (ev && (ev.ctrlKey || ev.metaKey)) {
+    if (S.sel.has(key)) S.sel.delete(key); else S.sel.add(key);
+    S.anchor = index;
+  } else {
+    S.sel.clear();
+    S.sel.add(key);
+    S.anchor = index;
+  }
+  render();
+}
+
+function selectPage(on) {
+  for (const t of S.tracks) {
+    if (on) S.sel.add(t.content_key); else S.sel.delete(t.content_key);
+  }
+  render();
+}
+
+function selectAllMatching() {
+  return guard(async () => {
+    const p = libraryParams();
+    const out = await api('/library/keys?' + p);
+    S.sel = new Set(out.keys);
+    S.anchor = null;
+    if (out.capped) {
+      S.error = `Selected the first ${num(out.keys.length)} of `
+        + `${num(out.total)}; narrow the filter to reach the rest.`;
+    }
+  });
+}
+
+function selectedKeys() { return Array.from(S.sel); }
+
+function selAction(act) {
+  if (act === 'clear') { S.sel.clear(); S.anchor = null; return render(); }
+  if (act === 'all-matching') return selectAllMatching();
+  const keys = selectedKeys();
+  if (!keys.length) return;
+  if (act === 'edit') return editModal(keys);
+  if (act === 'write') return writeTagsModal(keys);
+  if (act === 'enrich') return enrichModal(keys);
+  return decide(act, keys);
+}
+
+// Accept, reject, skip and mark-raw, over an explicit list of keys. Taken as
+// an argument rather than read from the selection, so the dialog's own
+// buttons act on the track the dialog is showing whatever else has happened
+// to the selection since it opened.
+function decide(act, keys) {
+  if (!keys || !keys.length) return;
+  if (act === 'accept' || act === 'reject') {
+    closeModal();
+    return guard(async () => {
+      await api('/enrich/' + act, {
+        method: 'POST', body: JSON.stringify({ content_keys: keys }),
+      });
+      // A verdict finishes with these tracks; leaving them selected invites
+      // pressing it twice.
+      S.sel.clear(); S.anchor = null;
+      await loadCore();
+      await loadLibrary();
+    });
+  }
+  if (act === 'skip' || act === 'raw') {
+    closeModal();
+    // Filing, not a verdict: the rows stay picked, so changing your mind is
+    // one more keystroke rather than another hunt through the table.
+    return guard(async () => {
+      await api('/enrich/state', {
+        method: 'POST',
+        body: JSON.stringify({ content_keys: keys,
+                               state: act === 'skip' ? 'skipped' : 'raw' }),
+      });
+      await loadCore();
+      await loadLibrary();
+    });
+  }
+}
+
+// ------------------------------------------------------- enrich a picking
+
+function enrichModal(keys) {
+  S.dialogKeys = keys.slice();
+  const body = `<p class="muted" style="margin-bottom:10px">
+      Look up ${num(keys.length)} selected track${keys.length === 1 ? '' : 's'}
+      against MusicBrainz again. New files are already done automatically as
+      they arrive, so this is for asking a second time - after correcting the
+      tags a search runs on, or once fingerprinting is set up.</p>
+    <p class="muted" style="margin-bottom:10px">Matches confident enough to
+      trust land in the catalog; the doubtful ones become
+      <em>awaiting review</em>. Anything you have marked
+      <strong>skipped</strong> is left out, even when it is selected, and
+      nothing is written to your audio files unless you tick the box.</p>
+    <label class="hstack" style="gap:6px;margin-bottom:6px">
+      <input type="checkbox" id="en-fp" ${fingerprintReady() ? '' : 'disabled'}>
+      <span>Also identify by sound (AcoustID fingerprint) when the tags are no
+        help.${fingerprintReady() ? ''
+          : ` <span class="faint">Not set up: needs <code>fpcalc</code> on PATH
+              and an AcoustID key. Without it, a download whose artist is a
+              channel name will usually come back empty.</span>`}</span></label>
+    <label class="hstack" style="gap:6px">
+      <input type="checkbox" id="en-write">
+      <span>Write accepted values into the audio files as well
+        (<strong>rewrites files on disk</strong>).</span></label>`;
+  showModal('Enrich ' + num(keys.length) + ' track'
+    + (keys.length === 1 ? '' : 's'), body,
+    `<button class="btn" data-close="1">Cancel</button>
+     <button class="btn primary" data-run-enrich="1">Look them up</button>`);
+}
+
+function startEnrich(keys) {
+  const fp = $('#en-fp'), wt = $('#en-write');
+  const body = { content_keys: keys, fingerprint: !!(fp && fp.checked),
+                 write_tags: !!(wt && wt.checked) };
+  closeModal();
+  return guard(async () => {
+    const res = await api('/enrich/run', {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    S.outcome = null;
+    S.job = { id: res.job, kind: 'enrich', state: 'running', done: 0,
+              total: keys.length, label: num(keys.length) + ' tracks' };
+    watchJob(res.job, async (job) => {
+      S.outcome = job;
+      await loadCore();
+      await loadLibrary();
+    });
+  });
+}
+
+// ------------------------------------------------------------ edit modal
+
+const EDIT_FIELDS = [
+  ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'],
+  ['album_artist', 'Album artist'], ['track_no', 'Track no'],
+  ['disc_no', 'Disc no'], ['year', 'Year'], ['isrc', 'ISRC'],
+];
+
+function editModal(keys) {
+  if (keys.length === 1) {
+    return guard(async () => {
+      S.detail = await api('/enrich/track/' + encodeURIComponent(keys[0]));
+      showEditModal(keys);
+    });
+  }
+  S.detail = null;
+  showEditModal(keys);
+}
+
+function showEditModal(keys) {
+  S.dialogKeys = keys.slice();
+  const d = S.detail;
+  const many = keys.length > 1;
+  const val = (f) => {
+    if (!d) return '';
+    if (d.overrides && d.overrides[f] !== undefined) return d.overrides[f];
+    return d.current[f] === null || d.current[f] === undefined ? '' : d.current[f];
+  };
+  const proposedRow = (f, label) => {
+    if (!d || !d.proposed || d.proposed[f] === undefined) return '';
+    const now = d.current[f];
+    if (String(now === null ? '' : now) === String(d.proposed[f])) return '';
+    return `<button class="btn sm" data-use-proposed="${f}"
+      title="Use the proposed value">${h(String(d.proposed[f]))}</button>`;
+  };
+  const rows = EDIT_FIELDS.map(([f, label]) => `<tr>
+      <td style="white-space:nowrap;color:var(--muted)">${label}</td>
+      <td><input name="${f}" value="${h(val(f))}" style="width:100%;
+        border:1px solid var(--line-2);border-radius:3px;padding:2px 6px"
+        placeholder="${many ? 'leave blank to keep each track’s own value'
+                            : 'blank clears any hand-typed value'}"></td>
+      <td style="width:34%">${proposedRow(f)}</td>
+    </tr>`).join('');
+
+  const head = many
+    ? `<p class="muted" style="margin-bottom:10px">Editing
+        <strong>${num(keys.length)} tracks</strong>. Only the boxes you fill in
+        are written; the rest keep whatever each track already has.</p>`
+    : d ? `<div class="hstack" style="gap:10px;margin-bottom:10px;align-items:flex-start">
+        ${d.cover ? `<img src="${h(d.cover)}" alt="" style="width:64px;height:64px;
+           object-fit:cover;border:1px solid var(--line-2);border-radius:3px">` : ''}
+        <div style="min-width:0">
+          <div class="mono" style="font-size:10px;color:var(--muted);
+            overflow:hidden;text-overflow:ellipsis">${h(d.rel_path)}</div>
+          <div style="margin-top:4px">${stateTag({
+            state: d.state, confidence: d.confidence, enrich_source: d.source,
+            overrides: Object.keys(d.overrides || {}).length })}
+            ${d.copies > 1 ? `<span class="tag" title="the same audio appears
+              ${d.copies} times in the library; an edit covers every copy"
+              >${d.copies} copies</span>` : ''}
+            ${d.mbid ? `<a class="tag" target="_blank" rel="noopener"
+              href="https://musicbrainz.org/recording/${h(d.mbid)}">musicbrainz</a>` : ''}
+          </div>
+        </div></div>` : '';
+
+  const note = d && d.proposed && Object.keys(d.proposed).length
+    ? `<p class="muted" style="margin-top:8px;font-size:11px">The buttons on the
+        right are what the source proposed. Click one to drop it into the box.</p>`
+    : '';
+
+  showModal(many ? 'Edit ' + num(keys.length) + ' tracks' : 'Edit metadata',
+    head + `<form id="edit-form"><table class="tbl"><tbody>${rows}</tbody></table></form>` + note,
+    `<button class="btn" data-close="1">Cancel</button>
+     ${d && d.state === 'awaiting'
+       ? `<button class="btn" data-detail-act="reject">Reject match</button>
+          <button class="btn" data-detail-act="accept">Accept match</button>` : ''}
+     <button class="btn primary" data-save-edit="1">Save</button>`);
+}
+
+function saveEdit(keys) {
+  const form = $('#edit-form');
+  if (!form) return;
+  const fields = {};
+  for (const [f] of EDIT_FIELDS) {
+    const el = form.elements[f];
+    if (!el) continue;
+    const v = el.value.trim();
+    // Over a selection, an empty box means "leave this field alone" - there
+    // is no single existing value to clear. On one track it means "forget
+    // what I typed here", which is the only way back to the source's answer.
+    if (keys.length > 1 && v === '') continue;
+    fields[f] = v;
+  }
+  if (!Object.keys(fields).length) return closeModal();
+  closeModal();
+  return guard(async () => {
+    await api('/enrich/edit', {
+      method: 'POST', body: JSON.stringify({ content_keys: keys, fields }),
+    });
+    await loadCore();
+    await loadLibrary();
+  });
+}
+
+// ------------------------------------------------------ write tags modal
+
+function writeTagsModal(keys) {
+  S.dialogKeys = keys.slice();
+  S.writePreview = null;
+  return guard(async () => {
+    // Asked for before the dialog opens, not after the write: the one action
+    // here that cannot be undone is the one that should be readable first.
+    S.writePreview = await api('/enrich/write/preview', {
+      method: 'POST', body: JSON.stringify({ content_keys: keys }),
+    });
+    showWriteModal(keys);
+  });
+}
+
+const FIELD_LABEL = {
+  title: 'Title', artist: 'Artist', album: 'Album',
+  album_artist: 'Album artist', track_no: 'Track no', disc_no: 'Disc no',
+  year: 'Year', isrc: 'ISRC',
+};
+
+function showWriteModal(keys) {
+  const p = S.writePreview || { files: [], writable: 0, missing: 0,
+                                nothing_to_write: 0, no_artwork: 0,
+                                total: keys.length, shown: 0 };
+  const one = p.files.length === 1 ? p.files[0] : null;
+
+  const changeRows = (f) => {
+    const fields = Object.keys(f.changes);
+    if (!fields.length) {
+      return `<p class="muted">Every tag in this file already matches the
+        catalog. Writing would change nothing.</p>`;
+    }
+    return `<table class="tbl"><thead><tr>
+        <th style="width:22%">Field</th><th>In the file now</th>
+        <th>Would become</th></tr></thead><tbody>
+      ${fields.map(k => `<tr>
+        <td style="color:var(--muted)">${h(FIELD_LABEL[k] || k)}</td>
+        <td class="clip">${f.changes[k].from === null || f.changes[k].from === undefined
+          ? '<span class="faint">empty</span>' : h(String(f.changes[k].from))}</td>
+        <td class="clip"><strong>${h(String(f.changes[k].to))}</strong></td>
+      </tr>`).join('')}
+    </tbody></table>`;
+  };
+
+  // Everything that would stop this doing what the user expects, said before
+  // they press the button rather than reported as a zero afterwards.
+  const warnings = [];
+  if (p.missing) {
+    warnings.push(`${num(p.missing)} of these files ${p.missing === 1 ? 'is' : 'are'}
+      not where the catalog says. Rescan the library folder to fix the paths,
+      then try again.`);
+  }
+  if (p.no_change === p.shown && p.shown && !p.missing) {
+    warnings.push(`Nothing would change: ${p.shown === 1 ? 'this file already carries'
+      : 'these files already carry'} the values the catalog holds. Identify
+      ${p.shown === 1 ? 'it' : 'them'} first, or edit the metadata by hand,
+      and there will be something to write.`);
+  } else if (p.no_change) {
+    warnings.push(`${num(p.no_change)} of these files already match the catalog
+      and would not change.`);
+  }
+  if (p.renormalised) {
+    warnings.push(`${num(p.renormalised)} of these files ${p.renormalised === 1
+      ? 'is' : 'are'} stored under a differently normalised name than the disk
+      uses. They are found and written correctly; a rescan tidies the catalog.`);
+  }
+  if (p.nothing_to_write) {
+    warnings.push(`${num(p.nothing_to_write)} ${p.nothing_to_write === 1 ? 'file has' : 'files have'}
+      nothing to write: the catalog holds no values for ${p.nothing_to_write === 1 ? 'it' : 'them'}
+      yet. Identify ${p.nothing_to_write === 1 ? 'it' : 'them'} first, or type something in.`);
+  }
+
+  const artNote = p.no_artwork === p.shown && p.shown
+    ? `<div class="faint" style="font-size:11px;margin-top:4px">
+        ${p.shown === 1 ? 'This file is not' : 'None of these files are'} matched to
+        a release yet, so there is no cover to fetch. Identify
+        ${p.shown === 1 ? 'it' : 'them'} first and the box will have something to do.</div>`
+    : '';
+
+  const body = `
+    <div class="notice bad" style="margin-bottom:10px">
+      This rewrites the audio files themselves. Everything else in this screen
+      edits the catalog and can be undone by clicking the other button; this
+      cannot.</div>
+    ${warnings.map(w => `<div class="notice warn" style="margin-bottom:10px">
+      ${icon('i-warn')}<div>${w}</div></div>`).join('')}
+    ${one
+      ? `<div class="mono" style="font-size:10px;color:var(--muted);margin-bottom:8px;
+           overflow:hidden;text-overflow:ellipsis">${h(one.rel_path)}</div>
+         ${changeRows(one)}`
+      : `<p class="muted">${num(p.writable)} of ${num(p.total)} selected file${p.total === 1 ? '' : 's'}
+           would be rewritten with what the catalog now says.
+           ${p.total > p.shown ? `Showing the first ${num(p.shown)}.` : ''}</p>
+         <div style="max-height:34vh;overflow:auto;border:1px solid var(--line-2);
+              border-radius:4px;margin-top:8px">
+         <table class="tbl"><tbody>${p.files.map(f => `<tr>
+           <td class="clip mono" style="font-size:10px">${h(f.rel_path)}</td>
+           <td style="width:34%">${f.missing
+             ? '<span class="tag bad">not on disk</span>'
+             : Object.keys(f.changes).length
+               ? `<span class="tag ok">${Object.keys(f.changes).length} field${
+                   Object.keys(f.changes).length === 1 ? '' : 's'}</span>`
+               : '<span class="tag">no change</span>'}</td>
+         </tr>`).join('')}</tbody></table></div>`}
+    <p class="muted" style="margin-top:10px">Each file is written to a copy,
+      read back, and only then swapped in, so an interrupted write leaves the
+      original intact.</p>
+    <label class="hstack" style="gap:6px;margin-top:6px">
+      <input type="checkbox" id="wt-art" ${p.no_artwork === p.shown ? 'disabled' : ''}>
+      <span>Also replace the cover with the release\u2019s own front cover.
+        Worth it for downloads, whose artwork is a video frame.</span></label>
+    ${artNote}`;
+
+  showModal('Write tags into ' + num(p.writable || 0) + ' file'
+    + (p.writable === 1 ? '' : 's'), body,
+    `<button class="btn" data-close="1">Cancel</button>
+     <button class="btn danger" data-run-write="1" ${p.writable ? '' : 'disabled'}
+       >Write ${num(p.writable || 0)} file${p.writable === 1 ? '' : 's'}</button>`);
+}
+
+function startWriteTags(keys) {
+  const art = $('#wt-art');
+  const artwork = !!(art && art.checked);
+  closeModal();
+  return guard(async () => {
+    const res = await api('/enrich/write', {
+      method: 'POST',
+      body: JSON.stringify({ content_keys: keys, artwork }),
+    });
+    S.outcome = null;
+    S.job = { id: res.job, kind: 'write-tags', state: 'running', done: 0,
+              total: keys.length, label: num(keys.length) + ' files' };
+    watchJob(res.job, async (job) => {
+      S.outcome = job;
+      // Writing tags changes every content key it touches, so the selection
+      // now names files that no longer exist under those keys. Dropping it
+      // is more honest than leaving a selection that silently acts on
+      // nothing.
+      S.sel.clear(); S.anchor = null;
+      await loadCore();
+      await loadLibrary();
+    });
+  });
+}
+
 // ---------------------------------------------------------------- events
 
 async function guard(fn) {
@@ -983,6 +1538,55 @@ async function guard(fn) {
   try { await fn(); } catch (e) { S.error = e.message; }
   render();
 }
+
+document.addEventListener('click', (ev) => {
+  if (S.view !== 'library') return;
+  const box = ev.target.closest('[data-pick]');
+  if (box) {
+    // The checkbox is a plain toggle whatever modifier is held: it is the
+    // one control on the row whose meaning should not change under ctrl.
+    const t = S.tracks[+box.dataset.pick];
+    if (!t) return;
+    if (S.sel.has(t.content_key)) S.sel.delete(t.content_key);
+    else S.sel.add(t.content_key);
+    S.anchor = +box.dataset.pick;
+    return render();
+  }
+  if (ev.target.id === 'pick-all') return selectPage(ev.target.checked);
+  if (ev.target.closest('[data-dismiss-outcome]')) {
+    S.outcome = null;
+    return render();
+  }
+  const chip = ev.target.closest('[data-state-filter]');
+  if (chip) {
+    S.filter.state = chip.dataset.stateFilter;
+    S.offset = 0;
+    return guard(loadLibrary);
+  }
+  const act = ev.target.closest('[data-sel-act]');
+  if (act) return selAction(act.dataset.selAct);
+  const detailAct = ev.target.closest('[data-detail-act]');
+  if (detailAct) return decide(detailAct.dataset.detailAct, S.dialogKeys);
+  if (ev.target.closest('[data-run-enrich]')) return startEnrich(S.dialogKeys);
+  if (ev.target.closest('[data-run-write]')) return startWriteTags(S.dialogKeys);
+  if (ev.target.closest('[data-save-edit]')) return saveEdit(S.dialogKeys);
+  const use = ev.target.closest('[data-use-proposed]');
+  if (use) {
+    const form = $('#edit-form');
+    const field = use.dataset.useProposed;
+    if (form && form.elements[field] && S.detail) {
+      form.elements[field].value = S.detail.proposed[field];
+      form.elements[field].focus();
+    }
+    return;
+  }
+  // A click on the row body selects; anything inside it that is its own
+  // control has already returned above.
+  const row = ev.target.closest('[data-row]');
+  if (row && !ev.target.closest('a,button,input')) {
+    return selectRow(+row.dataset.row, ev);
+  }
+});
 
 document.addEventListener('click', (ev) => {
   const t = ev.target.closest('[data-act],[data-facet],[data-scope],[data-page],'
@@ -1171,11 +1775,30 @@ function startScan(root) {
     });
     S.job = { id: res.job, kind: 'scan', label: root, state: 'running',
               done: 0, total: 0 };
-    watchJob(res.job, async () => {
+    watchJob(res.job, async (job) => {
       await loadCore();
       if (S.view === 'library') await loadLibrary();
+      followAutoEnrich(job, root);
     });
   });
+}
+
+// A scan and a download each hand back the id of the identification pass they
+// started. Picking it up is what keeps that pass visible: it is the longer of
+// the two jobs by far, and an hour of work with no progress bar reads as
+// nothing happening.
+function followAutoEnrich(job, label) {
+  const id = job && job.result && job.result.enrich_job;
+  if (!id) return;
+  S.outcome = null;
+  S.job = { id, kind: 'enrich', state: 'running', done: 0, total: 0,
+            label: label || 'new files' };
+  watchJob(id, async (done) => {
+    S.outcome = done;
+    await loadCore();
+    if (S.view === 'library') await loadLibrary();
+  });
+  render();
 }
 
 document.addEventListener('submit', (ev) => {
@@ -1216,6 +1839,7 @@ document.addEventListener('submit', (ev) => {
         // plan that mentions them, so the whole core is reloaded.
         await loadCore();
         await loadDownload();
+        followAutoEnrich(job, 'the new files');
       });
     });
   }
@@ -1288,7 +1912,58 @@ $('#btn-rescan').addEventListener('click', () => {
 });
 
 document.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Escape') closeModal();
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName);
+  const modal = !!$('#modal-root').firstChild;
+
+  if (ev.key === 'Escape') {
+    if (modal) return closeModal();
+    if (S.view === 'library' && S.sel.size) {
+      S.sel.clear(); S.anchor = null;
+      return render();
+    }
+    return;
+  }
+  if (modal) {
+    // Enter submits the edit form, which is what a dialog full of text
+    // boxes is expected to do.
+    if (ev.key === 'Enter' && $('#edit-form') && ev.target.tagName !== 'BUTTON') {
+      ev.preventDefault();
+      return saveEdit(S.dialogKeys);
+    }
+    return;
+  }
+  if (typing || S.view !== 'library') return;
+
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a') {
+    ev.preventDefault();
+    return selectPage(true);
+  }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+
+  // Arrows walk the table; shift extends the run, which is how every other
+  // list on the machine behaves.
+  if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    const step = ev.key === 'ArrowDown' ? 1 : -1;
+    const at = S.anchor === null ? (step > 0 ? -1 : S.tracks.length) : S.anchor;
+    const next = Math.max(0, Math.min(S.tracks.length - 1, at + step));
+    if (ev.shiftKey && S.anchor !== null) {
+      const t = S.tracks[next];
+      if (t) S.sel.add(t.content_key);
+      S.anchor = next;
+      return render();
+    }
+    return selectRow(next, null);
+  }
+  if (!S.sel.size) return;
+  const key = ev.key.toLowerCase();
+  if (key === 'e') { ev.preventDefault(); return selAction('enrich'); }
+  if (key === 'a') { ev.preventDefault(); return selAction('accept'); }
+  if (key === 'r') { ev.preventDefault(); return selAction('reject'); }
+  if (key === 's') { ev.preventDefault(); return selAction('skip'); }
+  if (key === 'u') { ev.preventDefault(); return selAction('raw'); }
+  if (key === 'w') { ev.preventDefault(); return selAction('write'); }
+  if (ev.key === 'Enter') { ev.preventDefault(); return selAction('edit'); }
 });
 
 // ------------------------------------------------------------------ boot

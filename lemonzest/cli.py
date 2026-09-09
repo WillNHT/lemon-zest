@@ -94,9 +94,60 @@ def scan_cmd(ctx, root, full, workers):
         f"{counts['unchanged']} unchanged, {counts['removed']} removed, "
         f"{counts['failed']} failed"
     )
+    _auto_enrich(con, root=root)
 
 
 cli.add_command(scan_cmd, name="scan")
+
+
+def _auto_enrich(con, root=None, content_keys=None):
+    """Run the automatic pass and say what it did.
+
+    Called after a scan and after a download, so the terminal behaves the way
+    the interface does. It is not optional and there is no flag: identifying
+    a file is part of taking it into the library.
+    """
+    from . import enrich as en
+
+    if not en.auto_enabled():
+        return
+    pend = (en.tracks_for_keys(con, content_keys) if content_keys is not None
+            else en.pending(con, root=root))
+    if not pend:
+        return
+    console.print(f"\n[cyan]identifying[/] {len(pend)} new file"
+                  + ("" if len(pend) == 1 else "s")
+                  + " [dim](MusicBrainz allows one request a second)[/]")
+    with Progress(SpinnerColumn(), TextColumn("[cyan]identifying"), BarColumn(),
+                  TextColumn("{task.completed}/{task.total}"),
+                  TimeRemainingColumn(), console=console) as prog:
+        task = prog.add_task("enrich", total=len(pend))
+
+        def cb(done, total, status):
+            prog.update(task, completed=done, total=total)
+
+        counts = en.auto_after_ingest(con, root=root, content_keys=content_keys,
+                                      progress=cb)
+    bits = [f"[green]{counts['applied']}[/] enriched"]
+    if counts["written"]:
+        bits.append(f"[green]{counts['written']}[/] tagged on disk")
+    if counts["candidates"]:
+        bits.append(f"[yellow]{counts['candidates']}[/] awaiting review")
+    if counts["unmatched"]:
+        bits.append(f"{counts['unmatched']} not found")
+    if counts["failed"]:
+        bits.append(f"[red]{counts['failed']}[/] failed")
+    if counts["skipped"]:
+        bits.append(f"{counts['skipped']} skipped")
+    console.print(", ".join(bits))
+    for e in counts["errors"]:
+        console.print(f"  [red]{e['message']}[/]"
+                      + (f" [dim]({e['count']} files)[/]" if e["count"] > 1 else "")
+                      + (f" [dim]{e['track']}[/]" if e.get("track") else ""))
+    if counts["stopped"]:
+        console.print(f"[red]stopped early:[/] {counts['stopped']}")
+    if counts["candidates"]:
+        console.print("[dim]lemon-zest enrich review[/]")
 
 
 @cli.command()
@@ -262,6 +313,17 @@ def download_cmd(ctx, urls, root, playlist_name, audio_format, audio_quality,
         console.print(f"[yellow]{summary['failed_index']}[/] of the files "
                       "yt-dlp wrote could not be catalogued - the output "
                       "template puts them outside the library folder.")
+    if summary["downloaded"]:
+        # Scoped to what this run fetched. A download into a big library must
+        # not turn into a pass over the whole of it.
+        keys = []
+        for f in summary["files"]:
+            row = con.execute("SELECT content_key FROM track WHERE path = ?",
+                              (f,)).fetchone()
+            if row and row["content_key"] not in keys:
+                keys.append(row["content_key"])
+        if keys:
+            _auto_enrich(con, content_keys=keys)
     if summary["playlist"]:
         p = summary["playlist"]
         console.print(f"[cyan]playlist[/] {p['name']}: {p['added']} added"
@@ -1072,6 +1134,51 @@ def enrich_reject(ctx, ref):
     row = _track_ref(con, ref)
     en.reject(con, row["content_key"])
     console.print(f"[yellow]rejected[/] for {row['rel_path']}")
+
+
+@enrich.command("skip")
+@click.argument("refs", nargs=-1, required=True)
+@click.pass_context
+def enrich_skip(ctx, refs):
+    """Exclude tracks from enrichment. They are never looked up again."""
+    from . import enrich as en
+    con = _con(ctx)
+    rows = [_track_ref(con, r) for r in refs]
+    en.set_state(con, [r["content_key"] for r in rows], "skipped")
+    console.print(f"[yellow]skipped[/] {len(rows)} track"
+                  + ("" if len(rows) == 1 else "s")
+                  + " - no run will look at them until you unskip.")
+
+
+@enrich.command("unskip")
+@click.argument("refs", nargs=-1, required=True)
+@click.pass_context
+def enrich_unskip(ctx, refs):
+    """Put tracks back in the queue, forgetting whatever was stored."""
+    from . import enrich as en
+    con = _con(ctx)
+    rows = [_track_ref(con, r) for r in refs]
+    en.set_state(con, [r["content_key"] for r in rows], "raw")
+    console.print(f"[green]back in the queue:[/] {len(rows)} track"
+                  + ("" if len(rows) == 1 else "s"))
+
+
+@enrich.command("states")
+@click.pass_context
+def enrich_states(ctx):
+    """How many files sit in each of the four enrichment states."""
+    from . import enrich as en
+    counts = en.state_counts(_con(ctx))
+    t = Table(box=None, pad_edge=False, show_header=False)
+    for state, note in (
+            ("raw", "never looked up - a run will pick these up"),
+            ("awaiting", "a match is stored and wants a decision"),
+            ("enriched", "values are in the catalog"),
+            ("skipped", "excluded until you unskip them")):
+        t.add_row(state, f"{counts[state]:,}", "[dim]" + note + "[/]")
+    console.print(t)
+    if counts["awaiting"]:
+        console.print("\n[dim]lemon-zest enrich review[/]")
 
 
 @enrich.command("set")

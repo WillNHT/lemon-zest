@@ -81,6 +81,59 @@ ENRICHABLE = ("title", "artist", "album", "album_artist",
               "track_no", "disc_no", "year", "isrc")
 
 
+# ------------------------------------------------------------------ states
+#
+# The `enrichment.status` column records what happened to a lookup; the
+# interface needs the shorter question of what a person should do next.
+# Four states answer it, and every status maps onto one:
+#
+#   raw       nothing decided - no row at all, or a lookup that came back
+#             empty. These are the ones a run picks up.
+#   awaiting  a candidate is stored and wants a human judgement.
+#   enriched  values are in the catalog: applied automatically, accepted by
+#             hand, or typed in by hand.
+#   skipped   deliberately excluded. Never looked up again, whatever a run
+#             is asked to do, until someone changes the state back.
+#
+# `rejected` folds into `skipped` rather than into `raw` because that is what
+# it already did: rejecting a proposal has always meant "do not offer this
+# file again", which is a skip that arrived through a judgement.
+STATES = ("raw", "awaiting", "enriched", "skipped")
+
+_STATE_OF_STATUS = {
+    None: "raw",
+    "none": "raw",
+    "candidate": "awaiting",
+    "applied": "enriched",
+    "rejected": "skipped",
+    "skipped": "skipped",
+}
+
+# Statuses a lookup must never touch. One list, because the SQL in `pending`
+# and the guard in `run_tracks` have to agree exactly: a file the list picks
+# up but the guard drops is a lookup nobody asked for, and the other way
+# round is a skip that quietly stopped meaning anything.
+NEVER_LOOK = ("skipped", "rejected")
+
+# The same mapping in SQL, for queries that report a state beside a track.
+# Written out rather than mapped in Python afterwards because the library
+# list pages and filters in SQL, and cannot filter on a value it computes
+# after the LIMIT.
+STATE_SQL = (
+    "CASE e.status "
+    "WHEN 'candidate' THEN 'awaiting' "
+    "WHEN 'applied' THEN 'enriched' "
+    "WHEN 'rejected' THEN 'skipped' "
+    "WHEN 'skipped' THEN 'skipped' "
+    "ELSE 'raw' END"
+)
+
+
+def state_of(status):
+    """The four-state answer for a stored ``enrichment.status``."""
+    return _STATE_OF_STATUS.get(status, "raw")
+
+
 # ------------------------------------------------------------ normalisation
 
 # Anything after these markers is a qualifier rather than part of the title.
@@ -795,6 +848,12 @@ def pending(con, limit=None, root=None, redo=False):
         # Anything already decided is left alone; only "none" is retried,
         # since that is a lookup that found nothing rather than a judgement.
         where.append("(e.status IS NULL OR e.status = 'none')")
+    else:
+        # `redo` re-asks about decisions, but a skip is not a decision about
+        # an answer - it is an instruction not to ask. Enforced here rather
+        # than at the call site so that no caller can forget it.
+        where.append("(e.status IS NULL OR e.status NOT IN (%s))"
+                     % ",".join("'%s'" % st for st in NEVER_LOOK))
     sql = (
         "SELECT t.* FROM track t "
         "LEFT JOIN enrichment e ON e.content_key = t.content_key "
@@ -866,6 +925,17 @@ def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None):
             if cand["duration"] and row["duration"]:
                 if abs(cand["duration"] - row["duration"]) > MAX_DURATION_DELTA:
                     continue
+            if not cand["release_id"]:
+                # The ISRC endpoint answers with the recording and its artist
+                # credit, and no releases at all, whatever `inc` asks for. So
+                # the top rung - the free one, on 98.7% of the tagged library -
+                # was delivering a title and an artist and then nothing: no
+                # album, no year, and no release to fetch a cover from. One
+                # more request by mbid is what turns it back into a full
+                # answer, and it is only spent when the first reply was short.
+                full = client.recording(cand["mbid"]) if cand["mbid"] else None
+                if full:
+                    cand = recording_fields(full, prefer_album=album)
             fields = {**cand["fields"], **cand["release_fields"]}
             _store(con, row["content_key"], "isrc", 1.0, fields,
                    cand["mbid"], cand["release_id"], now, "applied")
@@ -1058,15 +1128,68 @@ def accept(con, content_key):
 
 
 def reject(con, content_key):
-    """Mark a candidate wrong. It is not offered again, and not re-fetched."""
+    """Mark a candidate wrong. It is not offered again, and not re-fetched.
+
+    Reads as ``skipped`` in the interface: the file has been judged and the
+    judgement was "not this", which for every later run means the same thing
+    as a skip. The distinct status is kept so the reason survives.
+    """
     con.execute("UPDATE enrichment SET status='rejected' WHERE content_key=?",
                 (content_key,))
     con.commit()
+    return True
+
+
+def set_state(con, content_keys, state):
+    """Move files between the four states by hand. Returns how many moved.
+
+    Only the two states a person sets directly are accepted here - ``skipped``
+    and ``raw``. ``enriched`` is what accepting or typing a value does, and
+    ``awaiting`` is what a lookup produces; setting either by decree would
+    claim an answer exists when none does.
+
+    ``raw`` deletes the row rather than storing a status. A file with no
+    enrichment row is exactly what "never been through the queue" means, and
+    leaving a husk behind would keep a stale confidence and a stale mbid
+    attached to a file whose next lookup starts from nothing.
+    """
+    if state not in ("skipped", "raw"):
+        raise ValueError("cannot set state %r by hand" % state)
+    keys = [k for k in (content_keys or []) if k]
+    if not keys:
+        return 0
+    now = time.time()
+    n = 0
+    for key in keys:
+        if state == "raw":
+            cur = con.execute("DELETE FROM enrichment WHERE content_key = ?",
+                              (key,))
+            n += cur.rowcount if cur.rowcount > 0 else 0
+        else:
+            con.execute(
+                "INSERT INTO enrichment(content_key, status, source, "
+                "confidence, fields, fetched_at) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(content_key) DO UPDATE SET status=excluded.status",
+                (key, "skipped", "manual", 0.0, "{}", now))
+            n += 1
+    con.commit()
+    return n
 
 
 def override(con, content_key, **fields):
-    """Record a hand-typed value. Outranks every source, now and later."""
+    """Record a hand-typed value. Outranks every source, now and later.
+
+    The file also comes out of the queue as ``enriched``: somebody has said
+    what this track is, which is a better answer than any lookup was going to
+    return, and leaving it as ``raw`` would send a run off to overwrite the
+    columns the typing did not cover.
+
+    An existing row keeps its ``mbid`` and ``release_id`` - those identify a
+    recording, and correcting a spelling does not unidentify it. Only the
+    status and the provenance move.
+    """
     now = time.time()
+    wrote = False
     for field, value in fields.items():
         if field not in ENRICHABLE:
             continue
@@ -1075,7 +1198,35 @@ def override(con, content_key, **fields):
             "VALUES (?,?,?,?) ON CONFLICT(content_key, field) DO UPDATE SET "
             "value=excluded.value, set_at=excluded.set_at",
             (content_key, field, value, now))
+        wrote = True
+    if wrote:
+        con.execute(
+            "INSERT INTO enrichment(content_key, status, source, confidence, "
+            "fields, fetched_at, applied_at) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(content_key) DO UPDATE SET status='applied', "
+            "source='manual', confidence=1.0, applied_at=excluded.applied_at",
+            (content_key, "applied", "manual", 1.0, "{}", now, now))
     _apply_fields(con, content_key, {}, now)
+    con.commit()
+    return wrote
+
+
+def overrides_for(con, content_key):
+    """The hand-typed values on one file, as a plain dict."""
+    return {r["field"]: r["value"] for r in con.execute(
+        "SELECT field, value FROM track_override WHERE content_key = ?",
+        (content_key,))}
+
+
+def clear_overrides(con, content_key, fields=None):
+    """Forget hand-typed values, so the source's own answer shows again."""
+    if fields:
+        con.executemany(
+            "DELETE FROM track_override WHERE content_key = ? AND field = ?",
+            [(content_key, f) for f in fields])
+    else:
+        con.execute("DELETE FROM track_override WHERE content_key = ?",
+                    (content_key,))
     con.commit()
 
 
@@ -1100,10 +1251,49 @@ def review_queue(con, limit=200):
     return out
 
 
+def proposal_for(con, content_key):
+    """Everything the interface needs to judge one file, in one call.
+
+    Three tiers side by side, because a person deciding whether to accept a
+    proposal is really comparing them: what the catalog currently says, what
+    the source proposed, and what has been typed by hand. Kept separate
+    rather than merged - a merged view cannot show that the album on screen
+    came from a guess while the title came from the file.
+    """
+    row = con.execute(
+        "SELECT * FROM track WHERE content_key = ? ORDER BY id LIMIT 1",
+        (content_key,)).fetchone()
+    if not row:
+        return None
+    enr = con.execute("SELECT * FROM enrichment WHERE content_key = ?",
+                      (content_key,)).fetchone()
+    copies = con.execute(
+        "SELECT COUNT(*) FROM track WHERE content_key = ?",
+        (content_key,)).fetchone()[0]
+    return {
+        "content_key": content_key,
+        "track_id": row["id"],
+        "path": row["path"],
+        "rel_path": row["rel_path"],
+        "copies": copies,
+        "duration": row["duration"],
+        "purl": row["purl"],
+        "state": state_of(enr["status"] if enr else None),
+        "status": enr["status"] if enr else None,
+        "source": enr["source"] if enr else None,
+        "confidence": enr["confidence"] if enr else None,
+        "mbid": enr["mbid"] if enr else None,
+        "cover": cover_art_url(enr["release_id"]) if enr else None,
+        "current": {f: row[f] for f in ENRICHABLE},
+        "proposed": json.loads(enr["fields"] or "{}") if enr else {},
+        "overrides": overrides_for(con, content_key),
+    }
+
+
 def summary(con):
     """Counts for the status line: how much of the library is identified."""
     one = lambda q, *a: con.execute(q, a).fetchone()[0]
-    return {
+    out = {
         "tracks": one("SELECT COUNT(*) FROM track WHERE size > 0"),
         "with_isrc": one("SELECT COUNT(*) FROM track WHERE isrc IS NOT NULL"),
         "applied": one("SELECT COUNT(*) FROM enrichment WHERE status='applied'"),
@@ -1112,6 +1302,25 @@ def summary(con):
         "unmatched": one("SELECT COUNT(*) FROM enrichment WHERE status='none'"),
         "overrides": one("SELECT COUNT(DISTINCT content_key) FROM track_override"),
     }
+    out["states"] = state_counts(con)
+    return out
+
+
+def state_counts(con):
+    """How many *files* sit in each of the four states.
+
+    Counted over tracks rather than over enrichment rows, because `raw` is
+    the absence of a row: counting the table could never report it, and the
+    number a person wants is "how many of my files still need looking at".
+    """
+    counts = {st: 0 for st in STATES}
+    rows = con.execute(
+        f"SELECT {STATE_SQL} AS state, COUNT(*) AS n FROM track t "
+        "LEFT JOIN enrichment e ON e.content_key = t.content_key "
+        "WHERE t.size > 0 GROUP BY state")
+    for r in rows:
+        counts[r["state"]] = r["n"]
+    return counts
 
 
 def run(con, client=None, root=None, limit=None, redo=False, write_tags=False,
@@ -1141,12 +1350,48 @@ def run(con, client=None, root=None, limit=None, redo=False, write_tags=False,
         acoustid = AcoustID(cfg["acoustid_key"])
     if not use_fingerprint:
         acoustid = None
-    counts = dict(backfilled=0, applied=0, candidates=0, unmatched=0,
-                  written=0, write_failed=0, failed=0, stopped=None)
-
+    counts = _new_counts()
     counts["backfilled"] = backfill_isrc(con)["matched"]
 
     rows = pending(con, limit=limit, root=root, redo=redo)
+    _process(con, rows, client, acoustid, counts, write_tags, artwork,
+             progress)
+    return counts
+
+
+# How many distinct failure messages a run keeps. A run over two thousand
+# files that loses the network produces two thousand identical complaints;
+# what a person needs is the sentence, once, with a count beside it.
+MAX_REPORTED_ERRORS = 8
+
+
+def _new_counts():
+    return dict(backfilled=0, applied=0, candidates=0, unmatched=0,
+                written=0, write_failed=0, failed=0, skipped=0, stopped=None,
+                errors=[], auto=False)
+
+
+def _note_error(counts, message, track=None):
+    """Record why something failed, folding repeats into one line.
+
+    Without this a failure is a number: `failed: 1` and nothing else, which
+    is exactly as useful as no message at all. The reason is what tells the
+    difference between "MusicBrainz is down", "that file is not where the
+    catalog thinks" and "this container cannot hold tags".
+    """
+    message = str(message).strip() or "unknown error"
+    for e in counts["errors"]:
+        if e["message"] == message:
+            e["count"] += 1
+            return
+    if len(counts["errors"]) < MAX_REPORTED_ERRORS:
+        counts["errors"].append({"message": message, "count": 1,
+                                 "track": track})
+
+
+def _process(con, rows, client, acoustid, counts, write_tags, artwork,
+             progress):
+    """The lookup loop. Shared by a whole-library run and a hand-picked one."""
     total = len(rows)
     consecutive = 0
     for i, row in enumerate(rows, 1):
@@ -1154,6 +1399,7 @@ def run(con, client=None, root=None, limit=None, redo=False, write_tags=False,
             status = enrich_track(con, row, client, acoustid=acoustid)
         except LookupError_ as exc:
             counts["failed"] += 1
+            _note_error(counts, exc, row["rel_path"])
             consecutive += 1
             if consecutive >= MAX_CONSECUTIVE_FAILURES:
                 counts["stopped"] = f"{exc} ({consecutive} in a row)"
@@ -1165,20 +1411,225 @@ def run(con, client=None, root=None, limit=None, redo=False, write_tags=False,
         counts[{"applied": "applied", "candidate": "candidates",
                 "none": "unmatched"}[status]] += 1
         if status == "applied" and write_tags:
-            ok = write_back(con, row["content_key"], artwork=artwork)
-            counts["written" if ok else "write_failed"] += 1
+            res = write_back_result(con, row["content_key"], artwork=artwork)
+            counts["written" if res["ok"] else "write_failed"] += 1
+            if res["reason"]:
+                _note_error(counts, res["reason"], row["rel_path"])
         if progress:
             progress(i, total, status)
     return counts
 
 
-def write_back(con, content_key, artwork=False):
-    """Push an applied enrichment into the audio file itself.
+def tracks_for_keys(con, content_keys):
+    """One track row per content key, in the order the keys were given.
 
-    Returns True on success. A failure is reported, not raised: one file with
-    an exotic container must not end a run over two thousand of them.
+    One row, not all of them: a content key can name several files - the same
+    recording downloaded twice - and looking each copy up separately would
+    spend a rate-limited request to get the same answer, which is then stored
+    once anyway because the enrichment table is keyed by content key too.
+    """
+    out, seen = [], set()
+    for key in content_keys or []:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        row = con.execute(
+            "SELECT * FROM track WHERE content_key = ? AND size > 0 LIMIT 1",
+            (key,)).fetchone()
+        if row:
+            out.append(row)
+    return out
+
+
+# The one hatch out of automatic enrichment, and it is not a user setting:
+# it exists so a test suite and a CI box do not make rate-limited calls to
+# somebody else's service. Anything a person would reach for lives in the
+# interface, not in an environment variable.
+AUTO_ENV = "LEMONZEST_AUTO_ENRICH"
+
+
+def auto_enabled():
+    return os.environ.get(AUTO_ENV, "1") != "0"
+
+
+def auto_after_ingest(con, root=None, content_keys=None, progress=None,
+                      contact=None, client=None, acoustid=None):
+    """Identify what just arrived, and tag it, without asking anybody.
+
+    Run after a scan and after a download - the two moments the library
+    actually changes - so a file is identified as it lands rather than when
+    somebody remembers to go and look.
+
+    What it will do on its own:
+
+      * the offline ISRC backfill, which is free;
+      * a lookup for everything still ``raw`` in what just arrived;
+      * fingerprinting, when ``fpcalc`` and a key are present, because a
+        download whose artist is a channel name gives a text search nothing;
+      * **writing the tags into the audio files**, cover included.
+
+    What it still will not do, because automation does not get to widen these:
+
+      * touch a **skipped** file, ever;
+      * write a match that is not certain. Only an ``applied`` enrichment is
+        written to disk - an exact ISRC, or a text match at or above ``AUTO``,
+        or a fingerprint the tags agree with. Anything doubtful stays a
+        candidate in the review queue and no file is rewritten for it;
+      * overwrite a release-derived field that the file already filled in, or
+        anything typed by hand.
+
+    Never raises: this runs behind somebody else's scan, and a service being
+    down is not a reason for the scan to look like it failed.
+    """
+    counts = _new_counts()
+    counts["auto"] = True
+    if not auto_enabled():
+        counts["stopped"] = "automatic enrichment is off in this environment"
+        return counts
+    try:
+        cfg = get_config(con)
+        client = client or MusicBrainz(contact=contact or cfg["contact"] or None)
+        if acoustid is None and fingerprint_status(con)["ready"]:
+            # Taken when it is available rather than asked about: it is the
+            # rung that answers the download case, and the whole point here
+            # is that nobody is being asked.
+            acoustid = AcoustID(cfg["acoustid_key"])
+
+        counts["backfilled"] = backfill_isrc(con)["matched"]
+
+        if content_keys is not None:
+            rows = tracks_for_keys(con, content_keys)
+            rows = _drop_skipped(con, rows, counts)
+        else:
+            # `pending` has already left the skipped ones out. Counted anyway,
+            # so an automatic pass can say what it deliberately did not touch
+            # rather than looking as though it missed them.
+            rows = pending(con, root=root)
+            counts["skipped"] = _count_skipped(con, root)
+
+        _process(con, rows, client, acoustid, counts,
+                 True,   # write_tags: the point of the mode
+                 True,   # artwork: a download's cover is a video frame
+                 progress)
+    except Exception as exc:      # noqa: BLE001 - reported, never propagated
+        counts["stopped"] = "%s: %s" % (type(exc).__name__, exc)
+        _note_error(counts, exc)
+    return counts
+
+
+def _count_skipped(con, root=None):
+    """How many files a sweep is leaving alone on purpose."""
+    placeholders = ",".join("?" * len(NEVER_LOOK))
+    sql = ("SELECT COUNT(DISTINCT t.content_key) FROM track t "
+           "JOIN enrichment e ON e.content_key = t.content_key "
+           f"WHERE e.status IN ({placeholders})")
+    params = list(NEVER_LOOK)
+    if root:
+        sql += " AND t.root = ?"
+        params.append(root)
+    return con.execute(sql, params).fetchone()[0]
+
+
+def _drop_skipped(con, rows, counts):
+    """Remove the files nobody is allowed to look at, and count them."""
+    if not rows:
+        return []
+    placeholders = ",".join("?" * len(NEVER_LOOK))
+    blocked = {r["content_key"] for r in con.execute(
+        f"SELECT content_key FROM enrichment WHERE status IN ({placeholders})",
+        NEVER_LOOK)}
+    wanted = [r for r in rows if r["content_key"] not in blocked]
+    counts["skipped"] += len(rows) - len(wanted)
+    return wanted
+
+
+def run_tracks(con, content_keys, client=None, write_tags=False, artwork=False,
+               progress=None, contact=None, use_fingerprint=False,
+               acoustid=None):
+    """Enrich a hand-picked set of files. Asking again, by hand.
+
+    New files are identified automatically as they arrive - see
+    ``auto_after_ingest``. This is the path for asking a second time about
+    files that have already been through it.
+
+    Differs from ``run`` in three ways, all of them because somebody chose
+    these files rather than asking for a sweep:
+
+      * the offline ISRC backfill does not run - it is a library-wide pass,
+        and quietly rewriting files nobody selected is not what a button
+        marked with three track names should do;
+      * a file that already has an answer is looked up again, because asking
+        for it again is the only reason to select it;
+      * a **skipped** file is dropped rather than looked up, and counted, so
+        the interface can say so. That is the whole promise of the state, and
+        an explicit selection is exactly where it would otherwise be lost.
+    """
+    cfg = get_config(con)
+    client = client or MusicBrainz(contact=contact or cfg["contact"] or None)
+    if use_fingerprint and acoustid is None:
+        acoustid = AcoustID(cfg["acoustid_key"])
+    if not use_fingerprint:
+        acoustid = None
+
+    counts = _new_counts()
+    wanted = _drop_skipped(con, tracks_for_keys(con, content_keys), counts)
+    _process(con, wanted, client, acoustid, counts, write_tags, artwork,
+             progress)
+    return counts
+
+
+def pending_write(con, content_key):
+    """What a write would put into this file, and what it would replace.
+
+    The preview behind the confirmation dialog. Writing tags is the one
+    action here that cannot be taken back, so what is about to happen should
+    be readable before it happens rather than described afterwards.
+    """
+    row = con.execute(
+        "SELECT t.*, e.release_id, e.status AS enrich_status FROM track t "
+        "LEFT JOIN enrichment e ON e.content_key = t.content_key "
+        "WHERE t.content_key = ? ORDER BY t.id LIMIT 1",
+        (content_key,)).fetchone()
+    if not row:
+        return None
+
+    fields = {f: row[f] for f in ENRICHABLE if row[f] not in (None, "")}
+    on_disk = {}
+    real = None
+    from .paths import resolve_existing
+    from .meta import read_tags
+    real = resolve_existing(row["path"])
+    if real:
+        # Read the file rather than trusting the catalog's copy of it: the
+        # whole question a preview answers is whether the two still agree.
+        on_disk = read_tags(real) or {}
+    changes = {f: {"from": on_disk.get(f), "to": v} for f, v in fields.items()
+               if str(on_disk.get(f) or "") != str(v or "")}
+    return {
+        "content_key": content_key,
+        "rel_path": row["rel_path"],
+        "missing": real is None,
+        "renormalised": bool(real and real != row["path"]),
+        "state": state_of(row["enrich_status"]),
+        "fields": fields,
+        "changes": changes,
+        "artwork_available": bool(row["release_id"]),
+    }
+
+
+def write_back_result(con, content_key, artwork=False):
+    """Push an applied enrichment into the audio file. Returns a report.
+
+    ``{"ok": bool, "reason": str|None, "wrote": bool}``. A failure is
+    reported rather than raised - one file with an exotic container must not
+    end a run over two thousand of them - but the reason travels with it, so
+    the interface can say *why* instead of showing a silent zero.
     """
     from . import tags as tags_mod   # imported late: enrichment works without it
+
+    def out(ok, reason=None, wrote=False):
+        return {"ok": ok, "reason": reason, "wrote": wrote,
+                "content_key": content_key}
 
     # Driven from track, not from enrichment: a hand-typed correction on a
     # file no source could identify is exactly the case that most needs
@@ -1188,7 +1639,7 @@ def write_back(con, content_key, artwork=False):
         "  ON e.content_key = t.content_key AND e.status = 'applied' "
         "WHERE t.content_key = ? LIMIT 1", (content_key,)).fetchone()
     if not row:
-        return False
+        return out(False, "no track in the catalog with that content key")
 
     # What goes into the file is what the catalog now says, not the raw
     # proposal. The catalog has already had the fill-only rule and any
@@ -1197,22 +1648,41 @@ def write_back(con, content_key, artwork=False):
     # leave the two disagreeing about the same track.
     fields = {f: row[f] for f in ENRICHABLE if row[f] not in (None, "")}
     if not fields:
-        return False
+        return out(False, "the catalog has no values for this file to write - "
+                          "identify it or type something in first")
 
     cover = None
-    if artwork and row["release_id"]:
-        try:
-            cover = fetch_cover(row["release_id"])
-        except LookupError_:
-            cover = None
+    cover_note = None
+    if artwork:
+        if not row["release_id"]:
+            # Said out loud rather than passed over: the cover box was
+            # ticked, and silently writing no cover is how a user concludes
+            # the feature is broken.
+            cover_note = ("no cover was fetched: this file is not matched to "
+                          "a release yet, so there is none to fetch")
+        else:
+            try:
+                cover = fetch_cover(row["release_id"])
+            except LookupError_ as exc:
+                cover_note = "cover could not be fetched: %s" % exc
 
     try:
         new_key = tags_mod.write(row["path"], fields, cover=cover)
-    except tags_mod.TagWriteError:
-        return False
+    except tags_mod.TagWriteError as exc:
+        return out(False, str(exc))
+    if new_key is None:
+        # write() declines when there is nothing to put in the file. Counting
+        # that as a success is how "1 written" ends up describing a file
+        # nobody touched.
+        return out(False, "nothing to write into this file")
     tags_mod.rekey(con, content_key, row["path"], new_key)
     con.commit()
-    return True
+    return out(True, cover_note, wrote=True)
+
+
+def write_back(con, content_key, artwork=False):
+    """Push an applied enrichment into the audio file. True when it landed."""
+    return write_back_result(con, content_key, artwork=artwork)["ok"]
 
 
 def cover_art_url(release_id, size=500):
