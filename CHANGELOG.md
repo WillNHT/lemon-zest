@@ -1,6 +1,77 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-09-09)
+
+### Features
+
+- **app**: Inbox, folder control, track inspector, standalone build
+  ([`1e1caa3`](https://github.com/WillNHT/lemon-zest/commit/1e1caa39797aa81fbeb18f0a67e8ebb6e0a10a5f))
+
+The interface gains the things a library page cannot answer, and the packaged executable stops
+  asking the user to install anything.
+
+Inbox. Every file the catalog has indexed since the inbox was last emptied, newest first, with when
+  it arrived. track.added_at is written on insert and never updated, so a rescan of an edited file
+  does not make it new again; "mark all as seen" moves a watermark in meta and deletes nothing. The
+  library and the inbox are one table over two questions, so the selection model, the shortcuts and
+  the actions are shared.
+
+Library folders. Each one can be hidden - still indexed, but out of the library, the facets, the
+  inbox and the counts - or removed, which forgets its rows. Neither touches a file, and the remove
+  dialog says so before the button rather than after it.
+
+Track inspector. Clicking a row opens what the table has no room for: the artwork the file itself
+  carries (served from the audio, not from the Cover Art Archive - a download's video frame is the
+  reason to look), every field, the full path, added and modified, and where the values came from.
+
+Search terms. Enrich on a single track shows the terms the lookup will send and lets them be typed
+  over: MusicBrainz has "Song", the file is "Song (Single Version) [Official Video]", and no scoring
+  recovers that. Typed terms are searched once, verbatim, judged against themselves rather than the
+  file's tags, and skip the ISRC shortcut - they exist because the exact answer was wrong. Refused
+  over a selection: one query cannot describe forty tracks.
+
+Genre. It was never in ENRICHABLE, so nothing ever proposed one. Now taken from the release and its
+  release group, by vote, and only when the file's own tag is empty.
+
+Standalone executable. yt-dlp, ffmpeg, ffprobe, Deno and fpcalc ship inside the binary;
+  lemonzest.bundled puts them at the front of PATH at startup, so yt-dlp finds ffmpeg and a JS
+  runtime without anything being installed. A frozen build has no `-m`, so the exe re-runs itself
+  with --yt-dlp and becomes it. `lemon-zest tools` reports what was found and whether it came from
+  the bundle; the smoke test checks all five with PATH stripped, so a machine that happens to have
+  ffmpeg cannot pass by accident.
+
+Also: the download page keeps its URL list across reloads, text is selectable everywhere except the
+  controls, and every gradient is now a solid colour.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+### Performance Improvements
+
+- **app**: Ship a folder, and stop the download page waiting on yt-dlp
+  ([`4b9a616`](https://github.com/WillNHT/lemon-zest/commit/4b9a61620d9acae4f9d1c7d8aa79665dab1922ad))
+
+Two delays, one of them four seconds long.
+
+Opening the Download page asked yt-dlp its version on every visit. That is a process start, an
+  import of yt-dlp and - on a packaged build - a second copy of this executable: 4.1s measured,
+  spent inside the click that opened the page. The answer is now cached for the life of the process,
+  warmed by a thread at startup, and taken under a lock so a page opened during the warm-up waits
+  for that one subprocess instead of starting another. The view also paints before it loads, so
+  switching to Download is immediate whatever the config costs, and the page keeps its last answer
+  rather than blinking back to a spinner.
+
+The artifact is now a folder in a zip rather than a onefile .exe. Onefile unpacked all 320 MB of
+  bundled ffmpeg, Deno and yt-dlp into a temporary directory on every single launch; extracted once
+  by whoever unzips it, the same build starts in 0.85s instead of five seconds.
+  `packaging/make_zip.py` writes the archive - one top-level folder, so extracting it never scatters
+  three hundred files - and CI and the release workflow now build, smoke-test the executable inside
+  the folder, zip it, and attach that. The tools download is cached in CI on the URL set, so a rerun
+  does not refetch a quarter of a gigabyte.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.4.0 (2026-09-09)
 
 ### Bug Fixes
