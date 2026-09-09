@@ -95,6 +95,10 @@ def create_app(db_path=None):
             "artists": one("SELECT COUNT(DISTINCT artist) FROM track"),
             "albums": one("SELECT COUNT(DISTINCT album) FROM track"),
             "with_isrc": one("SELECT COUNT(*) FROM track WHERE isrc IS NOT NULL"),
+            "enriched": one("SELECT COUNT(*) FROM enrichment "
+                            "WHERE status='applied'"),
+            "enrich_candidates": one("SELECT COUNT(*) FROM enrichment "
+                                     "WHERE status='candidate'"),
             "playlists": one("SELECT COUNT(*) FROM playlist"),
             "playlist_entries": one("SELECT COUNT(*) FROM playlist_entry"),
             "unmatched": one("SELECT COUNT(*) FROM playlist_entry "
@@ -105,7 +109,8 @@ def create_app(db_path=None):
                 one("SELECT COUNT(*) FROM playlist_entry WHERE track_id IS NULL")
                 + one("SELECT COUNT(*) FROM track WHERE size = 0")
                 + one("SELECT COUNT(*) FROM track WHERE (title IS NULL OR "
-                      "title = '') AND size > 0")),
+                      "title = '') AND size > 0")
+                + one("SELECT COUNT(*) FROM enrichment WHERE status='candidate'")),
             "roots": [r["root"] for r in
                       c.execute("SELECT DISTINCT root FROM track ORDER BY root")],
         })
@@ -205,6 +210,55 @@ def create_app(db_path=None):
                 "SELECT COUNT(*) FROM playlist_entry "
                 "WHERE track_id IS NULL").fetchone()[0],
         })
+
+    # ------------------------------------------------------- enrichment
+
+    @app.get("/api/enrich/summary")
+    def enrich_summary():
+        from . import enrich as en
+        return jsonify(en.summary(con()))
+
+    @app.get("/api/enrich/review")
+    def enrich_review():
+        """The candidates a person still has to judge.
+
+        Read-only and side-effect free, like the dry run: the interface shows
+        what would change beside what the file says now, and nothing moves
+        until someone accepts it.
+        """
+        from . import enrich as en
+        limit = min(int(request.args.get("limit", 100)), 500)
+        rows = en.review_queue(con(), limit=limit)
+        return jsonify({"candidates": [{
+            "track_id": r["track_id"], "content_key": r["content_key"],
+            "rel_path": r["rel_path"], "confidence": r["confidence"],
+            "source": r["source"], "mbid": r["mbid"],
+            "cover": en.cover_art_url(r["release_id"]),
+            "current": {f: r.get(f) for f in
+                        ("title", "artist", "album", "album_artist", "duration")},
+            "proposed": r["proposed"],
+        } for r in rows]})
+
+    @app.post("/api/enrich/<action>")
+    def enrich_decide(action):
+        """Accept or reject one candidate.
+
+        Writing to the audio file is not reachable from here on purpose: the
+        interface decides what the catalog believes, and rewriting two
+        thousand files is a deliberate command with a confirmation on it.
+        """
+        from . import enrich as en
+        if action not in ("accept", "reject"):
+            return jsonify({"error": "unknown action"}), 404
+        key = (request.json or {}).get("content_key")
+        if not key:
+            return jsonify({"error": "content_key required"}), 400
+        c = con()
+        if action == "accept":
+            ok = en.accept(c, key)
+            return jsonify({"ok": bool(ok)}), (200 if ok else 404)
+        en.reject(c, key)
+        return jsonify({"ok": True})
 
     @app.get("/api/facets")
     def facets():

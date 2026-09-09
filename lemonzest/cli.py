@@ -113,6 +113,12 @@ def stats(ctx):
     t.add_row("albums", f"{q('SELECT COUNT(DISTINCT album) FROM track'):,}")
     t.add_row("with ISRC", f"{q('SELECT COUNT(*) FROM track WHERE isrc IS NOT NULL'):,}")
     t.add_row("with source URL", f"{q('SELECT COUNT(*) FROM track WHERE purl IS NOT NULL'):,}")
+    # Kept out of the f-strings: a backslash inside one is a syntax error
+    # before Python 3.12, and this project supports 3.10.
+    enriched = q("SELECT COUNT(*) FROM enrichment WHERE status = 'applied'")
+    waiting = q("SELECT COUNT(*) FROM enrichment WHERE status = 'candidate'")
+    t.add_row("identified", f"{enriched:,}")
+    t.add_row("awaiting review", f"{waiting:,}")
     t.add_row("playlists", f"{q('SELECT COUNT(*) FROM playlist'):,}")
     t.add_row("playlist entries", f"{q('SELECT COUNT(*) FROM playlist_entry'):,}")
     t.add_row("unmatched entries",
@@ -818,6 +824,230 @@ def doctor_cmd(ctx, directory):
             "appended instead of replacing. Lemon Zest rewrites playlists in "
             "place, so syncing with it once will collapse them back."
         )
+
+
+# ------------------------------------------------------------- enrichment
+
+@cli.group()
+def enrich():
+    """Identify tracks against MusicBrainz and correct their metadata."""
+
+
+def _track_ref(con, ref):
+    """Find one track by id, content key, or a fragment of its path."""
+    row = None
+    if str(ref).isdigit():
+        row = con.execute("SELECT * FROM track WHERE id = ?", (int(ref),)).fetchone()
+    if row is None:
+        row = con.execute("SELECT * FROM track WHERE content_key = ?",
+                          (ref,)).fetchone()
+    if row is None:
+        rows = con.execute("SELECT * FROM track WHERE rel_path LIKE ? LIMIT 5",
+                           (f"%{ref}%",)).fetchall()
+        if len(rows) > 1:
+            raise click.ClickException(
+                f"{ref!r} matches {len(rows)} tracks; use the id instead:\n  "
+                + "\n  ".join(f"{r['id']}  {r['rel_path']}" for r in rows))
+        row = rows[0] if rows else None
+    if row is None:
+        raise click.ClickException(f"no track matching {ref!r}")
+    return row
+
+
+@enrich.command("status")
+@click.pass_context
+def enrich_status(ctx, ):
+    """How much of the library is identified."""
+    from . import enrich as en
+    con = _con(ctx)
+    s = en.summary(con)
+    total = max(s["tracks"], 1)
+    t = Table(box=None, pad_edge=False)
+    t.add_column("", style="dim")
+    t.add_column("", justify="right")
+    t.add_column("", justify="right", style="dim")
+    for label, key in (("tracks", "tracks"), ("carrying an ISRC", "with_isrc"),
+                       ("enriched", "applied"), ("awaiting review", "candidates"),
+                       ("rejected", "rejected"), ("no match found", "unmatched"),
+                       ("hand-corrected", "overrides")):
+        pct = f"{100 * s[key] / total:.1f}%" if key != "tracks" else ""
+        t.add_row(label, f"{s[key]:,}", pct)
+    console.print(t)
+    if s["candidates"]:
+        console.print(f"\n[yellow]{s['candidates']} candidates need a decision[/] - "
+                      "lemon-zest enrich review")
+
+
+@enrich.command("backfill")
+@click.option("--dry-run", is_flag=True, help="Report matches without storing them.")
+@click.pass_context
+def enrich_backfill(ctx, dry_run):
+    """Copy ISRCs onto untagged twins already in the library. Offline."""
+    from . import enrich as en
+    con = _con(ctx)
+    counts = en.backfill_isrc(con, dry_run=dry_run)
+    console.print(
+        f"{counts['scanned']:,} tracks without an ISRC - "
+        f"[green]{counts['matched']:,}[/] matched a twin that has one, "
+        f"{counts['ambiguous']:,} ambiguous"
+        + (" [dim](dry run, nothing stored)[/]" if dry_run else ""))
+    if counts["matched"] and not dry_run:
+        console.print("[dim]stored as candidates; apply them with "
+                      "'enrich review' or the next 'enrich run'.[/]")
+
+
+@enrich.command("run")
+@click.option("--root", type=click.Path(), default=None,
+              help="Only tracks under this library root.")
+@click.option("--limit", type=int, default=None,
+              help="Stop after this many lookups.")
+@click.option("--redo", is_flag=True, help="Re-look-up tracks already decided.")
+@click.option("--write-tags", is_flag=True,
+              help="Write applied values into the audio files themselves.")
+@click.option("--artwork", is_flag=True,
+              help="With --write-tags, replace the cover with the release's own.")
+@click.option("--contact", default=None,
+              help="Contact URL or address for the MusicBrainz User-Agent.")
+@click.option("--yes", is_flag=True, help="Do not ask before writing to files.")
+@click.pass_context
+def enrich_run(ctx, root, limit, redo, write_tags, artwork, contact, yes):
+    """Look tracks up against MusicBrainz and store what it says.
+
+    Rate-limited to one request per second, as MusicBrainz asks. Stopping it
+    early is safe: every decision is committed as it is made, and the next
+    run continues where this one left off.
+    """
+    from . import enrich as en
+    con = _con(ctx)
+
+    if write_tags and not yes:
+        click.confirm(
+            "--write-tags rewrites the tags inside your audio files. "
+            "Each file is rewritten to a copy and swapped in, so an "
+            "interruption leaves the original. Continue?", abort=True)
+
+    pend = en.pending(con, limit=limit, root=root, redo=redo)
+    if not pend:
+        console.print("[green]nothing to look up.[/] "
+                      "Use --redo to revisit tracks already decided.")
+        return
+    console.print(f"{len(pend):,} tracks to look up "
+                  f"[dim](~{len(pend) * 1.05 / 60:.0f} min at 1 req/s)[/]")
+
+    with Progress(SpinnerColumn(), TextColumn("[cyan]identifying"), BarColumn(),
+                  TextColumn("{task.completed}/{task.total}"),
+                  TimeRemainingColumn(), console=console) as prog:
+        task = prog.add_task("enrich", total=len(pend))
+
+        def cb(done, total, status):
+            prog.update(task, completed=done, total=total)
+
+        counts = en.run(con, root=root, limit=limit, redo=redo,
+                        write_tags=write_tags, artwork=artwork,
+                        contact=contact, progress=cb)
+
+    console.print(
+        f"[green]{counts['applied']}[/] identified, "
+        f"[yellow]{counts['candidates']}[/] need review, "
+        f"{counts['unmatched']} no match"
+        + (f", {counts['backfilled']} backfilled" if counts["backfilled"] else "")
+        + (f", [red]{counts['failed']} lookups failed[/]" if counts["failed"] else "")
+        + (f", [green]{counts['written']}[/] files rewritten" if write_tags else "")
+        + (f", [red]{counts['write_failed']} writes failed[/]"
+           if counts["write_failed"] else ""))
+    if counts["stopped"]:
+        console.print(f"[red]stopped early:[/] {counts['stopped']}")
+    if counts["candidates"]:
+        console.print("[dim]lemon-zest enrich review[/]")
+
+
+@enrich.command("review")
+@click.option("--limit", default=20, show_default=True)
+@click.pass_context
+def enrich_review(ctx, limit):
+    """List candidates that need a decision, least confident first."""
+    from . import enrich as en
+    con = _con(ctx)
+    rows = en.review_queue(con, limit=limit)
+    if not rows:
+        console.print("[green]nothing waiting.[/]")
+        return
+    for r in rows:
+        p = r["proposed"]
+        console.print(f"\n[bold]{r['track_id']}[/]  [dim]{r['rel_path']}[/]  "
+                      f"[{'yellow' if r['confidence'] < 0.8 else 'green'}]"
+                      f"{r['confidence']:.2f}[/] [dim]via {r['source']}[/]")
+        t = Table(box=None, pad_edge=False, show_header=True)
+        t.add_column("", style="dim")
+        t.add_column("in the file")
+        t.add_column("proposed", style="cyan")
+        for field in ("title", "artist", "album", "album_artist", "year", "isrc"):
+            old = r.get(field) or ""
+            new = p.get(field)
+            if new is None or str(new) == str(old):
+                continue
+            t.add_row(field, str(old), str(new))
+        console.print(t)
+    console.print(f"\n[dim]lemon-zest enrich accept <id>   |   "
+                  f"enrich reject <id>[/]")
+
+
+@enrich.command("accept")
+@click.argument("ref")
+@click.option("--write-tags", is_flag=True, help="Also write it into the file.")
+@click.option("--artwork", is_flag=True, help="With --write-tags, fetch the cover.")
+@click.pass_context
+def enrich_accept(ctx, ref, write_tags, artwork):
+    """Apply a stored candidate."""
+    from . import enrich as en
+    con = _con(ctx)
+    row = _track_ref(con, ref)
+    if not en.accept(con, row["content_key"]):
+        raise click.ClickException("no candidate stored for that track.")
+    console.print(f"[green]applied[/] to {row['rel_path']}")
+    if write_tags:
+        ok = en.write_back(con, row["content_key"], artwork=artwork)
+        console.print("[green]file rewritten[/]" if ok
+                      else "[red]could not write the file[/]")
+
+
+@enrich.command("reject")
+@click.argument("ref")
+@click.pass_context
+def enrich_reject(ctx, ref):
+    """Mark a candidate wrong. It will not be offered or re-fetched."""
+    from . import enrich as en
+    con = _con(ctx)
+    row = _track_ref(con, ref)
+    en.reject(con, row["content_key"])
+    console.print(f"[yellow]rejected[/] for {row['rel_path']}")
+
+
+@enrich.command("set")
+@click.argument("ref")
+@click.option("--title")
+@click.option("--artist")
+@click.option("--album")
+@click.option("--album-artist")
+@click.option("--year")
+@click.option("--isrc")
+@click.option("--write-tags", is_flag=True, help="Also write it into the file.")
+@click.pass_context
+def enrich_set(ctx, ref, write_tags, **fields):
+    """Correct a track by hand. Outranks every source, now and later."""
+    from . import enrich as en
+    con = _con(ctx)
+    given = {k: v for k, v in fields.items() if v is not None}
+    if not given:
+        raise click.ClickException("give at least one field to set.")
+    row = _track_ref(con, ref)
+    en.override(con, row["content_key"], **given)
+    console.print(f"[green]set[/] {', '.join(given)} on {row['rel_path']}")
+    if write_tags:
+        ok = en.write_back(con, row["content_key"])
+        console.print("[green]file rewritten[/]" if ok else
+                      "[yellow]nothing applied yet - accept a candidate first, "
+                      "or the file has no enrichment to write.[/]")
 
 
 @cli.command("gui")

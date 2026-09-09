@@ -2,7 +2,7 @@
 import os
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -110,6 +110,45 @@ CREATE TABLE IF NOT EXISTS device_playlist (
     entries    INTEGER,
     written_at REAL,
     PRIMARY KEY (device_id, filename)
+);
+
+-- ------------------------------------------------------------ enrichment
+--
+-- What an external source said about a file, kept apart from what the file
+-- itself says. Three reasons it is its own table rather than more columns
+-- on track:
+--
+--   * a wrong answer stays reversible - the raw tags are never overwritten
+--     in place, so `enrich reject` restores the file's own reading;
+--   * every value carries where it came from and how sure the match was,
+--     which is the only way to audit a bad tag or invalidate a stale one;
+--   * it is keyed by content_key, not track_id, so moving or rescanning a
+--     file keeps its enrichment and costs no further API calls.
+CREATE TABLE IF NOT EXISTS enrichment (
+    content_key TEXT PRIMARY KEY,
+    status      TEXT NOT NULL,    -- candidate | applied | rejected | none
+    source      TEXT NOT NULL,    -- isrc | musicbrainz | backfill
+    confidence  REAL NOT NULL,
+    mbid        TEXT,             -- MusicBrainz recording id
+    release_id  TEXT,             -- MusicBrainz release id, for cover art
+    fields      TEXT NOT NULL,    -- JSON: the proposed tag values
+    fetched_at  REAL NOT NULL,
+    applied_at  REAL,
+    -- The content_key the file had when the values were written into it.
+    -- Writing tags changes the head of the file and therefore the key, so
+    -- without this an applied file looks unenriched on the next scan.
+    applied_key TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_enrich_status ON enrichment(status);
+
+-- The user tier: a hand-typed value outranks every source, and survives a
+-- re-run of the enricher. Also keyed by content_key.
+CREATE TABLE IF NOT EXISTS track_override (
+    content_key TEXT NOT NULL,
+    field       TEXT NOT NULL,
+    value       TEXT,
+    set_at      REAL NOT NULL,
+    PRIMARY KEY (content_key, field)
 );
 
 CREATE TABLE IF NOT EXISTS sync_log (
