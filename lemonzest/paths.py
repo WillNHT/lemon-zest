@@ -52,8 +52,22 @@ def norm(p):
 def resolve_existing(path):
     """Return the on-disk spelling of ``path``, trying NFC and NFD.
 
-    Returns None when neither form exists.
+    Returns None when no form of it exists.
+
+    The catalog stores NFC, because a path has to have one spelling to be
+    comparable. The disk does not agree: NTFS keeps whatever bytes the writer
+    used, so a yt-dlp download can land as NFD - "\u304b" plus a combining
+    dakuten where the catalog holds "\u304c" - and the stored path then opens
+    nothing at all. Same characters to a reader, different bytes to open().
+
+    Whole-path NFC and NFD are tried first because they are one stat each and
+    they cover the ordinary case. When they fail, the walk below handles the
+    case they cannot: a path whose folders are in one normalisation and whose
+    filename is in the other, which is what a folder made by hand containing
+    a downloaded file actually looks like.
     """
+    if not path:
+        return None
     cands = [path,
              unicodedata.normalize("NFC", path),
              unicodedata.normalize("NFD", path)]
@@ -64,6 +78,32 @@ def resolve_existing(path):
         seen.add(c)
         if os.path.exists(c):
             return c
+    return _resolve_component_wise(path)
+
+
+def _resolve_component_wise(path):
+    """Walk the path, matching each component against what is on disk.
+
+    One directory listing per level, and only ever reached after the cheap
+    whole-path attempts have failed, so the cost lands on the paths that are
+    actually broken rather than on every lookup.
+    """
+    path = str(path).replace("\\", "/")
+    head, _, tail = path.rpartition("/")
+    if not head or not tail:
+        return None
+    base = resolve_existing(head) if not os.path.isdir(head) else head
+    if not base or not os.path.isdir(base):
+        return None
+    want = unicodedata.normalize("NFC", tail)
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+    for name in names:
+        if unicodedata.normalize("NFC", name) == want:
+            found = os.path.join(base, name)
+            return found.replace("\\", "/")
     return None
 
 

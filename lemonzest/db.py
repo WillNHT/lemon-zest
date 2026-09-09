@@ -135,7 +135,9 @@ CREATE TABLE IF NOT EXISTS device_playlist (
 --     file keeps its enrichment and costs no further API calls.
 CREATE TABLE IF NOT EXISTS enrichment (
     content_key TEXT PRIMARY KEY,
-    status      TEXT NOT NULL,    -- candidate | applied | rejected | none
+    -- candidate | applied | rejected | skipped | none. The interface
+    -- shows four states over these; enrich.STATE_SQL is the mapping.
+    status      TEXT NOT NULL,
     source      TEXT NOT NULL,    -- isrc | musicbrainz | backfill
     confidence  REAL NOT NULL,
     mbid        TEXT,             -- MusicBrainz recording id

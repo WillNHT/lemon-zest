@@ -3,6 +3,12 @@
 Uses Flask's test client, so no port is opened and no browser is involved.
 """
 import os
+
+# Automatic enrichment follows every scan and download. Switched off for the
+# suite: these tests are about the catalog and the sync, and none of them
+# should be making rate-limited calls to somebody else's service.
+os.environ["LEMONZEST_AUTO_ENRICH"] = "0"
+
 import shutil
 import sys
 import tempfile
