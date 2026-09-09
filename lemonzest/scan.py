@@ -7,6 +7,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from . import db
 from .meta import is_audio, probe
 from .paths import norm
 
@@ -95,6 +96,10 @@ def scan(con, root, workers=8, progress=None, full=False):
     now = time.time()
     counts = {"seen": 0, "added": 0, "updated": 0, "unchanged": 0,
               "removed": 0, "failed": 0}
+
+    # Registered before the walk, so a folder with no music in it yet is
+    # still a library folder afterwards - that is how a library starts.
+    db.add_root(con, root, scanned=True)
 
     known = {
         r["path"]: (r["size"], r["mtime"], r["id"])

@@ -277,6 +277,30 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(summary["exit_code"], 1)
         self.assertTrue(summary["errors"])
 
+    def test_an_empty_scanned_folder_is_somewhere_to_download_into(self):
+        """A new library starts empty; downloading is how it fills.
+
+        Before library_root existed, a folder was known only through the
+        tracks in it, so scanning an empty one registered nothing and the
+        first download had no destination to offer.
+        """
+        from lemonzest import scan as scan_mod
+        scan_mod.scan(self.con, self.root)
+        self.assertEqual(db.roots(self.con),
+                         [download.norm(os.path.abspath(self.root))])
+
+        summary = download.download(self.con, ["https://example.test/v"],
+                                    cfg=self.cfg())
+        self.assertEqual(summary["downloaded"], 1)
+        self.assertEqual(summary["root"],
+                         download.norm(os.path.abspath(self.root)))
+
+    def test_a_folder_downloaded_into_is_a_library_folder(self):
+        download.download(self.con, ["https://example.test/v"],
+                          root=self.root, cfg=self.cfg())
+        self.assertIn(download.norm(os.path.abspath(self.root)),
+                      db.roots(self.con))
+
     def test_an_unknown_folder_is_refused_before_anything_runs(self):
         with self.assertRaises(download.DownloadError):
             download.download(self.con, ["https://example.test/v"],

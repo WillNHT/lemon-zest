@@ -41,6 +41,15 @@ CREATE INDEX IF NOT EXISTS ix_track_artist ON track(artist);
 CREATE INDEX IF NOT EXISTS ix_track_album  ON track(album);
 CREATE INDEX IF NOT EXISTS ix_track_root   ON track(root);
 
+-- Library folders the scanner watches. Kept apart from track.root so a
+-- folder that holds no music yet is still a place downloads can land: an
+-- empty folder is the normal way to start a library.
+CREATE TABLE IF NOT EXISTS library_root (
+    root       TEXT PRIMARY KEY,   -- absolute, NFC-normalised
+    added_at   REAL,
+    scanned_at REAL
+);
+
 CREATE TABLE IF NOT EXISTS playlist (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
@@ -216,6 +225,13 @@ def connect(path=None):
     con.execute("PRAGMA foreign_keys=ON")
     migrate(con)
     con.executescript(SCHEMA)
+    # A catalog scanned before library_root existed knows its folders only
+    # through the tracks in them. Adopt those, once.
+    con.execute(
+        "INSERT INTO library_root(root, added_at, scanned_at) "
+        "SELECT DISTINCT root, NULL, NULL FROM track "
+        "WHERE root NOT IN (SELECT root FROM library_root)"
+    )
     con.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -223,6 +239,31 @@ def connect(path=None):
     )
     con.commit()
     return con
+
+
+def add_root(con, root, scanned=False):
+    """Remember ``root`` as a library folder, whether or not it holds music."""
+    import time
+
+    from .paths import norm
+
+    root = norm(os.path.abspath(root))
+    now = time.time()
+    con.execute(
+        "INSERT INTO library_root(root, added_at, scanned_at) VALUES (?,?,?) "
+        "ON CONFLICT(root) DO UPDATE SET scanned_at = "
+        "COALESCE(excluded.scanned_at, library_root.scanned_at)",
+        (root, now, now if scanned else None),
+    )
+    con.commit()
+    return root
+
+
+def roots(con):
+    """Every library folder, registered or merely inferred from its tracks."""
+    return [r["root"] for r in con.execute(
+        "SELECT root FROM library_root "
+        "UNION SELECT DISTINCT root FROM track ORDER BY root")]
 
 
 def log(con, device_id, kind, detail=None, size=None):

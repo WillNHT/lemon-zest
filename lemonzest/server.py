@@ -111,8 +111,7 @@ def create_app(db_path=None):
                 + one("SELECT COUNT(*) FROM track WHERE (title IS NULL OR "
                       "title = '') AND size > 0")
                 + one("SELECT COUNT(*) FROM enrichment WHERE status='candidate'")),
-            "roots": [r["root"] for r in
-                      c.execute("SELECT DISTINCT root FROM track ORDER BY root")],
+            "roots": db_mod.roots(c),
         })
 
     def _library_where(args):
@@ -370,8 +369,7 @@ def create_app(db_path=None):
                 "profiles": [{"name": p["name"], "path": p["path"]}
                              for p in status["profiles"]],
             },
-            "roots": [r["root"] for r in
-                      c.execute("SELECT DISTINCT root FROM track ORDER BY root")],
+            "roots": db_mod.roots(c),
         }
 
     @app.get("/api/download/config")

@@ -31,6 +31,7 @@ import subprocess
 import sys
 import time
 
+from . import db
 from . import playlists as pl_mod
 from . import scan as scan_mod
 from .paths import norm
@@ -505,10 +506,11 @@ def probe(url, cfg, timeout=120):
 def _resolve_root(con, cfg, root):
     """Which library folder a download lands in.
 
-    In order: what was asked for, the configured folder, then the folder
-    already holding the most tracks. Downloading into a folder the scanner
-    does not watch would put files on disk that never reach the catalog, so
-    guessing the busiest known root beats defaulting to the shell's cwd.
+    In order: what was asked for, the configured folder, the folder already
+    holding the most tracks, then the only registered library folder there
+    is. Downloading into a folder the scanner does not watch would put files
+    on disk that never reach the catalog, so guessing a known root beats
+    defaulting to the shell's cwd.
     """
     candidate = (root or cfg.get("root") or "").strip()
     if not candidate:
@@ -516,6 +518,12 @@ def _resolve_root(con, cfg, root):
             "SELECT root, COUNT(*) n FROM track GROUP BY root ORDER BY n DESC"
         ).fetchone()
         candidate = row["root"] if row else ""
+    if not candidate:
+        # A library that has been scanned but holds no music yet: an empty
+        # folder is where a library starts, and downloading is how it fills.
+        known = db.roots(con)
+        if len(known) == 1:
+            candidate = known[0]
     if not candidate:
         raise DownloadError(
             "no library folder to download into. Scan one first, or name a "
@@ -626,6 +634,9 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     if not urls:
         raise DownloadError("no URL given")
     root = _resolve_root(con, cfg, root)
+    # Downloading into a folder is a claim that it is a library folder, so
+    # it shows up in the picker next time even before it has been scanned.
+    db.add_root(con, root)
 
     args = build_args(cfg, urls, root, no_playlist=no_playlist,
                       archive=archive, output=output,
