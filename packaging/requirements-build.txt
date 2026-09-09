@@ -1,0 +1,5 @@
+# What the packaging environment needs on top of the project's own
+# dependencies. Pinned to a floor rather than an exact version: PyInstaller
+# tracks new Python releases, and holding it back is how a build breaks on a
+# newer interpreter than the one this was written against.
+pyinstaller>=6.3

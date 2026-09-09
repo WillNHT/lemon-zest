@@ -15,3 +15,8 @@ cookies.txt
 .realdb/
 backups/
 .testdb/
+
+# Build outputs
+build/
+dist/
+*.spec.bak
