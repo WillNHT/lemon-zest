@@ -18,3 +18,21 @@ include = ["lemonzest*"]
 
 [tool.setuptools.package-data]
 lemonzest = ["web/*"]
+
+# Releases are derived from the commit history rather than declared: the
+# subjects since the last tag decide whether the next version is a patch, a
+# minor or a major, and both copies of the number are rewritten to match.
+[tool.semantic_release]
+version_variables = ["lemonzest/__init__.py:__version__"]
+version_toml = ["pyproject.toml:project.version"]
+commit_message = "chore(release): {version}\n\n[skip ci]"
+# The release is a Windows executable built in a later job, not a wheel on
+# PyPI, so there is nothing to build here.
+build_command = ""
+tag_format = "v{version}"
+
+[tool.semantic_release.branches.master]
+match = "master"
+
+[tool.semantic_release.changelog]
+exclude_commit_patterns = ['^chore\(release\):']
