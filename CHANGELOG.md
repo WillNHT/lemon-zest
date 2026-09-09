@@ -1,6 +1,35 @@
 # CHANGELOG
 
 
+## v0.6.0 (2026-09-09)
+
+### Features
+
+- **download**: Show the batch, not just the current file
+  ([`ca5cc6b`](https://github.com/WillNHT/lemon-zest/commit/ca5cc6bde33254170b1ba2c9686f6e0fc19d524b))
+
+A forty-track download reported the bytes of whichever file yt-dlp happened to be fetching. That bar
+  resets to zero at every track and never describes the run, so the only way to know how far along a
+  batch was is to count "wrote ..." lines in the log.
+
+The run now counts items. The URLs are listed once before anything is fetched - one flat listing
+  each, reused afterwards for the playlist ordering that already needed it - so the bar has a
+  denominator from the first second rather than the last. Every item ends exactly once: written,
+  already in the archive, or failed, which is what makes "12 of 47" add up.
+
+The progress template carries the playlist position, the speed and the ETA alongside the bytes, and
+  the short three-field line an older yt-dlp emits is still read rather than dropped. Progress
+  events now carry item counts; the bytes moved to where they describe something - the current item,
+  handed to a new on_batch callback and kept whole on the job.
+
+The Download page draws it: overall bar, done/total, downloaded vs already had vs failed, elapsed
+  and an estimate of what is left, and beneath it the track being fetched with its own bar, size,
+  speed and ETA. It stays on screen when the run finishes. The status strip shows the same count on
+  every page, so a long playlist can be watched from the library.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.5.0 (2026-09-09)
 
 ### Features
