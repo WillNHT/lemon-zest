@@ -1,6 +1,92 @@
 # CHANGELOG
 
 
+## v0.4.0 (2026-09-09)
+
+### Bug Fixes
+
+- **tags**: Open the file the filesystem has, not the one the catalog stored
+  ([`6ec4e1b`](https://github.com/WillNHT/lemon-zest/commit/6ec4e1bf5c013a68ea19b958a041061f8675b890))
+
+Writing tags to a downloaded track failed with "no such file" over a file that was plainly sitting
+  there. The catalog stores paths NFC-normalised, because a path needs one spelling to be
+  comparable; NTFS keeps whatever bytes wrote the file, and a yt-dlp download of a Japanese title
+  arrives as NFD - U+304B plus a combining dakuten where the catalog holds U+304C. Identical to a
+  reader, different to open().
+
+`paths.resolve_existing` already existed for exactly this, and `executor` and `organise` both used
+  it. `tags.write` did not, so it was the one path that opened the stored spelling directly. It now
+  resolves first.
+
+resolve_existing also gains a component-wise walk. Trying the whole path as NFC and then as NFD
+  covers the ordinary case and misses the one that actually occurs here: a folder made by hand in
+  one normalisation holding a file written by yt-dlp in the other, where normalising the whole path
+  either way fixes one component and breaks the other.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+### Features
+
+- **enrich**: Identify and tag new files automatically, and make the rest reviewable
+  ([`2ce9688`](https://github.com/WillNHT/lemon-zest/commit/2ce9688912c38bc928bac623942bcefc2c38b87d))
+
+Enrichment used to be something you had to remember to run, and the only way to act on it was to
+  type track ids at a terminal. It now runs itself, and what still needs a person has a place in the
+  interface.
+
+Automatic --------- A scan and a download each finish by identifying whatever they brought in and
+  writing the tags into those files - `enrich.auto_after_ingest`, in both the CLI and the server. It
+  runs as its own job rather than as a tail on the caller's: MusicBrainz allows one request a
+  second, and a scan that finished in two seconds should not appear to grind for an hour. A
+  download's pass is scoped to the files that run fetched, so downloading into a large library does
+  not start a pass over all of it.
+
+Three bounds automation does not get to widen: a skipped file is never looked at, only an `applied`
+  match reaches disk (a candidate waits for a person and no file is rewritten for it), and the
+  fill-only rule and hand-typed overrides still win.
+
+Four states ----------- `enrichment.status` records what a lookup did; the interface needs the
+  shorter question of what to do next. Four states answer it - raw, awaiting, enriched, skipped -
+  and `enrich.STATE_SQL` maps every status onto one so the library list can filter, page and count
+  on it in the same statement as the rest. `rejected` folds into `skipped` because that is what it
+  always did.
+
+A skipped file is excluded from `pending` even under `--redo`, and from an explicit hand-picked
+  selection, which is the promise the state makes.
+
+In the library -------------- A Metadata column and state chips, selection the way a file manager
+  does it (click, shift-click a run, ctrl-click, ctrl+A, arrows, and "select all N matching" for the
+  whole filter rather than the page), and single-key actions over the selection: E enrich, A/R
+  accept or reject, S skip, U mark raw, Enter edit, W write tags.
+
+Editing by hand opens on one track with three tiers side by side - what the catalog says, what the
+  source proposed, what has been typed - and over a selection it writes only the fields filled in,
+  so fixing one album artist does not flatten everybody's title to one value.
+
+Saying what happened -------------------- A run that failed used to report `failed: 1` and drop the
+  reason on the floor; `write_back` returned a bare bool, and returned True when it had written
+  nothing at all. Failures now carry their message (folded with counts, so an outage is one
+  sentence), `write_back_result` reports why, and a finished job leaves a result on the page until
+  it is dismissed.
+
+The write dialog previews the exact diff before running - every field, what the file holds, what it
+  would become - and says up front when nothing would change, when files are not where the catalog
+  thinks, or when the cover box has no release to fetch from.
+
+ISRC lookups were returning almost nothing ------------------------------------------
+  `/ws/2/isrc/<isrc>` answers with the recording and its artist credit and zero releases, whatever
+  `inc` asks for. So the free, exact-identifier rung - the one that covers 98.7% of the tagged
+  library - was delivering a title and an artist and then stopping: no album, no year, and no
+  release id, which meant cover art could never be fetched for any ISRC match. One extra request by
+  mbid, spent only when the first reply comes back short, restores it.
+
+Tests set LEMONZEST_AUTO_ENRICH=0. That is a suite hatch so CI does not make rate-limited calls to
+  somebody else's service, not a user-facing setting: nothing in the interface can turn automatic
+  enrichment off.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.3.0 (2026-09-09)
 
 
