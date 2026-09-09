@@ -412,6 +412,57 @@ class EnrichTests(unittest.TestCase):
         tried = [call[1] for call in client.search_calls]
         self.assertIn("Jikanga Nai", tried)
 
+    def test_a_writer_credit_list_falls_back_to_the_primary_name(self):
+        # The art-track case: seven credited writers in one artist field, and
+        # no index has an artist by that name.
+        long_credit = ("Joji, Kurtis McKenzie, Linden Jay, Chelsea Lena, "
+                       "George Miller, Joshua Bliss Taffel, Kacy Anne Hill")
+        self.add("J/Nectar/Like You Do.mp3", seconds=2.0,
+                 title="Like You Do", artist=long_credit, album="Nectar")
+        scan.scan(self.con, self.lib)
+        client = StubMB(search=[])
+        enrich.enrich_track(self.con, self.row("Like You Do"), client)
+        tried = [call[0] for call in client.search_calls]
+        self.assertEqual(tried[0], long_credit)   # the whole string first
+        self.assertIn("Joji", tried)              # then the primary credit
+
+    def test_matching_on_the_primary_credit_replaces_the_writer_list(self):
+        long_credit = "Joji, Kurtis McKenzie, Linden Jay, Kacy Anne Hill"
+        self.add("J/Nectar/Like You Do.mp3", seconds=2.0,
+                 title="Like You Do", artist=long_credit, album="Nectar")
+        scan.scan(self.con, self.lib)
+
+        class OnlyPrimary(StubMB):
+            """Answers the narrow query and nothing else, like a real index."""
+
+            def search(self, artist, title, duration=None, limit=5):
+                self.search_calls.append((artist, title, duration))
+                if artist != "Joji":
+                    return []
+                return [recording("r1", "Like You Do", ["Joji"],
+                                  album="Nectar", date="2020-09-25",
+                                  length=2.0, isrc="USUM72016000")]
+
+        self.assertEqual(
+            enrich.enrich_track(self.con, self.row("Like You Do"),
+                                OnlyPrimary()), "applied")
+        row = self.row("Like You Do")
+        self.assertEqual(row["artist"], "Joji")
+        self.assertEqual(row["isrc"], "USUM72016000")
+        # album_artist was empty, so it is filled - which is what the path
+        # template reads, so the seven-name folder stops being generated.
+        self.assertEqual(row["album_artist"], "Joji")
+        self.assertEqual(row["album"], "Nectar")
+
+    def test_an_ampersand_artist_is_tried_whole_before_it_is_split(self):
+        # "Simon & Garfunkel" is one artist the credit splitter halves.
+        self.add("S/Album/Blue.mp3", seconds=2.0, title="Blue",
+                 artist="Simon & Garfunkel")
+        scan.scan(self.con, self.lib)
+        client = StubMB(search=[])
+        enrich.enrich_track(self.con, self.row("Blue"), client)
+        self.assertEqual(client.search_calls[0][0], "Simon & Garfunkel")
+
     def test_an_ascii_title_costs_exactly_one_request(self):
         self.add("A/Album/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha")
         scan.scan(self.con, self.lib)

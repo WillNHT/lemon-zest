@@ -682,13 +682,25 @@ def _search_terms(row):
     return artist, title
 
 
+# Enough attempts to cover the spellings that actually occur, few enough
+# that a stubborn track cannot cost half a minute of a rate-limited run.
+MAX_ATTEMPTS = 4
+
+
 def _search_attempts(row):
     """Spellings of one track to try, in order, until something matches.
 
     A search is a string comparison inside somebody else's index, so the
-    exact spelling decides whether there is a hit at all. Two rewrites are
-    worth a second request:
+    exact spelling decides whether there is a hit at all. Three rewrites earn
+    their extra request:
 
+      * **the primary credit alone.** An art track's `artist` is every
+        credited writer - "Joji, Kurtis McKenzie, Linden Jay, Chelsea Lena,
+        George Miller, Joshua Bliss Taffel, Kacy Anne Hill" is one field, and
+        one folder - and no index has an artist by that name. The full string
+        is still tried first, because splitting is not always right: "Simon &
+        Garfunkel" is one artist that the credit splitter happily halves, and
+        the whole string is what matches it.
       * **without the parenthetical.** A download titled "時間がない (Jikanga
         Nai)" carries a romanisation the database does not; dropping it is
         the difference between no result and the right one.
@@ -696,19 +708,32 @@ def _search_attempts(row):
         are the same characters to a reader and different bytes to a search
         index.
 
-    Only spellings that actually differ are tried, so a plain ASCII title
-    still costs exactly one request.
+    Only spellings that actually differ are tried, so an ordinary track with
+    one artist and an ASCII title still costs exactly one request.
     """
     artist, title = _search_terms(row)
     if not title:
         return []
-    seen, out = set(), []
-    for cand in (title,
-                 _PARENTHETICAL.sub("", title).strip(),
-                 _SPACE.sub(" ", unicodedata.normalize("NFKC", title)).strip()):
-        if cand and cand not in seen:
-            seen.add(cand)
-            out.append((artist, cand))
+
+    names = credits(artist)
+    primary = names[0] if names else artist
+    # The narrower artist is what the title rewrites are paired with: by the
+    # time we are reaching for them the wide string has already failed.
+    titles = [title,
+              _PARENTHETICAL.sub("", title).strip(),
+              _SPACE.sub(" ", unicodedata.normalize("NFKC", title)).strip()]
+
+    out, seen = [], set()
+    for pair in ([(artist, title), (primary, title)]
+                 + [(primary, t) for t in titles[1:]]):
+        cand_artist, cand_title = pair
+        key = (fold(cand_artist), fold(cand_title))
+        if not cand_title or key in seen:
+            continue
+        seen.add(key)
+        out.append((cand_artist, cand_title))
+        if len(out) >= MAX_ATTEMPTS:
+            break
     return out
 
 
