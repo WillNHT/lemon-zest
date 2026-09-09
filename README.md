@@ -27,6 +27,22 @@ Lemon Zest rewrites playlists in place, so syncing once collapses them back.
 
 ## Install
 
+### The Windows executable
+
+Download `lemon-zest-<version>-windows-x64.exe` from the
+[latest release](https://github.com/WillNHT/lemon-zest/releases/latest). It
+is one self-contained file — no Python, no install step. Double-click it to
+open the interface, or run it from a terminal to use the CLI:
+
+```
+lemon-zest-1.0.0-windows-x64.exe doctor "D:/Music"
+```
+
+The binary is unsigned, so Windows SmartScreen will warn on first run;
+*More info -> Run anyway* is the way past it.
+
+### From source
+
 Needs Python 3.10+. `ffmpeg` is optional for now (the test suite uses it to
 generate audio; the MVP does no transcoding).
 
@@ -198,3 +214,32 @@ there is nothing behind them to show. Nothing in the core knows the
 interface exists — the planner and executor communicate through plain dicts
 and an event callback — so a Tauri or Electron shell could replace the
 browser later without touching them.
+
+## Releasing
+
+The version number is not typed anywhere by hand. Every commit subject
+follows [Conventional Commits](https://www.conventionalcommits.org):
+
+```
+feat(playlists): write playlists under the device's own filename
+fix(sync): resolve a destination's on-disk spelling before writing it
+docs: how a device's playlist naming is detected and honoured
+```
+
+CI rejects a pull request whose commits do not parse. On a push to `master`,
+[python-semantic-release](https://python-semantic-release.readthedocs.io)
+reads the subjects since the last tag and derives the next
+[semantic version](https://semver.org): a `fix` bumps the patch, a `feat`
+the minor, a `!` or a `BREAKING CHANGE:` footer the major, and a history of
+nothing but `docs`/`chore`/`ci` releases nothing at all. It then bumps both
+copies of the number, writes the changelog, tags, and opens the GitHub
+release. A second job builds the executable from that tag, smoke-tests it,
+and attaches it.
+
+To build the executable yourself:
+
+```bash
+pip install -e . -r packaging/requirements-build.txt
+pyinstaller --clean --noconfirm packaging/lemon-zest.spec
+python packaging/smoke_test.py dist/lemon-zest.exe
+```

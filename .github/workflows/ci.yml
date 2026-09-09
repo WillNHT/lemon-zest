@@ -1,0 +1,99 @@
+# What every push and pull request has to survive.
+#
+# Three separate questions, kept as separate jobs so a failure names itself:
+# are the commit messages parseable as Conventional Commits (semantic-release
+# reads them to decide the next version, so an unparseable one silently
+# ships nothing), do the tests pass on the platforms people run this on, and
+# does the executable still build and start.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit-messages:
+    name: conventional commits
+    runs-on: ubuntu-latest
+    # Only a pull request has a well-defined range of new commits to check;
+    # on master the history is already merged and rewriting it is not on
+    # the table.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check each commit against the Conventional Commits grammar
+        run: |
+          base='${{ github.event.pull_request.base.sha }}'
+          head='${{ github.event.pull_request.head.sha }}'
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9._/-]+\))?!?: .+'
+          bad=0
+          while IFS= read -r sha; do
+            subject=$(git log -1 --format=%s "$sha")
+            # A merge commit is written by GitHub, not by a person.
+            if [ "$(git rev-list --parents -n 1 "$sha" | wc -w)" -gt 2 ]; then
+              continue
+            fi
+            if ! printf '%s' "$subject" | grep -Eq "$pattern"; then
+              echo "::error::not a conventional commit: ${sha:0:8} $subject"
+              bad=1
+            fi
+          done < <(git rev-list "$base..$head")
+          if [ "$bad" -ne 0 ]; then
+            echo "Expected: type(optional scope)!: subject"
+            echo "Types: build chore ci docs feat fix perf refactor revert style test"
+            exit 1
+          fi
+          echo "all commits parse"
+
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e . pytest
+      - run: python -m pytest -q
+
+  build:
+    name: executable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e . -r packaging/requirements-build.txt
+      - run: pyinstaller --clean --noconfirm packaging/lemon-zest.spec
+      # A build can succeed and still ship a binary that dies on its first
+      # import, or serves a 404 for its own interface. Start it and ask.
+      - run: python packaging/smoke_test.py dist/lemon-zest.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemon-zest-${{ matrix.os }}
+          path: dist/lemon-zest.exe
+          if-no-files-found: error
