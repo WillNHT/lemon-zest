@@ -964,7 +964,10 @@ function renderImport() {
 
 function renderDownload() {
   const d = S.dl;
-  if (!d) return '<div class="empty"><span class="spin"></span></div>';
+  if (!d) {
+    return `<div class="empty"><span class="spin"></span>
+      <div style="margin-top:8px">Checking what is installed...</div></div>`;
+  }
   const cfg = d.config, ck = d.cookies;
   const js = d.js_runtime || { found: [], chosen: null, detail: '' };
   const bn = d.bundled || { frozen: false, tools: {} };
@@ -1918,10 +1921,15 @@ document.addEventListener('click', (ev) => {
     }
     if (d.arg === 'problems') {
       S.problems = null;
+      render();
       return guard(async () => { S.problems = await api('/problems'); });
     }
     if (d.arg === 'download') {
       S.dlProbe = null;
+      // Painted first, loaded second: the config asks yt-dlp its version and
+      // looks for a JavaScript runtime, and a click that waits on both is a
+      // click that feels broken.
+      render();
       return guard(loadDownload);
     }
     return render();

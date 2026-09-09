@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for the standalone Lemon Zest executable.
+"""PyInstaller spec for the standalone Lemon Zest build.
 
 Build it from the repository root:
 
     pip install -e . -r packaging/requirements-build.txt
     pyinstaller --clean --noconfirm packaging/lemon-zest.spec
+    python packaging/make_zip.py            # what the release ships
 
-The result is dist/lemon-zest.exe on Windows, dist/lemon-zest elsewhere.
+The result is a folder, dist/lemon-zest/, with lemon-zest.exe at the top of
+it. A folder rather than one file because of what travels with it: ffmpeg,
+Deno and yt-dlp are a quarter of a gigabyte, and a onefile build unpacks
+every byte of that into a temporary directory on **every** launch, which
+turns a double-click into a five-second wait. Unpacked once, by whoever
+extracts the zip, it starts immediately and every launch after is free.
 
 Everything the build needs to know is derived here rather than passed in, so
 the same command works on a laptop and on a CI runner: the version comes
@@ -112,9 +118,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    # exclude_binaries: the libraries and the bundled tools are collected
+    # beside the executable rather than packed inside it. This is what makes
+    # the build a folder, and what makes it start instantly.
+    exclude_binaries=True,
     name="lemon-zest",
     debug=False,
     bootloader_ignore_signals=False,
@@ -129,4 +136,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version=VERSION_FILE,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name="lemon-zest",
 )

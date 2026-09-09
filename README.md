@@ -29,15 +29,20 @@ Lemon Zest rewrites playlists in place, so syncing once collapses them back.
 
 ### The Windows executable
 
-Download `lemon-zest-<version>-windows-x64.exe` from the
-[latest release](https://github.com/WillNHT/lemon-zest/releases/latest). It
-is one self-contained file — no Python, no install step, **and nothing else
-to install**. Double-click it to open the interface, or run it from a
-terminal to use the CLI:
+Download `lemon-zest-<version>-windows-x64.zip` from the
+[latest release](https://github.com/WillNHT/lemon-zest/releases/latest),
+extract it anywhere, and run `lemon-zest.exe` from the extracted folder. No
+Python, no install step, **and nothing else to install**. Double-click it to
+open the interface, or run it from a terminal to use the CLI:
 
 ```
-lemon-zest-1.0.0-windows-x64.exe doctor "D:/Music"
+lemon-zest.exe doctor "D:/Music"
 ```
+
+A folder rather than a single .exe on purpose: everything below travels
+with it, and a onefile build would unpack a quarter of a gigabyte into a
+temporary directory on every launch. Keep the folder together — the .exe
+on its own is not the program.
 
 Everything downloading and identifying needs travels inside it:
 
@@ -48,8 +53,8 @@ Everything downloading and identifying needs travels inside it:
 | `deno` | YouTube signs its media URLs with a JavaScript challenge that has to be run; without a runtime every video fails |
 | `fpcalc` | Chromaprint, for identifying a file by sound. Still needs a free AcoustID key |
 
-That is what makes the executable large (around 140 MB) and its first
-launch a few seconds slow: a onefile build unpacks itself on every start.
+That is what makes the download large — roughly 100 MB zipped, 350 MB
+extracted. It starts instantly, because nothing is unpacked at launch.
 `lemon-zest.exe tools` prints what it found and where each one came from.
 
 A copy of any of these already on PATH is still preferred for yt-dlp, so
@@ -603,13 +608,21 @@ reads the subjects since the last tag and derives the next
 the minor, a `!` or a `BREAKING CHANGE:` footer the major, and a history of
 nothing but `docs`/`chore`/`ci` releases nothing at all. It then bumps both
 copies of the number, writes the changelog, tags, and opens the GitHub
-release. A second job builds the executable from that tag, smoke-tests it,
-and attaches it.
+release. A second job builds from that tag, smoke-tests the result, zips it
+and attaches the archive.
 
-To build the executable yourself:
+To build it yourself:
 
 ```bash
 pip install -e . -r packaging/requirements-build.txt
 pyinstaller --clean --noconfirm packaging/lemon-zest.spec
-python packaging/smoke_test.py dist/lemon-zest.exe
+python packaging/smoke_test.py dist/lemon-zest/lemon-zest.exe
+python packaging/make_zip.py
 ```
+
+The build downloads ffmpeg, Deno and fpcalc into `build/tools` and folds
+them in; they are cached under `build/tools-cache`, so only the first build
+pays for them. `LEMONZEST_TOOLS_DIR=/somewhere` uses binaries you supply
+instead, for a build that cannot reach the network. The smoke test runs the
+result with PATH stripped to the system directories, so a machine that
+happens to have ffmpeg installed cannot make a broken bundle look fine.

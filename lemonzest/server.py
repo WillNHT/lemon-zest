@@ -1118,8 +1118,24 @@ def create_app(db_path=None):
     return app
 
 
+def _warm(app):
+    """Fill the caches the first page view would otherwise wait on.
+
+    One thread, at startup, doing what the download page used to do inside
+    the click that opened it.
+    """
+    def work():
+        try:
+            dl_mod.warm_cache()
+        except Exception:      # noqa: BLE001 - a warm cache is an optimisation
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+    return app
+
+
 def serve(db_path=None, host="127.0.0.1", port=7777, open_browser=True):
-    app = create_app(db_path)
+    app = _warm(create_app(db_path))
     if open_browser:
         import webbrowser
         threading.Timer(

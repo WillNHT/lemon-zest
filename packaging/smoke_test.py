@@ -7,6 +7,9 @@ So: run the CLI, then start the interface against a throwaway catalog and
 ask it for a page and an API response.
 
 Called as: smoke_test.py <path-to-exe>
+
+The path is the executable inside the built folder,
+``dist/lemon-zest/lemon-zest.exe``.
 """
 import json
 import os
@@ -19,7 +22,7 @@ import time
 import urllib.error
 import urllib.request
 
-TIMEOUT = 60  # generous: a onefile build unpacks itself on every start
+TIMEOUT = 60  # generous: a cold start on a CI runner is not a fast one
 
 
 def free_port():
@@ -111,10 +114,10 @@ def get(url):
 def stop(proc):
     """Stop the server and everything it spawned.
 
-    A onefile build is two processes: the bootloader that unpacked the
-    program, and the child that is actually running it. Signalling only the
-    parent leaves the child alive holding the .exe open, and the next build
-    then fails to overwrite it - so take down the whole tree.
+    The binary spawns children of its own - it re-runs itself as yt-dlp -
+    and signalling only the parent can leave one alive holding the .exe
+    open, after which the next build fails to overwrite it. Take down the
+    whole tree.
     """
     if proc.poll() is not None:
         return
