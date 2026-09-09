@@ -36,6 +36,7 @@ from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
 from .meta import content_key
+from .paths import resolve_existing
 
 # One field, three spellings. MP4 uses four-character atoms, ID3 uses frame
 # classes, Vorbis comments use plain names - and none of them agree.
@@ -123,8 +124,15 @@ def write(path, fields, cover=None):
     fields = {k: v for k, v in (fields or {}).items() if v not in (None, "")}
     if not fields and not cover:
         return None
-    if not os.path.isfile(path):
+    # The catalog stores NFC; NTFS stores whatever bytes wrote the file, and
+    # a yt-dlp download can be NFD. Same name on screen, different bytes to
+    # open(), so the stored path opens nothing and the write fails with "no
+    # such file" over a file that is plainly sitting there. Resolve to the
+    # spelling the filesystem actually has before touching anything.
+    real = resolve_existing(path)
+    if not real or not os.path.isfile(real):
         raise TagWriteError(f"no such file: {path}")
+    path = real
 
     directory = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".lz-tag-",
