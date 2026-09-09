@@ -28,7 +28,8 @@ import tempfile
 
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TSRC
+from mutagen.id3 import (APIC, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK,
+                         TSRC)
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus

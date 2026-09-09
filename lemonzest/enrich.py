@@ -391,9 +391,11 @@ def fingerprint(path, command=None):
     except (OSError, subprocess.SubprocessError) as exc:
         raise FingerprintError(str(exc)) from exc
     if out.returncode != 0:
-        raise FingerprintError((out.stderr or "").strip().splitlines()[-1:]
-                               and out.stderr.strip().splitlines()[-1]
-                               or f"fpcalc exited {out.returncode}")
+        # The last line of stderr is fpcalc's own complaint; the exit code
+        # is all there is to say when it did not make one.
+        lines = (out.stderr or "").strip().splitlines()
+        raise FingerprintError(lines[-1] if lines
+                               else f"fpcalc exited {out.returncode}")
     try:
         data = json.loads(out.stdout)
         return float(data["duration"]), data["fingerprint"]

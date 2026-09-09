@@ -1133,8 +1133,14 @@ def _print_organise(con, moves, skipped, limit):
         console.print(f"[dim]{m['src_rel']}[/]\n  [green]->[/] {m['dest_rel']}")
     if limit and len(moves) > limit:
         console.print(f"[dim]… {len(moves) - limit:,} more[/]")
-    console.print(f"\n{len(moves):,} to move, {skipped and len(skipped) or 0:,} "
-                  "skipped for having no artist to file them under")
+    console.print(f"\n{len(moves):,} to move, {len(skipped):,} left alone")
+    # Grouped by reason rather than listed: on a real library the same two
+    # reasons account for all of them, and the count is the useful part.
+    reasons = {}
+    for s in skipped:
+        reasons[s["why"]] = reasons.get(s["why"], 0) + 1
+    for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        console.print(f"  [dim]{n:,} — {why}[/]")
 
     affected = org_mod.affected_devices(con)
     if moves and affected:

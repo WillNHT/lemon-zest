@@ -38,6 +38,30 @@ def run_cli(exe, db):
     print("ok   cli --help")
 
 
+def run_subcommands(exe, db, workdir):
+    """Reach the modules --help never touches.
+
+    enrich, organise and tags are imported inside the command functions, so
+    they are not on the import path a --help run follows: the binary can be
+    missing all three and still print its help perfectly. These two commands
+    are read-only, need no network and no library, and fail loudly if a
+    module was left out of the build.
+    """
+    for args, needle in (
+        (["enrich", "status"], "tracks"),
+        (["organise", "plan", workdir], "already where"),
+    ):
+        out = subprocess.run([exe, "--db", db] + args, capture_output=True,
+                             text=True, timeout=TIMEOUT)
+        if out.returncode != 0:
+            raise SystemExit(f"{' '.join(args)} exited {out.returncode}\n"
+                             f"{out.stdout}{out.stderr}")
+        if needle not in out.stdout:
+            raise SystemExit(f"unexpected output from {' '.join(args)}:\n"
+                             f"{out.stdout}")
+        print(f"ok   cli {' '.join(args[:2])}")
+
+
 def get(url):
     with urllib.request.urlopen(url, timeout=5) as resp:
         return resp.status, resp.read()
@@ -110,6 +134,7 @@ def main():
     db = os.path.join(workdir, "smoke.db")
     try:
         run_cli(exe, db)
+        run_subcommands(exe, db, workdir)
         run_server(exe, db)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
