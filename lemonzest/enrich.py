@@ -78,7 +78,7 @@ MAX_DURATION_DELTA = 12.0
 # describing the file itself: a source knows about the recording, not about
 # where this copy came from.
 ENRICHABLE = ("title", "artist", "album", "album_artist",
-              "track_no", "disc_no", "year", "isrc")
+              "track_no", "disc_no", "year", "genre", "isrc")
 
 
 # ------------------------------------------------------------------ states
@@ -346,6 +346,31 @@ class MusicBrainz:
         data = self.get(f"isrc/{urllib.parse.quote(isrc)}",
                         inc="artist-credits+releases")
         return (data or {}).get("recordings") or []
+
+    def release_genres(self, release_id):
+        """The genres MusicBrainz records for a release, best first.
+
+        Genre is community-voted rather than editorial, and it hangs off the
+        release group more often than the release - an album's genre is a
+        property of the work, not of the Japanese CD pressing of it. So both
+        are asked for, in one request, and the counts decide.
+        """
+        data = self.get(f"release/{urllib.parse.quote(release_id)}",
+                        inc="genres+release-groups")
+        if not data:
+            return []
+        pools = [data.get("genres") or []]
+        group = data.get("release-group") or {}
+        pools.append(group.get("genres") or [])
+        by_name = {}
+        for pool in pools:
+            for g in pool:
+                name = (g.get("name") or "").strip()
+                if not name:
+                    continue
+                by_name[name] = max(by_name.get(name, 0), g.get("count") or 0)
+        return [n for n, _ in sorted(by_name.items(),
+                                     key=lambda kv: (-kv[1], kv[0]))]
 
     def recording(self, mbid):
         """One recording in full, by id. How a fingerprint result is read."""
@@ -677,6 +702,33 @@ def recording_fields(recording, prefer_album=None):
     return out
 
 
+# A genre lookup is one more rate-limited request per track, so it is only
+# spent where it changes anything: on a file whose own tag is empty. A file
+# that already says "Shibuya-kei" is not improved by MusicBrainz voting for
+# "pop", and the release it came from is asked about once either way.
+def _add_genre(client, cand, row):
+    """Fill the candidate's genre from MusicBrainz, when the file has none.
+
+    Never raises and never overwrites: a genre is the softest field in the
+    catalog, and losing a lookup to it would be absurd.
+    """
+    try:
+        if row["genre"]:
+            return
+    except (IndexError, KeyError):
+        pass
+    if not cand.get("release_id") or cand["release_fields"].get("genre"):
+        return
+    try:
+        names = client.release_genres(cand["release_id"])
+    except Exception:      # noqa: BLE001 - a genre is never worth a failure
+        return
+    if names:
+        # Title case, because that is how every other tagger writes them and
+        # a library sorted by genre should not hold "rock" and "Rock".
+        cand["release_fields"]["genre"] = names[0].title()
+
+
 def _best_candidate(records, row, album):
     """Pick the best of several recordings that all describe this track.
 
@@ -906,17 +958,27 @@ def _fingerprint_candidate(row, client, acoustid, fpcalc=None):
     return best, fp_score
 
 
-def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None):
+def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None,
+                 query=None):
     """Look one track up and store the best candidate. Returns its status.
 
     ``'applied'`` means the match was certain enough to write into the
     catalog on the spot; ``'candidate'`` means it wants a human; ``'none'``
     means nothing good enough came back.
+
+    ``query`` overrides what is searched for: ``{"artist", "title",
+    "album"}``, any of them. It is what the interface sends when a person
+    has looked at a wrong answer and can see why - "Song (Single Version)"
+    finds nothing, "Song" finds it. Given one, the automatic rewrites are
+    not tried and the ISRC shortcut is skipped: both exist to guess, and a
+    typed query is not a guess.
     """
     now = now or time.time()
     album = row["album"] if "album" in row.keys() else None
+    if query:
+        album = (query.get("album") or "").strip() or album
 
-    if row["isrc"]:
+    if row["isrc"] and not query:
         for rec in client.by_isrc(row["isrc"]):
             cand = recording_fields(rec, prefer_album=album)
             # An ISRC is an exact identifier, so the only check left is that
@@ -936,6 +998,7 @@ def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None):
                 full = client.recording(cand["mbid"]) if cand["mbid"] else None
                 if full:
                     cand = recording_fields(full, prefer_album=album)
+            _add_genre(client, cand, row)
             fields = {**cand["fields"], **cand["release_fields"]}
             _store(con, row["content_key"], "isrc", 1.0, fields,
                    cand["mbid"], cand["release_id"], now, "applied")
@@ -944,9 +1007,20 @@ def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None):
             return "applied"
 
     best, best_score = None, 0.0
-    for artist, title in _search_attempts(row):
+    # A typed query is also what the results are judged against. Scoring a
+    # hand-picked search against the file's own tags is what makes the box
+    # useless in the case it exists for: "Song (Single Version) [Official
+    # Video]" scores nothing against the "Song" it was told to look for.
+    judge = row
+    if query:
+        judge = {"title": query.get("title") or row["title"],
+                 "artist": query.get("artist") or row["artist"],
+                 "album_artist": query.get("artist") or row["album_artist"],
+                 "duration": row["duration"]}
+    for artist, title in (_query_attempts(query) if query
+                          else _search_attempts(row)):
         cand, s = _best_candidate(client.search(artist, title, row["duration"]),
-                                  row, album)
+                                  judge, album)
         if s > best_score:
             best, best_score = cand, s
         # A confident hit ends the ladder; the later spellings exist only
@@ -963,6 +1037,7 @@ def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None):
         except FingerprintError:
             cand, fp_score = None, 0.0
         if cand is not None:
+            _add_genre(client, cand, row)
             fields = {**cand["fields"], **cand["release_fields"]}
             # Audio and tags agreeing is the strongest evidence available;
             # audio alone still wants a person to look.
@@ -980,6 +1055,7 @@ def enrich_track(con, row, client, acoustid=None, fpcalc=None, now=None):
         con.commit()
         return "none"
 
+    _add_genre(client, best, row)
     fields = {**best["fields"], **best["release_fields"]}
     status = "applied" if best_score >= AUTO else "candidate"
     _store(con, row["content_key"], "musicbrainz", best_score, fields,
@@ -1011,6 +1087,20 @@ def _search_terms(row):
             if fold(artist or "") not in fold(row["title"] or ""):
                 return parsed_artist, parsed_title
     return artist, title
+
+
+def _query_attempts(query):
+    """What to search for when a person typed it. Their spelling, once.
+
+    One attempt, not four: the rewrites exist to recover from tags nobody
+    chose, and second-guessing a typed query would make the box that fixes
+    a bad match unable to reproduce one.
+    """
+    title = (query.get("title") or "").strip()
+    artist = (query.get("artist") or "").strip()
+    if not title:
+        return []
+    return [(artist or None, title)]
 
 
 # Enough attempts to cover the spellings that actually occur, few enough
@@ -1287,6 +1377,13 @@ def proposal_for(con, content_key):
         "current": {f: row[f] for f in ENRICHABLE},
         "proposed": json.loads(enr["fields"] or "{}") if enr else {},
         "overrides": overrides_for(con, content_key),
+        # What an automatic lookup would search for. Shown in the enrich
+        # dialog as the starting point for editing it: a person correcting
+        # a bad match needs to see the terms that produced it first.
+        "search": dict(zip(("artist", "title"), _search_terms(row)),
+                       album=row["album"]),
+        "album": row["album"],
+        "genre": row["genre"],
     }
 
 
@@ -1390,13 +1487,14 @@ def _note_error(counts, message, track=None):
 
 
 def _process(con, rows, client, acoustid, counts, write_tags, artwork,
-             progress):
+             progress, query=None):
     """The lookup loop. Shared by a whole-library run and a hand-picked one."""
     total = len(rows)
     consecutive = 0
     for i, row in enumerate(rows, 1):
         try:
-            status = enrich_track(con, row, client, acoustid=acoustid)
+            status = enrich_track(con, row, client, acoustid=acoustid,
+                                  query=query)
         except LookupError_ as exc:
             counts["failed"] += 1
             _note_error(counts, exc, row["rel_path"])
@@ -1545,7 +1643,7 @@ def _drop_skipped(con, rows, counts):
 
 def run_tracks(con, content_keys, client=None, write_tags=False, artwork=False,
                progress=None, contact=None, use_fingerprint=False,
-               acoustid=None):
+               acoustid=None, query=None):
     """Enrich a hand-picked set of files. Asking again, by hand.
 
     New files are identified automatically as they arrive - see
@@ -1563,6 +1661,10 @@ def run_tracks(con, content_keys, client=None, write_tags=False, artwork=False,
       * a **skipped** file is dropped rather than looked up, and counted, so
         the interface can say so. That is the whole promise of the state, and
         an explicit selection is exactly where it would otherwise be lost.
+
+    ``query`` replaces what is searched for, for every file in the set. It
+    is meant for one track at a time - the case it exists for is a person
+    looking at "Song (Single Version)" and knowing what to search instead.
     """
     cfg = get_config(con)
     client = client or MusicBrainz(contact=contact or cfg["contact"] or None)
@@ -1574,7 +1676,7 @@ def run_tracks(con, content_keys, client=None, write_tags=False, artwork=False,
     counts = _new_counts()
     wanted = _drop_skipped(con, tracks_for_keys(con, content_keys), counts)
     _process(con, wanted, client, acoustid, counts, write_tags, artwork,
-             progress)
+             progress, query=query)
     return counts
 
 

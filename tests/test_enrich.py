@@ -282,6 +282,105 @@ class EnrichTests(unittest.TestCase):
         return self.con.execute(
             "SELECT * FROM track WHERE rel_path LIKE ?", (f"%{like}%",)).fetchone()
 
+    # -- typed search terms, and genre -----------------------------------
+
+    def test_typed_terms_replace_the_search_and_are_used_verbatim(self):
+        """The "(Single Version)" case: the tags find nothing, the person can
+        see why, and what they type is what gets searched - once."""
+        self.add("Downloads/Song.mp3", seconds=2.0,
+                 title="Song (Single Version) [Official Video]",
+                 artist="Some Channel")
+        scan.scan(self.con, self.lib)
+        row = self.row("Song")
+
+        class Picky(StubMB):
+            def search(self, artist, title, duration=None, limit=5):
+                self.search_calls.append((artist, title, duration))
+                if (artist, title) != ("Alpha", "Song"):
+                    return []
+                return [recording("r1", "Song", ["Alpha"], album="First",
+                                  date="2001-01-01", length=2.0)]
+
+        client = Picky()
+        status = enrich.enrich_track(self.con, row, client,
+                                     query={"artist": "Alpha", "title": "Song",
+                                            "album": "First"})
+        self.assertEqual(status, "applied")
+        # Exactly one request: a typed query is not re-spelled four ways.
+        self.assertEqual(len(client.search_calls), 1)
+        self.assertEqual(client.search_calls[0][:2], ("Alpha", "Song"))
+        after = self.row("Song")
+        self.assertEqual(after["title"], "Song")
+        self.assertEqual(after["artist"], "Alpha")
+
+    def test_a_typed_query_skips_the_isrc_shortcut(self):
+        """An ISRC is an exact identifier, and a person typing a search has
+        just told us the exact answer is wrong."""
+        self.add("Tagged/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha",
+                 isrc="GBAAA0000001")
+        scan.scan(self.con, self.lib)
+        row = self.row("Blue")
+
+        client = StubMB(
+            by_isrc={"GBAAA0000001": [recording("r-isrc", "Wrong", ["Wrong"],
+                                                album="Wrong", length=2.0)]},
+            search=[recording("r2", "Blue", ["Alpha"], album="First",
+                              date="1999-01-01", length=2.0)])
+        enrich.enrich_track(self.con, row, client,
+                            query={"title": "Blue", "artist": "Alpha"})
+        self.assertEqual(client.isrc_calls, [])
+        self.assertEqual(self.row("Blue")["album"], "First")
+
+    def test_genre_is_taken_from_the_release_when_the_file_has_none(self):
+        self.add("Tagged/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha")
+        scan.scan(self.con, self.lib)
+        row = self.row("Blue")
+
+        class WithGenres(StubMB):
+            asked = []
+
+            def release_genres(self, release_id):
+                WithGenres.asked.append(release_id)
+                return ["shibuya-kei", "pop"]
+
+        client = WithGenres(search=[
+            recording("r1", "Blue", ["Alpha"], album="First",
+                      date="1999-01-01", length=2.0)])
+        enrich.enrich_track(self.con, row, client)
+        self.assertEqual(WithGenres.asked, ["rel-r1"])
+        # Title-cased, so a library sorted by genre does not hold two of them.
+        self.assertEqual(self.row("Blue")["genre"], "Shibuya-Kei")
+
+    def test_a_genre_already_in_the_file_is_left_alone_and_not_looked_up(self):
+        self.add("Tagged/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha",
+                 genre="City Pop")
+        scan.scan(self.con, self.lib)
+        row = self.row("Blue")
+
+        class Loud(StubMB):
+            def release_genres(self, release_id):
+                raise AssertionError("a tagged genre must not cost a request")
+
+        enrich.enrich_track(self.con, row, Loud(search=[
+            recording("r1", "Blue", ["Alpha"], album="First",
+                      date="1999-01-01", length=2.0)]))
+        self.assertEqual(self.row("Blue")["genre"], "City Pop")
+
+    def test_a_genre_lookup_that_fails_does_not_lose_the_match(self):
+        self.add("Tagged/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha")
+        scan.scan(self.con, self.lib)
+        row = self.row("Blue")
+
+        class Broken(StubMB):
+            def release_genres(self, release_id):
+                raise enrich.LookupError_("MusicBrainz returned 503")
+
+        status = enrich.enrich_track(self.con, row, Broken(search=[
+            recording("r1", "Blue", ["Alpha"], album="First",
+                      date="1999-01-01", length=2.0)]))
+        self.assertEqual(status, "applied")
+        self.assertIsNone(self.row("Blue")["genre"])
+
     # -- backfill ---------------------------------------------------------
 
     def test_backfill_copies_an_isrc_onto_an_untagged_twin(self):

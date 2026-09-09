@@ -31,12 +31,30 @@ Lemon Zest rewrites playlists in place, so syncing once collapses them back.
 
 Download `lemon-zest-<version>-windows-x64.exe` from the
 [latest release](https://github.com/WillNHT/lemon-zest/releases/latest). It
-is one self-contained file — no Python, no install step. Double-click it to
-open the interface, or run it from a terminal to use the CLI:
+is one self-contained file — no Python, no install step, **and nothing else
+to install**. Double-click it to open the interface, or run it from a
+terminal to use the CLI:
 
 ```
 lemon-zest-1.0.0-windows-x64.exe doctor "D:/Music"
 ```
+
+Everything downloading and identifying needs travels inside it:
+
+| Bundled | What it is for |
+| --- | --- |
+| `yt-dlp` | fetching audio. The binary re-runs itself as yt-dlp, so there is no `pip install` step |
+| `ffmpeg`, `ffprobe` | extracting the audio yt-dlp downloads |
+| `deno` | YouTube signs its media URLs with a JavaScript challenge that has to be run; without a runtime every video fails |
+| `fpcalc` | Chromaprint, for identifying a file by sound. Still needs a free AcoustID key |
+
+That is what makes the executable large (around 140 MB) and its first
+launch a few seconds slow: a onefile build unpacks itself on every start.
+`lemon-zest.exe tools` prints what it found and where each one came from.
+
+A copy of any of these already on PATH is still preferred for yt-dlp, so
+one you keep updated wins over the bundled release. `LEMONZEST_TOOLS_DIR`
+points a build at binaries you supply instead of downloading them.
 
 The binary is unsigned, so Windows SmartScreen will warn on first run;
 *More info -> Run anyway* is the way past it.
@@ -242,10 +260,10 @@ lemon-zest enrich config --acoustid-key <key>   # free: acoustid.org/new-applica
 lemon-zest enrich run --fingerprint
 ```
 
-`fpcalc` is located rather than bundled, the same way `yt-dlp` and `ffmpeg`
-are: it keeps an LGPL binary out of the distribution and lets it be upgraded
-on its own schedule. Dropping `fpcalc.exe` beside `lemon-zest.exe` works too.
-`enrich config` says what is missing.
+The packaged executable already carries `fpcalc`, so on Windows only the
+key is missing there. From source it is located on PATH, and dropping
+`fpcalc.exe` beside `lemon-zest.exe` works too. `enrich config` says what is
+missing, and `lemon-zest tools` says what was found.
 
 How much of a fingerprint match is applied still depends on the tags, even
 though getting there did not. Audio and tags agreeing is the strongest
@@ -317,6 +335,21 @@ Enrichment is automatic, so most of the time there is nothing to press: the
 selection is for asking again, correcting by hand, or skipping. The
 **Metadata** chips above the table filter to one state, so "show me the 23
 awaiting review" is one click.
+
+**Enrich** on a single track shows the terms the lookup will send — artist,
+title, album — and lets them be typed over. That box is the answer to the
+match that found nothing: MusicBrainz has *Song*, the file is called *Song
+(Single Version) [Official Video]*, and no amount of scoring recovers that.
+Edited terms are searched exactly as typed, once, and the results are judged
+against them rather than against the file's own tags; the automatic
+rewrites, and the ISRC shortcut, are both skipped, because they exist to
+guess and you have just said what the answer is. Over a selection the box
+is not offered: one query cannot describe forty tracks.
+
+Genre comes from the release when the file has none — MusicBrainz records it
+per release and per release group, and the votes decide. It is only asked
+for when the tag is empty, so a file that already says *City Pop* keeps it
+and costs no extra request.
 
 **Edit metadata** opens on one track with three tiers side by side — what the
 catalog says now, what the source proposed (click a proposal to drop it into
@@ -403,6 +436,25 @@ collects everything worth a second look in one place:
 empty files (zero bytes on disk - failed downloads, which Lemon Zest refuses to
 copy rather than putting dead entries on the card), untagged files, and
 playlist entries that resolve to nothing.
+
+**Inbox** is what a library page cannot be: everything the catalog has
+indexed since you last emptied it, newest first, with when each file
+arrived. Downloads and scanned files land there, automatic identification
+runs on them as they arrive, and the inbox is where you see what it did -
+six tracks that came in this morning are otherwise six rows in the middle
+of an alphabet. *Mark all as seen* moves a watermark; it deletes nothing
+and no row leaves the library.
+
+Clicking a row opens an inspector beside the table: the artwork the file
+itself carries (a downloaded video frame included, which is the reason to
+look), every field including the ones the table has no room for, the full
+path, when it arrived and when the file was last modified, and where its
+values came from.
+
+**Scan & import** lists the library folders. Each one can be rescanned,
+**hidden** - still indexed, but out of the library, the facets and the
+inbox - or **removed**, which forgets its rows. Neither deletes a file, and
+a removed folder comes back by scanning it again.
 
 ## What it guarantees
 

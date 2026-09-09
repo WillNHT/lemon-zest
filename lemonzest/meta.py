@@ -153,3 +153,70 @@ def probe(path):
            "content_key": content_key(path, st.st_size)}
     rec.update(read_tags(path))
     return rec
+
+
+def artwork(path):
+    """The picture embedded in ``path``, as ``(bytes, mime)``, or None.
+
+    Every container hides it somewhere different - an ID3 APIC frame, an
+    MP4 ``covr`` atom, a FLAC picture block, a base64 Vorbis comment - and
+    the interface only wants the first one it can show. Read on demand
+    rather than cached in the catalog: artwork is between one and ten
+    megabytes a file, and a library of two thousand of them is not a thing
+    to keep in SQLite.
+    """
+    try:
+        mf = MutagenFile(path)
+    except Exception:
+        return None
+    if mf is None:
+        return None
+
+    # FLAC and anything else exposing pictures directly.
+    for pic in (getattr(mf, "pictures", None) or []):
+        data = getattr(pic, "data", None)
+        if data:
+            return data, getattr(pic, "mime", None) or "image/jpeg"
+
+    tags = getattr(mf, "tags", None)
+    if not tags:
+        return None
+
+    # MP4/M4A: the covr atom carries its format in a flag.
+    try:
+        covr = tags.get("covr")
+    except Exception:
+        covr = None
+    if covr:
+        first = covr[0]
+        fmt = getattr(first, "imageformat", None)
+        mime = "image/png" if fmt == 14 else "image/jpeg"
+        return bytes(first), mime
+
+    # ID3: any APIC frame, front cover preferred.
+    try:
+        apics = tags.getall("APIC")
+    except Exception:
+        apics = []
+    if apics:
+        front = next((a for a in apics if getattr(a, "type", 3) == 3), apics[0])
+        if front.data:
+            return front.data, front.mime or "image/jpeg"
+
+    # Vorbis comments: a base64 FLAC picture block in a text field.
+    try:
+        blocks = tags.get("metadata_block_picture") or []
+    except Exception:
+        blocks = []
+    for block in blocks:
+        try:
+            import base64
+
+            from mutagen.flac import Picture
+
+            pic = Picture(base64.b64decode(block))
+        except Exception:
+            continue
+        if pic.data:
+            return pic.data, pic.mime or "image/jpeg"
+    return None

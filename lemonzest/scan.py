@@ -29,12 +29,18 @@ def walk_audio(root):
 
 
 def _upsert(con, root, npath, rec, now):
-    """Write one probed file into the catalog."""
+    """Write one probed file into the catalog.
+
+    ``added_at`` is written on insert and never updated: it is what the
+    inbox reads, and a rescan re-probing an edited file must not make that
+    file new again.
+    """
     rel = norm(os.path.relpath(npath, root))
-    cols = ["path", "rel_path", "root", "seen_at"] + TRACK_FIELDS
-    vals = [npath, rel, root, now] + [rec[f] for f in TRACK_FIELDS]
+    cols = ["path", "rel_path", "root", "seen_at", "added_at"] + TRACK_FIELDS
+    vals = [npath, rel, root, now, now] + [rec[f] for f in TRACK_FIELDS]
     placeholders = ",".join("?" * len(cols))
-    updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "path")
+    updates = ",".join(f"{c}=excluded.{c}" for c in cols
+                       if c not in ("path", "added_at"))
     con.execute(
         f"INSERT INTO track({','.join(cols)}) VALUES ({placeholders}) "
         f"ON CONFLICT(path) DO UPDATE SET {updates}",

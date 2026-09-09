@@ -138,12 +138,23 @@ def set_config(con, **changes):
 def ytdlp_command():
     """How to invoke yt-dlp here, or None when it is not installed.
 
-    A yt-dlp on PATH wins; otherwise the module inside this interpreter is
-    used, which is what ``pip install lemon-zest[youtube]`` leaves behind.
+    A yt-dlp on PATH wins, so one the user keeps updated is used in
+    preference to ours. Then the copy inside the packaged executable, which
+    is reached by re-running the binary with ``--yt-dlp`` - a frozen build
+    has no ``-m`` to call. Then the module in this interpreter, which is
+    what ``pip install lemon-zest[youtube]`` leaves behind.
     """
+    from . import bundled
+
     exe = shutil.which("yt-dlp")
     if exe:
         return [exe]
+    if bundled.frozen():
+        try:
+            import yt_dlp  # noqa: F401
+        except Exception:
+            return None
+        return [sys.executable, "--yt-dlp"]
     try:
         import yt_dlp  # noqa: F401
     except Exception:

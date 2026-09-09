@@ -23,6 +23,7 @@ HERE = SPECPATH
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+import fetch_tools  # noqa: E402
 import stage_frontend  # noqa: E402
 import version_info  # noqa: E402
 
@@ -48,6 +49,19 @@ if sys.platform == "win32":
 # with the binary under the package path the server looks in.
 datas = [(WORK, os.path.join("lemonzest", "web"))]
 
+# ffmpeg, Deno and fpcalc, downloaded at build time and folded in whole.
+# They are the difference between "install these three first" and a binary
+# that works on a machine with nothing on it: lemonzest.bundled puts this
+# folder at the front of PATH at startup, and yt-dlp finds them there.
+#
+# They go in as binaries rather than datas so PyInstaller treats them as
+# executables on the platforms where that matters, and land under `tools`,
+# which is the one name lemonzest.bundled looks for.
+TOOLS = os.path.join(ROOT, "build", "tools")
+binaries = [(path, fetch_tools.TOOLS_DEST) for path in fetch_tools.stage(TOOLS)]
+if not binaries:
+    print("WARNING: no bundled tools staged - this build needs ffmpeg on PATH")
+
 # Flask and Click are imported directly; the rest are pulled in by name at
 # runtime and would otherwise be missed by the import graph.
 hiddenimports = [
@@ -68,6 +82,10 @@ hiddenimports = [
     "mutagen.oggopus",
     "mutagen.oggvorbis",
     "psutil",
+    # Bundled rather than expected on PATH: the executable re-runs itself
+    # with --yt-dlp and becomes it. Nothing imports it at module scope, so
+    # the import graph would not find it.
+    "yt_dlp",
 ]
 
 excludes = [
@@ -80,7 +98,7 @@ excludes = [
 a = Analysis(
     [os.path.join(HERE, "entry.py")],
     pathex=[ROOT],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

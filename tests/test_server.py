@@ -94,6 +94,107 @@ class ServerTests(unittest.TestCase):
         albums = [x["value"] for x in d["album"]]
         self.assertEqual(albums, ["Album"])
 
+    # ------------------------------------------------------------ inbox
+
+    def test_inbox_holds_everything_scanned_until_it_is_emptied(self):
+        d = self.c.get("/api/library?new=1&order=added").get_json()
+        self.assertEqual(d["total"], 4)
+        self.assertEqual(self.c.get("/api/stats").get_json()["inbox"], 4)
+
+        self.assertEqual(self.c.post("/api/inbox/seen").status_code, 200)
+        self.assertEqual(
+            self.c.get("/api/library?new=1").get_json()["total"], 0)
+        self.assertEqual(self.c.get("/api/stats").get_json()["inbox"], 0)
+        # Emptying the inbox is a watermark, not a deletion.
+        self.assertEqual(self.c.get("/api/library").get_json()["total"], 4)
+
+    def test_a_file_added_after_the_inbox_was_emptied_is_new_again(self):
+        self.c.post("/api/inbox/seen")
+        make_mp3(os.path.join(self.lib, "Beta", "Album", "05 Later.mp3"),
+                 frames=44, artist="Beta", album="Album", title="Later",
+                 track=5)
+        con = db.connect(self.db_path)
+        scan.scan(con, self.lib)
+        con.close()
+
+        d = self.c.get("/api/library?new=1&order=added").get_json()
+        self.assertEqual(d["total"], 1)
+        self.assertEqual(d["tracks"][0]["title"], "Later")
+
+    def test_rescanning_an_unchanged_library_adds_nothing_to_the_inbox(self):
+        self.c.post("/api/inbox/seen")
+        con = db.connect(self.db_path)
+        scan.scan(con, self.lib)
+        con.close()
+        self.assertEqual(
+            self.c.get("/api/library?new=1").get_json()["total"], 0)
+
+    # --------------------------------------------------- library folders
+
+    def test_roots_report_what_is_in_them(self):
+        rows = self.c.get("/api/roots").get_json()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tracks"], 4)
+        self.assertFalse(rows[0]["hidden"])
+
+    def test_hiding_a_folder_takes_it_out_of_every_view(self):
+        root = self.c.get("/api/roots").get_json()[0]["root"]
+        self.c.post("/api/roots/hide", json={"root": root, "hidden": True})
+
+        self.assertEqual(self.c.get("/api/library").get_json()["total"], 0)
+        self.assertEqual(self.c.get("/api/library?new=1").get_json()["total"], 0)
+        self.assertEqual(self.c.get("/api/facets").get_json()["artist"], [])
+        stats = self.c.get("/api/stats").get_json()
+        self.assertEqual(stats["tracks"], 0)
+        self.assertNotIn(root, stats["roots"])
+        self.assertTrue(stats["root_detail"][0]["hidden"])
+
+        # Hiding forgets nothing: unhiding brings the library straight back.
+        self.c.post("/api/roots/hide", json={"root": root, "hidden": False})
+        self.assertEqual(self.c.get("/api/library").get_json()["total"], 4)
+
+    def test_removing_a_folder_forgets_rows_and_keeps_the_files(self):
+        root = self.c.get("/api/roots").get_json()[0]["root"]
+        out = self.c.post("/api/roots/remove", json={"root": root}).get_json()
+        self.assertEqual(out["tracks_removed"], 4)
+        self.assertEqual(out["roots"], [])
+        self.assertEqual(self.c.get("/api/library").get_json()["total"], 0)
+        for f in self.files:
+            self.assertTrue(os.path.exists(f), f)
+
+    def test_removing_a_folder_needs_one(self):
+        self.assertEqual(
+            self.c.post("/api/roots/remove", json={}).status_code, 400)
+
+    # --------------------------------------------- artwork and searching
+
+    def test_artwork_is_a_404_when_the_file_carries_none(self):
+        key = self.c.get("/api/library").get_json()["tracks"][0]["content_key"]
+        self.assertEqual(self.c.get("/api/art/" + key).status_code, 404)
+        self.assertEqual(self.c.get("/api/art/nosuchkey").status_code, 404)
+
+    def test_track_detail_says_what_a_lookup_would_search_for(self):
+        track = self.c.get("/api/library?q=Three").get_json()["tracks"][0]
+        d = self.c.get("/api/enrich/track/" + track["content_key"]).get_json()
+        self.assertEqual(d["search"]["title"], "Three")
+        self.assertEqual(d["search"]["artist"], "Beta")
+
+    def test_typed_search_terms_are_refused_over_a_selection(self):
+        keys = [t["content_key"]
+                for t in self.c.get("/api/library").get_json()["tracks"][:2]]
+        r = self.c.post("/api/enrich/run",
+                        json={"content_keys": keys,
+                              "query": {"title": "Something"}})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("one track at a time", r.get_json()["error"])
+
+    def test_a_typed_search_needs_a_title(self):
+        key = self.c.get("/api/library").get_json()["tracks"][0]["content_key"]
+        r = self.c.post("/api/enrich/run",
+                        json={"content_keys": [key],
+                              "query": {"artist": "Alpha", "title": "  "}})
+        self.assertEqual(r.status_code, 400)
+
     def test_problems_lists_the_empty_file(self):
         d = self.c.get("/api/problems").get_json()
         self.assertEqual(d["empty_total"], 1)

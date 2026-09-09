@@ -23,11 +23,14 @@
   --sel:        #f1e3d5;
   --sel-2:      #f6e7d8;
   --hover:      #e7e2d8;
-  --chrome:     linear-gradient(#fbf8f2, #e6dfd2);
-  --button:     linear-gradient(#fefdfa, #e4ded1);
-  --button-hi:  linear-gradient(#f2ece0, #d8d1c2);
-  --primary:    linear-gradient(#c1652b, #9c4718);
-  --primary-hi: linear-gradient(#ad5722, #8a3d13);
+  /* Solid colours throughout - no gradients anywhere in this file. A flat
+     ground reads the same at every zoom and on every panel, and the hairline
+     rules already do the work a gradient was faking. */
+  --chrome:     #efe9dd;
+  --button:     #f7f4ec;
+  --button-hi:  #e6e0d2;
+  --primary:    #9c4718;
+  --primary-hi: #85390f;
   --ok:         #3d5c40;
   --ok-bg:      #eef3ea;
   --ok-line:    #7f9c7a;
@@ -59,8 +62,15 @@ body { display: flex; align-items: stretch; justify-content: center; padding: 0;
   background: var(--paper);
   border: 1px solid var(--line-4);
   overflow: hidden;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.6);
-  user-select: none;
+}
+
+/* Text is selectable everywhere: a path, an error, a track title and a count
+   are all things people copy out. Controls are the exception - a button
+   label smearing into a highlight while you click through a list is noise,
+   not content. */
+#app, .modal { user-select: text; -webkit-user-select: text; }
+button, .btn, .chip, .row, .cell, .meter {
+  user-select: none; -webkit-user-select: none;
 }
 
 button, input, select { font: inherit; color: inherit; }
@@ -80,7 +90,6 @@ button { cursor: default; }
   display: grid; place-items: center; width: 20px; height: 20px;
   border: 1px solid #83431c; border-radius: 4px; color: #fbf1e6;
   background: var(--primary);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.28);
 }
 .brand .name {
   font-size: 13.5px; font-weight: 800; letter-spacing: .16em; color: var(--ink-2);
@@ -97,8 +106,7 @@ button { cursor: default; }
   display: flex; align-items: center; gap: 10px;
   border: 1px solid var(--line-2); border-radius: 4px;
   padding: 3px 8px;
-  background: linear-gradient(#fdfbf6, #f1ece1);
-  box-shadow: inset 0 1px 2px rgba(74,68,56,.09);
+  background: var(--paper-2);
 }
 .statusbox .label { font-weight: 600; font-size: 11px; color: var(--ink-2);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -200,12 +208,12 @@ button { cursor: default; }
 .btn {
   border: 1px solid var(--line-3); border-radius: 4px;
   padding: 3px 10px; color: #4a4438; background: var(--button);
-  font-size: 11px; white-space: nowrap;
+  font-size: 11px; white-space: nowrap; cursor: pointer;
 }
 .btn:hover:not(:disabled) { background: var(--button-hi); }
 .btn:disabled { opacity: .45; }
 .btn.primary { border-color: #83431c; color: #fbf1e6; background: var(--primary);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.25); font-weight: 600; }
+  font-weight: 600; }
 .btn.primary:hover:not(:disabled) { background: var(--primary-hi); }
 .btn.danger { border-color: var(--bad-line); color: var(--bad);
   background: var(--bad-bg); }
@@ -361,6 +369,39 @@ button { cursor: default; }
 .empty { padding: 40px 16px; text-align: center; color: var(--faint);
   font-size: 12px; }
 .empty h3 { font-size: 15px; color: var(--ink-2); margin-bottom: 6px; }
+
+/* ---------------------------------------------------------- inspector */
+
+/* The table and the one-track panel share the pane: the table keeps the
+   width it can use, the inspector takes a fixed column and stays put while
+   the rows scroll under it. */
+.withside { display: flex; align-items: flex-start; }
+.withside-main { flex: 1 1 auto; min-width: 0; }
+
+.inspector {
+  flex: 0 0 268px; align-self: stretch;
+  border-left: 1px solid var(--line-2); background: var(--paper-2);
+  position: sticky; top: 0;
+}
+.inspector .art {
+  display: grid; place-items: center;
+  aspect-ratio: 1 / 1; background: var(--white);
+  border-bottom: 1px solid var(--line);
+}
+.inspector .art img { width: 100%; height: 100%; object-fit: cover;
+  display: block; }
+.inspector .art .none-note { display: none; font: 9px var(--mono);
+  letter-spacing: .1em; text-transform: uppercase; color: var(--fainter); }
+.inspector .art.none { aspect-ratio: auto; padding: 18px 8px; }
+.inspector .art.none .none-note { display: block; }
+.inspector .in { padding: 10px 12px; }
+.inspector h3 { font-size: 13px; font-weight: 700; line-height: 1.25; }
+.inspector .kv { margin-top: 8px; }
+.inspector .kv dd { font-size: 11.5px; overflow-wrap: anywhere; }
+.inspector .path {
+  margin-top: 8px; font-size: 9.5px; color: var(--fainter);
+  overflow-wrap: anywhere;
+}
 
 /* -------------------------------------------------------------- modal */
 
