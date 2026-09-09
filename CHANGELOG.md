@@ -1,6 +1,174 @@
 # CHANGELOG
 
 
+## v0.2.0 (2026-09-09)
+
+### Bug Fixes
+
+- **download**: --print implies --quiet, so undo it
+  ([`8919b9b`](https://github.com/WillNHT/lemon-zest/commit/8919b9bc616ea01157a143450b5983a4ffb62a4a))
+
+The progress bar never moved on a real download and the log held nothing but warnings, errors and
+  the one line naming each finished file. The cause was our own command: --print implies --quiet as
+  well as --simulate, and while a WHEN prefix suppresses the --simulate half it leaves the quiet
+  half in place. yt-dlp was doing exactly as asked, and saying almost nothing.
+
+--no-quiet after the --print restores it. On one real video that is 14 progress lines where there
+  were none, parsing as (1024, 4185442, "Adam's Song"), plus twenty lines of extraction detail worth
+  having in a log.
+
+No stub could have caught this: a stub prints whatever it is written to print regardless of the
+  flags it is handed, which is exactly why the two things it cannot judge - what yt-dlp does with an
+  option, and when it flushes - both went wrong here. The test therefore asserts the flag is present
+  and ordered after --print, and the reasoning lives in a comment beside it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **download**: A resumed download finishes the job it started
+  ([`aa387dd`](https://github.com/WillNHT/lemon-zest/commit/aa387dd11e2d7c3b37f949f50bb77535bbff2e3c))
+
+Indexing happens after yt-dlp exits, so a run that is interrupted - and a sixty-track playlist gives
+  ample opportunity - leaves audio on disk and a line in the download archive, but no catalog row.
+  Running it again skips those files by design and reports them without naming them, so nothing ever
+  indexed them: they sat in the library folder, invisible to the catalog, the device set and every
+  playlist. Testing against a real playlist produced exactly that, fifteen tracks deep.
+
+When a run skips anything, it now rescans the library folder afterwards. That is stat-only for the
+  thousands of files that have not changed, and it is the one thing that cannot miss a file whose
+  name we were never told.
+
+The playlist gets the same treatment. Rather than adding what this run happened to fetch, it
+  resolves what the request asked for: the source is listed, each item's video id is matched against
+  the purl tag that --embed-metadata wrote and the scanner read, and the playlist is filled in the
+  source's own order. A resumed download therefore produces the whole playlist rather than the tail
+  of it. If the source cannot be listed, it falls back to this run's files, since a playlist missing
+  its older half still beats no playlist at all.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **download**: Ask yt-dlp not to buffer, so the log is live
+  ([`ecba8cd`](https://github.com/WillNHT/lemon-zest/commit/ecba8cd1f725f56d7f183152c9221735ac4797b0))
+
+On the first real playlist download the interface reported nothing for minutes at a time - no
+  progress, no files - while the audio was plainly landing on disk and the download archive was
+  growing. Python block-buffers stdout when it is a pipe rather than a terminal, so yt-dlp's output
+  reached Lemon Zest in 8 KB instalments: the progress bar sat still and the log looked empty until
+  enough text had accumulated to flush.
+
+PYTHONUNBUFFERED in the child's environment fixes it, next to the PYTHONIOENCODING that is already
+  there for the same class of reason.
+
+The existing tests could not have caught this, and neither could any test whose stub exits promptly,
+  because exiting flushes. The new one holds the pipe open after its first line and deliberately
+  does not flush it, then asserts the line arrived while the child was still running; it fails at
+  2.3s against the unfixed code.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **download**: Enable a JavaScript runtime, and keep --paths working
+  ([`e3a4352`](https://github.com/WillNHT/lemon-zest/commit/e3a4352012cebfb70e92dac1e18724c039c4daa5))
+
+Every video from a real playlist failed with "The page needs to be reloaded", preceded by "Signature
+  solving failed" and "n challenge solving failed". YouTube signs its media URLs with a challenge
+  that has to be executed, so yt-dlp needs a JavaScript runtime to get a playable format at all -
+  and it enables only Deno by default, treating node, bun and quickjs as opt-in. This machine has
+  Node and no Deno, so nothing could be fetched.
+
+Lemon Zest passes --ignore-config, so the user cannot fix that in their own yt-dlp.conf: enabling
+  the other runtimes has to happen here. It is a config key, so it can be changed or emptied, and
+  Deno keeps its priority when it is installed, so a machine that already worked behaves
+  identically. The option is only passed to a yt-dlp that advertises it in --help, cached per
+  interpreter, because an unknown option is not a degraded download but an immediate usage error,
+  and this project would rather work with whatever yt-dlp is installed than pin a version.
+
+Which runtime a download will use is now reported next to the cookie source, in the interface and in
+  both commands, for the same reason cookies are: when it is missing, every video fails, and the
+  failure says nothing about why. The error mapping now names it too.
+
+Also fixes a bug the fix uncovered: yt-dlp ignores every --paths when the output template is itself
+  absolute ("--paths is ignored since an absolute path is given in output template"), so the part
+  files were landing beside the finished audio rather than in the dot-folder the scanner skips -
+  exactly the case that would let a scan index a half-written download. The template is now
+  relative, with the library folder passed as -P home:.
+
+Verified against the real yt-dlp on the video that failed: it now resolves format 251 and a
+  destination inside the library, with no warnings.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **tests**: Stop the stub downloader writing into the repository
+  ([`2208bd0`](https://github.com/WillNHT/lemon-zest/commit/2208bd07f339bb61ba4d87e63b3ec1b4ccc8ddbe))
+
+An intermediate version of the stub derived its destination from the -o template alone. Once that
+  template became relative, the derivation produced an empty root and three test files were written
+  to the working directory - and committed. They are removed here, and the stub now refuses to write
+  to anything but an absolute path, so a wrong guess fails the test instead of landing files in the
+  checkout.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+### Features
+
+- **download**: Fetch audio from YouTube into the library
+  ([`d336022`](https://github.com/WillNHT/lemon-zest/commit/d336022e855bbaa34f33399ed3cd7d0b635fcdc9))
+
+Downloads land inside a library root and are indexed on the spot, so what arrives is an ordinary
+  library track: tick it onto a card and sync, with no rescan in between. yt-dlp runs as a
+  subprocess rather than as an import - that is the interface it promises to keep stable, it can be
+  upgraded on its own schedule, and a download that wedges cannot take the catalog's process with
+  it.
+
+Two output templates are parsed rather than yt-dlp's human-facing progress: --progress-template for
+  bytes, and --print after_move: for the path that was really written, after the extraction and the
+  rename. --ignore-config keeps a user's own yt-dlp.conf from redirecting files out of the library,
+  part files go to a dotfile folder the scanner skips, and the download archive lives beside them so
+  a second run does not re-fetch what is already there.
+
+Cookies are the difference between a download and a refusal: YouTube turns away signed-out clients
+  for age gates, the bot check and members-only material. Firefox profiles are found by looking for
+  a cookies.sqlite on disk, most recently written first, which is the profile the user is signed in
+  to; a cookies.txt is accepted when there is no Firefox to read. The default tries Firefox, falls
+  back to the file, and then proceeds without cookies rather than refusing to start, because plenty
+  of videos need none. When YouTube does refuse, the error names which of those to fix instead of
+  repeating yt-dlp's wording.
+
+Adding a downloaded track to a playlist it is already in does nothing - the same rule the sync
+  obeys, for the reason this project exists.
+
+Covered by tests/test_download.py against a stub yt-dlp: no network, and nothing that depends on a
+  video still being up.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **download**: Keep the whole run, and let it be copied
+  ([`0c3a5bd`](https://github.com/WillNHT/lemon-zest/commit/0c3a5bd775d34effe879f9d223962d69d06d965e))
+
+A download that goes wrong is debugged from what yt-dlp said, and until now almost none of that
+  survived: progress moved a bar, one line of detail was kept, and the rest was read and dropped.
+  Every line is now recorded and streamed to the interface as it arrives, headed by the command that
+  produced it - which is the first question anyone asks of a failed download, and whose answer
+  includes which cookie source was chosen - and followed by what happened after yt-dlp exited: what
+  was catalogued, and what went into a playlist.
+
+A failure carries its log on the exception rather than only having streamed past, so the CLI can
+  print the tail of it instead of leaving the user to reproduce the failure to find out what it
+  said, and the server can hand it to a page that loads after the job is over.
+
+The app sets user-select: none, being a tool rather than a document. A log is the exception: it
+  exists to be pasted into a bug report. So the log block opts back in, wraps rather than scrolling
+  sideways - a truncated path is exactly what nobody can debug - and has a Copy button that falls
+  back to selecting the text when the clipboard is not available.
+
+Progress lines are deliberately not recorded: one per chunk would push the run's actual output out
+  of the ring within seconds. The ring is 500 lines and the job endpoint now returns all of it,
+  rather than the last 40.
+
+Also: a long library path in the destination menu no longer widens the pane past the window, which
+  it did because a select will not shrink below its widest option without min-width: 0.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.1.0 (2026-09-09)
 
 ### Bug Fixes
