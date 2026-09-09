@@ -1,6 +1,9 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-09-09)
+
+
 ## v0.2.1 (2026-09-09)
 
 ### Bug Fixes
@@ -116,6 +119,61 @@ Verified against the real yt-dlp on the video that failed: it now resolves forma
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
+- **enrich**: Search on the primary credit when the artist is a writer list
+  ([`2157508`](https://github.com/WillNHT/lemon-zest/commit/21575080d83ed367793b0987abec919e4403f7d8))
+
+The seven-name folder was still unmatched. `credits()` split the string correctly and had done since
+  the first commit, but it was only ever used for scoring and for the offline backfill - the search
+  query still received all seven names verbatim:
+
+artist:"Joji, Kurtis McKenzie, Linden Jay, Chelsea Lena, George Miller, Joshua Bliss Taffel, Kacy
+  Anne Hill"
+
+No index has an artist by that name, so the lookup returned nothing and the track was reported as
+  "no match" rather than as a question we had failed to ask properly.
+
+The attempt ladder now falls back to the primary credit. The whole string is still tried first,
+  because splitting is not always right: "Simon & Garfunkel" is one artist the credit splitter
+  happily halves, and the full string is what matches it. Attempts are capped at four so a stubborn
+  track cannot cost half a minute of a rate-limited run, and the title rewrites are paired with the
+  narrow artist, since by the time they are reached the wide string has already failed.
+
+On the real catalog this takes the run from 17 identified to 20. Both Joji tracks now resolve to
+  artist "Joji" with their own ISRCs, and album_artist - which was empty, and which the device path
+  template reads first - is filled in, so the seven-name folder stops being generated on the card.
+
+The library file itself keeps its folder: nothing here renames anything on disk.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **paths**: Substitute illegal characters rather than erase them
+  ([`1e90a2e`](https://github.com/WillNHT/lemon-zest/commit/1e90a2e3221a5d3cf379f9da9d8eddfedd500265))
+
+Two defects in one small function, both found by pointing the new organise command at the real
+  library and reading what it proposed.
+
+An illegal character became an underscore, which loses what the title said. "WHEN WE ALL FALL
+  ASLEEP, WHERE DO WE GO?" was about to be filed under a folder ending "GO_", next to the folder
+  yt-dlp had already created ending "GO？" - the same album, spelled two ways, because the downloader
+  substitutes the full-width twin and this did not. They are ordinary letters to every filesystem
+  involved: FAT32 and exFAT store names as UTF-16, so there was never a reason to reach for an
+  underscore. Now the two agree.
+
+The second is worse and was hiding behind an escape. The character class read [<>:"/\|?*], where the
+  backslash was escaping the pipe rather than standing for itself - so a backslash in a tag passed
+  through untouched, and on Windows that separates path components. An artist called "AC\DC" split
+  one folder into two: exactly the defect already fixed for the forward slash, in the same function,
+  undetected because the test asserted one example rather than the property.
+
+The test now asserts the property - that no member of the illegal set survives - which is what found
+  the backslash.
+
+Consequence worth stating: a track whose tags contain one of these characters gets a different
+  destination on a device than it did before, so the first sync after this moves those files on the
+  card. The count is small and the sync handles it as an ordinary rename.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
 - **tests**: Stop the stub downloader writing into the repository
   ([`2208bd0`](https://github.com/WillNHT/lemon-zest/commit/2208bd07f339bb61ba4d87e63b3ec1b4ccc8ddbe))
 
@@ -127,7 +185,86 @@ An intermediate version of the stub derived its destination from the -o template
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
+### Chores
+
+- **packaging**: Name the modules a --help run never imports
+  ([`05910a9`](https://github.com/WillNHT/lemon-zest/commit/05910a92c86a569aff6d95a7bfb86e56209c590a))
+
+enrich, organise and tags are imported inside the command functions, so a --help run does not touch
+  them - which means the frozen binary could be missing all three and still print its help
+  perfectly, and the smoke test would pass. Both halves of that are now closed: the spec names them
+  (with mutagen.id3 and mutagen.oggopus, which the tag writer newly needs), and the smoke test runs
+  two read-only commands that actually reach them.
+
+Also tidies two expressions written badly the first time: the fpcalc error path, which reached into
+  a list twice to avoid a variable, and the organise summary, which claimed every skipped file
+  lacked an artist when there are now two reasons a file is left alone. It reports the counts per
+  reason.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+### Documentation
+
+- **readme**: Document fingerprinting and organise
+  ([`cfda60b`](https://github.com/WillNHT/lemon-zest/commit/cfda60b471154d5646412eb20ed1fef10ce9f9dc))
+
+Covers what the last two commits added: the fourth rung of the ladder and what it needs installed,
+  and the command that makes the folders on disk agree with the catalog - including the two things
+  it refuses to do, since a tool that moves your music should say where it stops.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
 ### Features
+
+- Identify tracks by their audio, and file them where the metadata says
+  ([`de8880e`](https://github.com/WillNHT/lemon-zest/commit/de8880ec58d427f9fed49ed212c19a5a41c4bab2))
+
+Two rungs the ladder was missing, and the disk finally agreeing with the catalog.
+
+AcoustID fingerprinting is rung four: the only source that ignores what a file claims and listens to
+  it instead, which is the whole of the untagged download case. A file whose artist is a channel
+  name and whose title is a video title gives a text search nothing to work with and gives
+  Chromaprint everything.
+
+It is not bundled. The earlier note that this needed a packaging change was wrong: fpcalc is located
+  the way yt-dlp and ffmpeg already are - PATH first, then beside the frozen executable - which
+  keeps an LGPL binary out of the distribution, lets it be upgraded on its own schedule, and means
+  the spec and the CI build are untouched. Opt-in behind --fingerprint, and unavailable rather than
+  broken when fpcalc or the free AcoustID key is missing.
+
+How much of a fingerprint match is applied depends on the tags, even though getting there did not.
+  Audio and tags agreeing is the strongest evidence available and is applied. Audio alone - which is
+  what the files this rung exists for will produce, because their tags are what is wrong - is stored
+  for review, since "trust the sound over the tag" is a judgement about somebody's library rather
+  than a fact.
+
+`organise` then makes the folders match. It plans by default, asks before it moves anything, and
+  writes a journal that `organise undo` replays backwards, because moving two thousand files is the
+  most destructive thing this program can be asked to do. The default template changes folders only
+  and leaves every filename exactly as it is: the two halves of this library spell filenames
+  differently, so renaming them as well is a much larger diff than the problem calls for, and is
+  available with --template rather than by accident.
+
+The first dry run against the real library paid for the whole design, and found three things:
+
+* Release credits of "Various Artists" were being written into album_artist, which would have filed
+  Alphaville and Looking Glass under V. Placeholder credits are now refused and the recording's own
+  artist used instead. * A file with no album was to be moved out of a folder reading "someday
+  you'll wake up, and you'll be 26" and into one reading "Unknown Album". Any destination containing
+  a placeholder component is now skipped: tidiness that destroys information is not tidiness. * The
+  character-substitution defects fixed in the previous commit.
+
+After all three, the plan against the real library is exactly the three moves that should happen -
+  both Joji writer-list folders and one Rex Orange County - and nothing else. Identification over
+  the same 28 tracks went from 17 to 21.
+
+Moving a file leaves its content key alone, because the bytes did not change, so the device manifest
+  still matches and a replug stays a no-op. A device whose template mirrors the library layout is
+  named before anything moves, since its next sync will move the same files on the card.
+
+47 new tests, no network. 137 in total.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
 - **download**: Fetch audio from YouTube into the library
   ([`d336022`](https://github.com/WillNHT/lemon-zest/commit/d336022e855bbaa34f33399ed3cd7d0b635fcdc9))
@@ -185,6 +322,60 @@ Progress lines are deliberately not recorded: one per chunk would push the run's
 
 Also: a long library path in the destination menu no longer widens the pane past the window, which
   it did because a select will not shrink below its widest option without min-width: 0.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **enrich**: Reconcile a file's tags with what MusicBrainz knows
+  ([`340c020`](https://github.com/WillNHT/lemon-zest/commit/340c020a373a3b968d73146927babe36e7b2d9b9))
+
+A file's tags are only as good as whatever wrote them, and the downloaded half of this library is
+  wrong in a specific way: with no `artist` tag to read, yt-dlp falls back to the channel name, so a
+  KIRINJI track sits in a folder called "Nemu". Nothing in the catalog could tell that from a
+  correct tag, because nothing ever asked a second source.
+
+Adds a three-rung ladder, cheapest first. Backfill copies an ISRC onto an untagged twin already in
+  the library on folded artist, folded title and a two-second duration window - no network, and it
+  promotes files onto the rung above. ISRC lookup is an exact identifier, so a hit is certain. Text
+  search is fuzzy, scored on title, artist and duration; above 0.90 it is applied, between 0.62 and
+  0.90 it waits for a person, below that it is discarded.
+
+Four rules make it safe to point at a library you care about.
+
+Nothing is overwritten in place: a proposal lives in its own table with its source, confidence and
+  date, keyed by content key rather than track id, so a wrong answer is reversible and a moved file
+  keeps its enrichment.
+
+A release-derived field only fills a blank. Identifying a recording and choosing which of its forty
+  releases a copy came from are different questions with very different certainties, and one
+  confidence score describes only the first. The live run proved it: a correctly tagged "Cigarettes
+  After Sex" track matched its own recording with confidence 1.00 and proposed relabelling the album
+  with the HBO soundtrack that recording also appears on. Title, artist and ISRC come from the
+  recording and are taken; album, year and track number fill in only where the file was silent.
+  Release choice also prefers the artist's own record over a Various Artists anthology, and ties
+  between equally-scoring recordings are broken the same way - without which "How to Save a Life"
+  arrives as track 19 of "Hot Party Summer 2007".
+
+A hand-typed value outranks every source, now and on every later run.
+
+Audio files are untouched unless --write-tags, which asks first. Each file is rewritten to a copy
+  and swapped in, so an interruption leaves the original; the content key is recomputed in the same
+  transaction, or the next scan would see every corrected file as new and the card would recopy the
+  lot. --artwork additionally replaces the embedded cover with the release's own front cover, which
+  matters because a download embeds whatever yt-dlp scraped - the real square cover for an art
+  track, a 16:9 video frame for an ordinary upload.
+
+An isolated lookup failure is skipped and counted rather than ending the run; three in a row stop
+  it, because at that point the service is down rather than slow.
+
+Also on the download side, both cheap: the output template prefers album_artist to artist, since an
+  art track puts every credited writer in the latter and the one searchable name in the former; and
+  thumbnails are converted to JPEG, because YouTube serves WebP and several players show nothing at
+  all for a WebP cover.
+
+AcoustID is the obvious fourth rung and is deliberately absent: it needs the fpcalc binary bundled
+  into the executable, which is a packaging change.
+
+41 tests against a stub MusicBrainz, no network.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
