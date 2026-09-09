@@ -15,7 +15,24 @@ import re
 import unicodedata
 
 # Illegal on FAT32/exFAT (and on NTFS), plus control characters.
-_ILLEGAL = re.compile(r'[<>:"/\|?*\x00-\x1f]')
+#
+# The backslash is in here as a character in its own right, which it was not
+# before: the class used to read [...\|...], where the backslash was only
+# escaping the pipe. On Windows a backslash separates path components, so a
+# tag reading "AC\DC" split one folder into two - exactly the defect already
+# fixed for the forward slash, hiding behind an escape.
+_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# What to put in their place. The full-width forms are ordinary letters as
+# far as every filesystem is concerned - FAT32 and exFAT store names as
+# UTF-16 - and they are what the title actually said, where an underscore is
+# only a record that something was removed. It is also what yt-dlp does, so
+# a downloaded file and a file named from its tags agree instead of
+# differing by one character.
+_SUBSTITUTE = {
+    "<": "＜", ">": "＞", ":": "：", '"': "＂",
+    "/": "⧸", "\\": "⧵", "|": "｜", "?": "？", "*": "＊",
+}
 # Names Windows refuses outright, whatever the extension.
 _RESERVED = {
     "CON", "PRN", "AUX", "NUL",
@@ -53,7 +70,9 @@ def resolve_existing(path):
 def safe_component(name, max_len=MAX_COMPONENT):
     """Make one path component safe for FAT32/exFAT."""
     name = unicodedata.normalize("NFC", str(name))
-    name = _ILLEGAL.sub("_", name)
+    # A control character carries nothing and is dropped; everything else
+    # illegal has a full-width twin that reads the same.
+    name = _ILLEGAL.sub(lambda m: _SUBSTITUTE.get(m.group(0), ""), name)
     name = name.replace("\t", " ").strip()
     # FAT stores no trailing dot or space; Windows silently drops them.
     name = name.rstrip(". ")
@@ -131,6 +150,13 @@ def render_template(template, track, ext=None):
         year=_as_component(field("year"), ""),
         genre=_as_component(field("genre"), ""),
         ext=ext if ext is not None else os.path.splitext(track["path"])[1],
+        # The file's current name, kept verbatim. It exists so that a
+        # template can correct the folders without touching a filename it has
+        # no business parsing - see organise.DEFAULT_TEMPLATE. Substituted as
+        # a marker rather than the name itself, because the name is already
+        # a valid path component and running it through the sanitiser again
+        # would mangle characters it is entitled to contain.
+        filename="__FILENAME__",
     )
     try:
         rendered = template.format_map(values)

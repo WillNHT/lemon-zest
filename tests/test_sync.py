@@ -389,7 +389,15 @@ class SyncTests(unittest.TestCase):
 
 class PathTests(unittest.TestCase):
     def test_fat_illegal_characters(self):
-        self.assertEqual(safe_component('AC/DC: Back?'), "AC_DC_ Back_")
+        # Substituted with their full-width twins rather than underscored:
+        # those are ordinary letters to every filesystem, they read as what
+        # the title said, and they are what yt-dlp writes - so a downloaded
+        # file and a file named from its tags agree.
+        self.assertEqual(safe_component('AC/DC: Back?'), "AC⧸DC： Back？")
+        # Whatever the substitution, the point is that none of it is legal
+        # in a FAT name and none of it splits a component.
+        for ch in '<>:"/\|?*':
+            self.assertNotIn(ch, safe_component(f"a{ch}b"))
         self.assertEqual(safe_component("trailing. "), "trailing")
         self.assertEqual(safe_component("CON.mp3"), "CON_.mp3")
 
@@ -399,16 +407,19 @@ class PathTests(unittest.TestCase):
         self.assertEqual(dedupe("A/B.mp3", taken), "A/B (2).mp3")
 
     def test_a_slash_in_a_tag_does_not_create_a_folder(self):
-        """An artist called AC/DC must land in AC_DC/, not AC/DC/."""
+        """An artist called AC/DC lands in one folder, never two."""
         from lemonzest.paths import render_template
         track = {"artist": "AC/DC", "album_artist": "AC/DC",
                  "album": "Back In Black", "title": "Shoot to Thrill",
                  "track_no": 2, "disc_no": 1, "year": "1980", "genre": "Rock",
-                 "path": "/lib/AC_DC/Back In Black/02 Shoot to Thrill.m4a",
-                 "rel_path": "AC_DC/Back In Black/02 Shoot to Thrill.m4a"}
+                 "path": "/lib/AC⧸DC/Back In Black/02 Shoot to Thrill.m4a",
+                 "rel_path": "AC⧸DC/Back In Black/02 Shoot to Thrill.m4a"}
         rel = render_template(
             "{album_artist}/{album}/{track:02d} {title}{ext}", track)
-        self.assertEqual(rel, "AC_DC/Back In Black/02 Shoot to Thrill.m4a")
+        self.assertEqual(rel,
+                         "AC⧸DC/Back In Black/02 Shoot to Thrill.m4a")
+        # The invariant this test exists for: three components, not four.
+        self.assertEqual(len(rel.split("/")), 3)
         self.assertEqual(rel.count("/"), 2)
 
     def test_rel_path_template_mirrors_the_library(self):
@@ -427,7 +438,7 @@ class PathTests(unittest.TestCase):
         self.assertEqual(filename_for("mix", "{name}"), "mix.m3u8")
         # A slash in a playlist name is a character, never a path separator.
         self.assertEqual(filename_for("rock/pop", "{name}.m3u8"),
-                         "rock_pop.m3u8")
+                         "rock⧸pop.m3u8")
 
     def test_unicode_normalisation(self):
         from lemonzest.playlists import norm_name
