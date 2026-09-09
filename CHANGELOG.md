@@ -1,6 +1,26 @@
 # CHANGELOG
 
 
+## v0.2.1 (2026-09-09)
+
+### Bug Fixes
+
+- **scan**: An empty folder is a library folder
+  ([`ce48738`](https://github.com/WillNHT/lemon-zest/commit/ce48738b208f1d50658fe4f5ac575508ea042767))
+
+A library folder was known only through the tracks in it: the roots list was SELECT DISTINCT root
+  FROM track. Scanning a brand new empty folder therefore registered nothing, so it never appeared
+  in the Download view's "Into" picker, and a download with nothing else in the catalog failed with
+  "no library folder to download into" - the one case where downloading is exactly how the folder
+  would get filled.
+
+A library_root table now records the folders themselves. scan() registers the root before it walks,
+  and download() registers whatever root it lands in. An older catalog adopts its track roots once,
+  on open.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.2.0 (2026-09-09)
 
 ### Bug Fixes
