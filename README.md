@@ -436,7 +436,13 @@ while it writes (SQLite in WAL mode).
 
 **Download** fetches audio from YouTube into a library folder, says up front
 which cookies it will use, reports what it added, and streams the whole run
-into a log you can select and copy. **Needs attention**
+into a log you can select and copy. A batch is shown as a batch: the URLs
+are listed before anything is fetched, so the bar has a denominator from
+the first second — *12 of 47*, how many were downloaded, how many the
+archive already had, how many failed, how long it has taken and roughly how
+long is left, with the track being fetched right now and its own bytes
+underneath. The status strip carries the same count on every page, so a
+long playlist can be watched from the library. **Needs attention**
 collects everything worth a second look in one place:
 empty files (zero bytes on disk - failed downloads, which Lemon Zest refuses to
 copy rather than putting dead entries on the card), untagged files, and

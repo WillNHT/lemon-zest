@@ -43,6 +43,21 @@ from .paths import norm
 PROGRESS_PREFIX = "[lz-progress]"
 FILE_PREFIX = "[lz-file]"
 
+# What each progress line carries. Bytes describe the file being fetched;
+# the playlist position describes where in the batch it sits, which is the
+# thing a person watching a 40-track download actually wants to know and
+# the thing the old three-field line could not say.
+PROGRESS_TEMPLATE = (
+    PROGRESS_PREFIX
+    + "%(progress.downloaded_bytes)s|"
+    + "%(progress.total_bytes,progress.total_bytes_estimate)s|"
+    + "%(info.playlist_index)s|"
+    + "%(info.n_entries)s|"
+    + "%(progress.speed)s|"
+    + "%(progress.eta)s|"
+    + "%(info.title)s"
+)
+
 # Where a download lands under the library root, in yt-dlp's own output
 # syntax: alternates are comma-separated, the fallback follows a pipe.
 #
@@ -440,11 +455,7 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         "-o", output,
         "-P", "home:" + root,
         "-P", "temp:" + os.path.join(root, INCOMPLETE_DIR),
-        "--progress-template",
-        ("download:" + PROGRESS_PREFIX
-         + "%(progress.downloaded_bytes)s|"
-         + "%(progress.total_bytes,progress.total_bytes_estimate)s|"
-         + "%(info.title)s"),
+        "--progress-template", "download:" + PROGRESS_TEMPLATE,
         # A WHEN prefix keeps --print from implying --simulate, so this
         # reports the file that was really written, after the audio
         # extraction and the rename.
@@ -606,11 +617,26 @@ def _number(text):
 
 
 def _parse_progress(line):
-    """Split one progress line into (done, total, title)."""
-    parts = line[len(PROGRESS_PREFIX):].split("|", 2)
-    return (_number(parts[0]) if parts else None,
-            _number(parts[1]) if len(parts) > 1 else None,
-            parts[2].strip() if len(parts) > 2 else "")
+    """One progress line, as a dict.
+
+    Seven fields now, three before. The short form is still read rather than
+    dropped: a yt-dlp launched by an older Lemon Zest, or a stub in a test,
+    still moves the bar it knows how to move.
+    """
+    body = line[len(PROGRESS_PREFIX):]
+    parts = body.split("|")
+    out = {"bytes": None, "bytes_total": None, "index": None, "count": None,
+           "speed": None, "eta": None, "title": ""}
+    if len(parts) >= 7:
+        keys = ("bytes", "bytes_total", "index", "count", "speed", "eta")
+        for key, raw in zip(keys, parts):
+            out[key] = _number(raw)
+        out["title"] = "|".join(parts[6:]).strip()
+    else:
+        out["bytes"] = _number(parts[0]) if parts else None
+        out["bytes_total"] = _number(parts[1]) if len(parts) > 1 else None
+        out["title"] = "|".join(parts[2:]).strip()
+    return out
 
 
 _ARCHIVED = re.compile(r"has already been recorded in the archive", re.I)
@@ -628,7 +654,7 @@ def video_id(text):
     return text if re.fullmatch(r"[A-Za-z0-9_-]{11}", text) else None
 
 
-def _requested_track_ids(con, urls, cfg, downloaded, log):
+def _requested_track_ids(con, urls, cfg, downloaded, log, probes=None):
     """Catalog ids for everything the request named, in the source's order.
 
     ``--embed-metadata`` writes the source URL into the ``purl`` tag and the
@@ -643,12 +669,16 @@ def _requested_track_ids(con, urls, cfg, downloaded, log):
     """
     ids = []
     for url in urls:
-        try:
-            info = probe(url, cfg)
-        except DownloadError as exc:
-            log.append("could not list %s to order the playlist: %s"
-                       % (url, exc))
-            return downloaded
+        # Listed once at the start of the run to count the batch; reused
+        # here rather than fetched again.
+        info = (probes or {}).get(url)
+        if info is None:
+            try:
+                info = probe(url, cfg)
+            except DownloadError as exc:
+                log.append("could not list %s to order the playlist: %s"
+                           % (url, exc))
+                return downloaded
         entries = info["entries"] or [{"url": url}]
         for entry in entries:
             vid = video_id(entry.get("url"))
@@ -674,9 +704,47 @@ def _requested_track_ids(con, urls, cfg, downloaded, log):
     return found or downloaded
 
 
+# One item of a batch is finished when its file is written, when yt-dlp
+# says it is already in the archive, or when it fails. Those three are what
+# `done` counts - not bytes, which only ever describe the file currently
+# being fetched and reset to zero forty times over a playlist.
+def _new_batch(urls):
+    return {"total": 0, "done": 0, "downloaded": 0, "skipped": 0,
+            "failed": 0, "urls": len(urls), "listed": False,
+            "started": time.time(), "finished": None,
+            "current": None}
+
+
+def _count_items(urls, cfg, log):
+    """How many items this batch will attempt, and what is in each URL.
+
+    One flat listing per URL, before anything is fetched: it is the only way
+    to say "12 of 47" rather than "12 so far, of who knows". A listing that
+    fails is not fatal - the URL counts as one item, which is what it is
+    unless it turns out to be a playlist.
+
+    The listings are handed back so the playlist ordering at the end of the
+    run does not pay for them a second time.
+    """
+    total, probes = 0, {}
+    for url in urls:
+        try:
+            info = probe(url, cfg)
+        except DownloadError as exc:
+            log.append("could not list %s: %s" % (url, exc))
+            total += 1
+            continue
+        probes[url] = info
+        total += max(1, int(info.get("count") or 1))
+    return total, probes
+
+
+_ERROR_LINE = re.compile(r"^\s*ERROR:", re.I)
+
+
 def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
-             no_playlist=False, archive=True, output=None, audio_format=None,
-             audio_quality=None):
+             on_batch=None, no_playlist=False, archive=True, output=None,
+             audio_format=None, audio_quality=None):
     """Download ``urls`` into a library folder and index what arrives.
 
     Returns a summary dict. The files that arrive are indexed one by one
@@ -693,15 +761,37 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     # it shows up in the picker next time even before it has been scanned.
     db.add_root(con, root)
 
-    args = build_args(cfg, urls, root, no_playlist=no_playlist,
-                      archive=archive, output=output,
-                      audio_format=audio_format, audio_quality=audio_quality)
-
     def emit(kind, detail, done=0, total=0):
         if on_event:
             on_event(kind, detail, done, total)
 
+    batch = _new_batch(urls)
+
+    def report():
+        """Hand the caller a copy: this dict keeps changing under them."""
+        if on_batch:
+            snapshot = dict(batch)
+            snapshot["current"] = dict(batch["current"]) if batch["current"] else None
+            on_batch(snapshot)
+
     emit("start", "%d URL%s" % (len(urls), "" if len(urls) == 1 else "s"))
+    report()
+
+    # Counted before anything is fetched, so the progress bar has a
+    # denominator from the first second rather than from the last one.
+    listing_log = []
+    if no_playlist:
+        batch["total"], probes = len(urls), {}
+    else:
+        emit("listing", "listing what is at %d URL%s"
+             % (len(urls), "" if len(urls) == 1 else "s"))
+        batch["total"], probes = _count_items(urls, cfg, listing_log)
+    batch["listed"] = True
+    report()
+
+    args = build_args(cfg, urls, root, no_playlist=no_playlist,
+                      archive=archive, output=output,
+                      audio_format=audio_format, audio_quality=audio_quality)
 
     # The whole run, kept for the person reading it afterwards: the command
     # first, because "what did it actually run" is the first question asked
@@ -709,6 +799,12 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     # source was chosen.
     log = ["$ " + _printable(args)]
     emit("command", log[0])
+    log.extend(listing_log)
+    if batch["total"]:
+        line = "batch: %d item%s to fetch" % (batch["total"],
+                                              "" if batch["total"] == 1 else "s")
+        log.append(line)
+        emit("output", line)
 
     files = []
     tail = []
@@ -723,8 +819,23 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
             if not line:
                 continue
             if line.startswith(PROGRESS_PREFIX):
-                done, total, title = _parse_progress(line)
-                emit("progress", title or "downloading", done or 0, total or 0)
+                p = _parse_progress(line)
+                batch["current"] = {
+                    "title": p["title"] or "downloading",
+                    "index": p["index"], "count": p["count"],
+                    "bytes": p["bytes"] or 0,
+                    "bytes_total": p["bytes_total"] or 0,
+                    "speed": p["speed"], "eta": p["eta"],
+                }
+                # A playlist yt-dlp is further into than our own counters
+                # believe - the archive skips it printed before we started
+                # counting, say - moves the batch forward rather than
+                # letting it sit still while the numbers disagree.
+                if p["index"] and len(urls) == 1:
+                    batch["done"] = max(batch["done"], p["index"] - 1)
+                emit("progress", p["title"] or "downloading",
+                     batch["done"], batch["total"])
+                report()
                 continue
             if line.startswith(FILE_PREFIX):
                 path = line[len(FILE_PREFIX):].strip()
@@ -732,10 +843,27 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                     files.append(path)
                     log.append("wrote " + path)
                     del log[:-MAX_LOG]
-                    emit("file", path, len(files), 0)
+                    batch["downloaded"] += 1
+                    batch["done"] += 1
+                    batch["total"] = max(batch["total"], batch["done"])
+                    batch["current"] = None
+                    emit("file", path, batch["done"], batch["total"])
+                    report()
                 continue
             if _ARCHIVED.search(line):
                 skipped += 1
+                batch["skipped"] += 1
+                batch["done"] += 1
+                batch["total"] = max(batch["total"], batch["done"])
+                report()
+            elif _ERROR_LINE.search(line):
+                # One item, one failure: yt-dlp prints its ERROR line once
+                # per item it gives up on, and the continuation lines that
+                # sometimes follow do not start with ERROR.
+                batch["failed"] += 1
+                batch["done"] += 1
+                batch["total"] = max(batch["total"], batch["done"])
+                report()
             tail.append(line)
             del tail[:-60]
             log.append(line)
@@ -754,6 +882,10 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                    % code)
         raise DownloadError(explain(text) or last
                             or "yt-dlp exited with status %d" % code, log=log)
+
+    batch["current"] = None
+    batch["finished"] = time.time()
+    report()
 
     arrived = [f for f in files if os.path.isfile(f)]
     emit("index", "%d file%s" % (len(arrived), "" if len(arrived) == 1 else "s"),
@@ -784,7 +916,8 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         # Everything the request asked for, not merely what this run
         # fetched: the skipped ones belong in the playlist too, and asking
         # the source for its own order beats the order they downloaded in.
-        wanted = _requested_track_ids(con, urls, cfg, track_ids, log) \
+        wanted = _requested_track_ids(con, urls, cfg, track_ids, log,
+                                      probes=probes) \
             if skipped else track_ids
         if wanted:
             added_to = pl_mod.append_tracks(con, playlist, wanted,
@@ -807,6 +940,11 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         "errors": [l for l in tail if "ERROR" in l][-10:],
         "log": log,
         "at": time.time(),
+        # What the run was, as counts: how many items it set out to fetch
+        # and what became of each one. The interface shows this while the
+        # run is going and keeps it afterwards, which is the difference
+        # between a log you have to read and a batch you can see.
+        "batch": batch,
     }
     emit("done", "%d downloaded" % len(arrived), len(arrived), len(arrived))
     return summary

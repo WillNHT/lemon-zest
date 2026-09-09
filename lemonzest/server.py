@@ -56,6 +56,10 @@ def _new_job(kind, label):
                         "state": "running", "done": 0, "total": 0,
                         "detail": "", "started": time.time(),
                         "finished": None, "result": None, "error": None,
+                        # Set by a download: the item counts of the batch,
+                        # which is what a progress bar over forty tracks
+                        # needs and what bytes-of-one-file cannot give.
+                        "batch": None,
                         "events": []}
     return job_id
 
@@ -874,9 +878,16 @@ def create_app(db_path=None):
                         _update(job_id, detail=detail)
                         _push_event(job_id, kind, detail)
 
+                def on_batch(batch):
+                    # The batch as counts, kept whole on the job: the page
+                    # polls this and draws the run, rather than asking a
+                    # reader to count "wrote ..." lines in the log.
+                    _update(job_id, batch=batch)
+
                 summary = dl_mod.download(
                     c, urls, root=root, playlist=playlist_name,
-                    on_event=on_event, no_playlist=single, archive=archive)
+                    on_event=on_event, on_batch=on_batch,
+                    no_playlist=single, archive=archive)
                 # Scoped to the files this run actually fetched, not to the
                 # whole folder: a download into a library of two thousand
                 # would otherwise start an hours-long pass over all of them.
