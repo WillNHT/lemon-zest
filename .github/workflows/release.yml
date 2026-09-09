@@ -6,8 +6,10 @@
 # anything else (docs, chore, ci, ...) -> no release at all, in which case
 # this run stops after the first job and nothing is published.
 #
-# The executable is built after the tag exists, from the tag, so the version
-# baked into the binary is the version on the release it hangs off.
+# The build happens after the tag exists, from the tag, so the version baked
+# into the binary is the version on the release it hangs off. What ships is
+# a zip of a folder: the executable carries ffmpeg, Deno, yt-dlp and fpcalc
+# with it, and a onefile build would unpack all of that on every launch.
 name: Release
 
 on:
@@ -52,7 +54,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
   executable:
-    name: build and attach the executable
+    name: build and attach the archive
     needs: version
     if: needs.version.outputs.released == 'true'
     runs-on: windows-latest
@@ -70,17 +72,22 @@ jobs:
           cache: pip
 
       - run: pip install -e . -r packaging/requirements-build.txt
+      - name: Cache the bundled tools
+        uses: actions/cache@v4
+        with:
+          path: build/tools-cache
+          key: tools-${{ runner.os }}-${{ hashFiles('packaging/fetch_tools.py') }}
       - run: pyinstaller --clean --noconfirm packaging/lemon-zest.spec
 
-      - name: Check the binary actually runs before anyone downloads it
-        run: python packaging/smoke_test.py dist/lemon-zest.exe
+      - name: Check the build actually runs before anyone downloads it
+        run: python packaging/smoke_test.py dist/lemon-zest/lemon-zest.exe
 
-      - name: Name it after its version
+      - name: Zip it, named for its version
         id: name
         shell: bash
         run: |
-          name="lemon-zest-${{ needs.version.outputs.version }}-windows-x64.exe"
-          mv dist/lemon-zest.exe "dist/$name"
+          python packaging/make_zip.py "${{ needs.version.outputs.version }}"
+          name="lemon-zest-${{ needs.version.outputs.version }}-windows-x64.zip"
           echo "asset=dist/$name" >> "$GITHUB_OUTPUT"
 
       - name: Attach it to the release

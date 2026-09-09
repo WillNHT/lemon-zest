@@ -1321,6 +1321,42 @@ def organise_undo(ctx, journal):
                      if counts["failed"] else ""))
 
 
+@cli.command("tools")
+def tools_cmd():
+    """What this build carries with it, and what it found on PATH.
+
+    The packaged executable ships ffmpeg, ffprobe, Deno and fpcalc inside
+    it, so a machine with none of them installed can still download and
+    fingerprint. This is how you check that, and where each one came from.
+    """
+    import shutil
+
+    from . import bundled
+    from .download import ytdlp_command, ytdlp_version
+
+    bundled.install()
+    st = bundled.status()
+    console.print(f"build      [bold]{'packaged executable' if st['frozen'] else 'source checkout'}[/]")
+    if st["dirs"]:
+        console.print(f"bundle     {st['dirs'][0]}")
+
+    for name in ("ffmpeg", "ffprobe", "deno", "fpcalc"):
+        inside = st["tools"].get(name)
+        found = shutil.which(name)
+        if inside:
+            console.print(f"{name:<10} [green]bundled[/]  {inside}")
+        elif found:
+            console.print(f"{name:<10} [yellow]from PATH[/] {found}")
+        else:
+            console.print(f"{name:<10} [red]not found[/]")
+
+    cmd = ytdlp_command()
+    version = ytdlp_version()
+    console.print(f"{'yt-dlp':<10} "
+                  + (f"[green]{version}[/] via {' '.join(cmd)}" if cmd
+                     else "[red]not found[/]"))
+
+
 @cli.command("gui")
 @click.option("--port", default=7777, show_default=True)
 @click.option("--host", default="127.0.0.1", show_default=True)
@@ -1340,6 +1376,11 @@ def gui_cmd(ctx, port, host, no_browser):
 
 
 def main():
+    # The packaged build carries ffmpeg, Deno and fpcalc inside it; this is
+    # what makes them findable, and it has to happen before any command
+    # shells out to one. A source run finds nothing bundled and is a no-op.
+    from . import bundled
+    bundled.install()
     try:
         cli(obj={})
     except KeyboardInterrupt:

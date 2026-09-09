@@ -24,6 +24,16 @@ from . import executor, planner, playlists, scan
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
+# A hidden library folder stays indexed but drops out of every view of the
+# library. Written as SQL rather than a python filter so the counts, the
+# facets and the paged table all narrow together.
+VISIBLE = ("t.root NOT IN (SELECT root FROM library_root WHERE hidden = 1)")
+VISIBLE_BARE = VISIBLE.replace("t.root", "root")
+# When the inbox was last emptied. Everything indexed since is new.
+INBOX_MARK = ("COALESCE((SELECT CAST(value AS REAL) FROM meta "
+              "WHERE key = 'inbox_seen_at'), 0)")
+NEW_SQL = f"(t.added_at IS NOT NULL AND t.added_at > {INBOX_MARK})"
+
 # job id -> progress record. Small and bounded; finished jobs are kept so a
 # reloaded page can still show the outcome.
 JOBS = {}
@@ -89,8 +99,11 @@ def create_app(db_path=None):
     def stats():
         c = con()
         one = lambda q: c.execute(q).fetchone()[0]
+        vis = f"WHERE {VISIBLE_BARE}"
         return jsonify({
-            "tracks": one("SELECT COUNT(*) FROM track"),
+            "tracks": one(f"SELECT COUNT(*) FROM track {vis}"),
+            "inbox": one("SELECT COUNT(*) FROM track t "
+                         f"WHERE {VISIBLE} AND {NEW_SQL}"),
             "bytes": one("SELECT COALESCE(SUM(size),0) FROM track"),
             "artists": one("SELECT COUNT(DISTINCT artist) FROM track"),
             "albums": one("SELECT COUNT(DISTINCT album) FROM track"),
@@ -113,7 +126,8 @@ def create_app(db_path=None):
                 + one("SELECT COUNT(*) FROM enrichment WHERE status='candidate'")),
             "enrich_states": _enrich_states(c),
             "fingerprint": _fingerprint_state(c),
-            "roots": db_mod.roots(c),
+            "roots": db_mod.roots(c, include_hidden=False),
+            "root_detail": db_mod.roots_detail(c),
         })
 
     def _enrich_states(c):
@@ -130,7 +144,9 @@ def create_app(db_path=None):
         """Build the WHERE clause shared by the track list and the facets."""
         from . import enrich as en
 
-        clauses, params = [], []
+        clauses, params = [VISIBLE], []
+        if str(args.get("new") or "") in ("1", "true", "yes"):
+            clauses.append(NEW_SQL)
         state = (args.get("state") or "").strip()
         if with_state and state in en.STATES:
             clauses.append(en.STATE_SQL + " = ?")
@@ -161,6 +177,12 @@ def create_app(db_path=None):
         limit = min(int(request.args.get("limit", 200)), 1000)
         offset = int(request.args.get("offset", 0))
         device_id = request.args.get("device")
+        # Newest first is what an inbox is; everything else reads as an
+        # album shelf, where the track order inside a release is the point.
+        order = ("ORDER BY t.added_at DESC, t.id DESC"
+                 if request.args.get("order") == "added" else
+                 "ORDER BY (t.album_artist IS NULL), t.album_artist, t.album, "
+                 "t.disc_no, t.track_no, t.title, t.rel_path")
 
         # The enrichment join is on every library query rather than fetched
         # separately per page: the state is a column in the table and a filter
@@ -180,9 +202,8 @@ def create_app(db_path=None):
             "(SELECT COUNT(*) FROM track_override o "
             "   WHERE o.content_key = t.content_key) AS overrides "
             f"FROM track t {join} WHERE {where} "
-            "ORDER BY (t.album_artist IS NULL), t.album_artist, t.album, "
-            "t.disc_no, t.track_no, t.title, t.rel_path "
-            "LIMIT ? OFFSET ?", params + [limit, offset]
+            + order
+            + " LIMIT ? OFFSET ?", params + [limit, offset]
         ).fetchall()
 
         # Which of these are already on the selected device?
@@ -210,6 +231,8 @@ def create_app(db_path=None):
                 "enrich_source": r["enrich_source"],
                 "confidence": r["enrich_confidence"],
                 "overrides": r["overrides"],
+                "added_at": r["added_at"],
+                "mtime": r["mtime"],
                 "empty": r["size"] == 0,
                 "untagged": not r["title"],
                 "on_device": r["id"] in on_device,
@@ -237,6 +260,76 @@ def create_app(db_path=None):
             f"WHERE {where}", params).fetchone()[0]
         return jsonify({"keys": [r["content_key"] for r in rows],
                         "total": total, "capped": total > len(rows)})
+
+    @app.post("/api/inbox/seen")
+    def inbox_seen():
+        """Empty the inbox: everything indexed up to now stops being new.
+
+        The files are untouched and stay in the library - this moves a
+        watermark, which is the only thing "mark as seen" can honestly mean.
+        """
+        c = con()
+        db_mod.meta_set(c, "inbox_seen_at", time.time())
+        return jsonify({"ok": True, "at": time.time()})
+
+    # ---------------------------------------------------- library folders
+
+    @app.get("/api/roots")
+    def roots_list():
+        return jsonify(db_mod.roots_detail(con()))
+
+    @app.post("/api/roots/hide")
+    def roots_hide():
+        body = request.json or {}
+        root = (body.get("root") or "").strip()
+        if not root:
+            return jsonify({"error": "no folder given"}), 400
+        c = con()
+        db_mod.set_root_hidden(c, root, bool(body.get("hidden", True)))
+        return jsonify({"roots": db_mod.roots_detail(c)})
+
+    @app.post("/api/roots/remove")
+    def roots_remove():
+        """Forget a library folder. Never deletes audio files."""
+        body = request.json or {}
+        root = (body.get("root") or "").strip()
+        if not root:
+            return jsonify({"error": "no folder given"}), 400
+        c = con()
+        out = db_mod.remove_root(c, root,
+                                 forget_tracks=bool(body.get("forget_tracks", True)))
+        out["roots"] = db_mod.roots_detail(c)
+        return jsonify(out)
+
+    @app.get("/api/art/<path:content_key>")
+    def track_art(content_key):
+        """The artwork embedded in the file itself.
+
+        Served from the audio rather than from the Cover Art Archive on
+        purpose: it is what the file actually carries, which is the thing
+        someone looking at a track wants to see - including when it is a
+        video thumbnail that ought to be replaced. The archive's copy is
+        offered separately, by URL, in the track detail.
+        """
+        from . import meta as meta_mod
+
+        c = con()
+        row = c.execute(
+            "SELECT path FROM track WHERE content_key = ? ORDER BY id LIMIT 1",
+            (content_key,)).fetchone()
+        if not row:
+            return jsonify({"error": "no such track"}), 404
+        try:
+            art = meta_mod.artwork(row["path"])
+        except Exception:      # noqa: BLE001 - a missing picture is a 404
+            art = None
+        if not art:
+            return jsonify({"error": "no embedded artwork"}), 404
+        data, mime = art
+        # Content keys change when a file is rewritten, so a cached picture
+        # can never be the wrong one for this URL.
+        return app.response_class(data, mimetype=mime, headers={
+            "Cache-Control": "public, max-age=86400"})
 
     @app.get("/api/problems")
     def problems():
@@ -409,6 +502,19 @@ def create_app(db_path=None):
         write_tags = bool(body.get("write_tags"))
         artwork = bool(body.get("artwork"))
         use_fp = bool(body.get("fingerprint"))
+        # Typed search terms, when the person could see why the automatic
+        # ones failed. Refused over a selection: one query cannot describe
+        # forty different tracks, and applying it to all of them would file
+        # thirty-nine of them under the fortieth.
+        query = body.get("query") or None
+        if query:
+            query = {k: (query.get(k) or "").strip()
+                     for k in ("artist", "title", "album")}
+            if not query["title"]:
+                return jsonify({"error": "a search needs a title"}), 400
+            if len(keys) != 1:
+                return jsonify({"error": "search terms apply to one track at "
+                                         "a time"}), 400
         if use_fp and not en.fingerprint_status(con())["ready"]:
             return jsonify({"error": "fingerprinting needs fpcalc and an "
                                      "AcoustID key; set them up first"}), 400
@@ -425,7 +531,7 @@ def create_app(db_path=None):
 
                 counts = en.run_tracks(
                     c, keys, write_tags=write_tags, artwork=artwork,
-                    use_fingerprint=use_fp, progress=cb)
+                    use_fingerprint=use_fp, progress=cb, query=query)
                 bits = ["%d enriched" % counts["applied"],
                         "%d to review" % counts["candidates"]]
                 if counts["unmatched"]:
@@ -676,10 +782,16 @@ def create_app(db_path=None):
     # ------------------------------------------------------- downloads
 
     def _download_state(c):
+        from . import bundled
+
         cfg = dl_mod.get_config(c)
         status = dl_mod.cookie_status(cfg)
         return {
             "config": cfg,
+            # What the executable brought with it. Worth saying out loud:
+            # every "install ffmpeg" message on this page is wrong when the
+            # answer is already inside the binary.
+            "bundled": bundled.status(),
             "ytdlp": dl_mod.ytdlp_version(),
             "js_runtime": dl_mod.js_runtime_status(cfg),
             "cookies": {
@@ -1006,8 +1118,24 @@ def create_app(db_path=None):
     return app
 
 
+def _warm(app):
+    """Fill the caches the first page view would otherwise wait on.
+
+    One thread, at startup, doing what the download page used to do inside
+    the click that opened it.
+    """
+    def work():
+        try:
+            dl_mod.warm_cache()
+        except Exception:      # noqa: BLE001 - a warm cache is an optimisation
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+    return app
+
+
 def serve(db_path=None, host="127.0.0.1", port=7777, open_browser=True):
-    app = create_app(db_path)
+    app = _warm(create_app(db_path))
     if open_browser:
         import webbrowser
         threading.Timer(

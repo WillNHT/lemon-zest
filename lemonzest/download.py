@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 from . import db
@@ -138,12 +139,23 @@ def set_config(con, **changes):
 def ytdlp_command():
     """How to invoke yt-dlp here, or None when it is not installed.
 
-    A yt-dlp on PATH wins; otherwise the module inside this interpreter is
-    used, which is what ``pip install lemon-zest[youtube]`` leaves behind.
+    A yt-dlp on PATH wins, so one the user keeps updated is used in
+    preference to ours. Then the copy inside the packaged executable, which
+    is reached by re-running the binary with ``--yt-dlp`` - a frozen build
+    has no ``-m`` to call. Then the module in this interpreter, which is
+    what ``pip install lemon-zest[youtube]`` leaves behind.
     """
+    from . import bundled
+
     exe = shutil.which("yt-dlp")
     if exe:
         return [exe]
+    if bundled.frozen():
+        try:
+            import yt_dlp  # noqa: F401
+        except Exception:
+            return None
+        return [sys.executable, "--yt-dlp"]
     try:
         import yt_dlp  # noqa: F401
     except Exception:
@@ -151,17 +163,60 @@ def ytdlp_command():
     return [sys.executable, "-m", "yt_dlp"]
 
 
-def ytdlp_version():
+# Asking yt-dlp its version costs a process start, an import of yt-dlp, and
+# on a packaged build a second copy of this executable: four seconds,
+# measured. The download page asks for it on every visit, so opening that
+# page used to take four seconds. It is cached for the life of the process
+# and warmed in the background at startup, because the answer changes when
+# somebody installs a new yt-dlp - not while they are clicking.
+_VERSION = {"cmd": None, "value": None, "at": 0.0}
+# Held while the answer is being fetched, so a page opened during the
+# warm-up waits for that one subprocess instead of starting a second.
+_VERSION_LOCK = threading.Lock()
+VERSION_TTL = 900.0
+
+
+def ytdlp_version(refresh=False):
     cmd = ytdlp_command()
     if not cmd:
         return None
+
+    def cached():
+        return (_VERSION["cmd"] == cmd
+                and time.time() - _VERSION["at"] < VERSION_TTL)
+
+    if cached() and not refresh:
+        return _VERSION["value"]
+    with _VERSION_LOCK:
+        # Somebody else may have answered it while we waited for the lock.
+        if cached() and not refresh:
+            return _VERSION["value"]
+        return _ytdlp_version_uncached(cmd)
+
+
+def _ytdlp_version_uncached(cmd):
     try:
         out = subprocess.run(cmd + ["--version"], capture_output=True,
                              text=True, timeout=30, encoding="utf-8",
                              errors="replace")
+        value = out.stdout.strip() or None
     except Exception:
-        return None
-    return out.stdout.strip() or None
+        value = None
+    _VERSION.update(cmd=cmd, value=value, at=time.time())
+    return value
+
+
+def warm_cache():
+    """Ask the slow questions once, off the request path.
+
+    Started at boot by the server. Never raises: this is a cache being
+    filled, and a failure only means the first visitor pays what every
+    visitor used to.
+    """
+    try:
+        ytdlp_version(refresh=True)
+    except Exception:      # noqa: BLE001
+        pass
 
 
 _OPTION_SUPPORT = {}

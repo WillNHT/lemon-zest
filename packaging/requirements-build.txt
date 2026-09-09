@@ -3,3 +3,8 @@
 # tracks new Python releases, and holding it back is how a build breaks on a
 # newer interpreter than the one this was written against.
 pyinstaller>=6.3
+
+# yt-dlp ships inside the executable, so a packaged build never asks the
+# user to install it. Unpinned on purpose: YouTube breaks yt-dlp regularly
+# and the fix is always the newest release.
+yt-dlp

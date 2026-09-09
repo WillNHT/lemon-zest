@@ -7,6 +7,9 @@ So: run the CLI, then start the interface against a throwaway catalog and
 ask it for a page and an API response.
 
 Called as: smoke_test.py <path-to-exe>
+
+The path is the executable inside the built folder,
+``dist/lemon-zest/lemon-zest.exe``.
 """
 import json
 import os
@@ -19,7 +22,7 @@ import time
 import urllib.error
 import urllib.request
 
-TIMEOUT = 60  # generous: a onefile build unpacks itself on every start
+TIMEOUT = 60  # generous: a cold start on a CI runner is not a fast one
 
 
 def free_port():
@@ -62,6 +65,47 @@ def run_subcommands(exe, db, workdir):
         print(f"ok   cli {' '.join(args[:2])}")
 
 
+def run_bundled_tools(exe):
+    """The whole point of the packaged build: nothing else installed.
+
+    Each bundled tool is asked for its version through the binary itself,
+    with PATH emptied of anything that could answer instead - so a machine
+    that happens to have ffmpeg cannot make this pass by accident.
+    """
+    bare = dict(os.environ)
+    # Keep the Windows system directories: emptying PATH entirely stops the
+    # process from finding its own C runtime, which proves nothing.
+    if os.name == "nt":
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        bare["PATH"] = os.pathsep.join(
+            [root, os.path.join(root, "System32")])
+    else:
+        bare["PATH"] = "/usr/bin:/bin"
+
+    out = subprocess.run([exe, "--yt-dlp", "--version"], capture_output=True,
+                         text=True, timeout=TIMEOUT, env=bare)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise SystemExit("bundled yt-dlp did not answer --version\n"
+                         f"{out.stdout}{out.stderr}")
+    print(f"ok   bundled yt-dlp {out.stdout.strip().splitlines()[0]}")
+
+    out = subprocess.run([exe, "tools"], capture_output=True, text=True,
+                         timeout=TIMEOUT, env=bare)
+    if out.returncode != 0:
+        raise SystemExit(f"tools exited {out.returncode}\n"
+                         f"{out.stdout}{out.stderr}")
+    # `tools` prints one line per tool; "bundled" is the word that means it
+    # came out of the executable rather than off this machine's PATH.
+    for line in out.stdout.splitlines():
+        for name in ("ffmpeg", "ffprobe", "deno", "fpcalc"):
+            if line.strip().startswith(name) and "bundled" not in line:
+                raise SystemExit(f"{name} is not bundled:\n{out.stdout}")
+    for name in ("ffmpeg", "ffprobe", "deno", "fpcalc"):
+        if name not in out.stdout:
+            raise SystemExit(f"{name} is missing from the bundle:\n{out.stdout}")
+    print("ok   bundled ffmpeg, ffprobe, deno, fpcalc")
+
+
 def get(url):
     with urllib.request.urlopen(url, timeout=5) as resp:
         return resp.status, resp.read()
@@ -70,10 +114,10 @@ def get(url):
 def stop(proc):
     """Stop the server and everything it spawned.
 
-    A onefile build is two processes: the bootloader that unpacked the
-    program, and the child that is actually running it. Signalling only the
-    parent leaves the child alive holding the .exe open, and the next build
-    then fails to overwrite it - so take down the whole tree.
+    The binary spawns children of its own - it re-runs itself as yt-dlp -
+    and signalling only the parent can leave one alive holding the .exe
+    open, after which the next build fails to overwrite it. Take down the
+    whole tree.
     """
     if proc.poll() is not None:
         return
@@ -135,6 +179,7 @@ def main():
     try:
         run_cli(exe, db)
         run_subcommands(exe, db, workdir)
+        run_bundled_tools(exe)
         run_server(exe, db)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

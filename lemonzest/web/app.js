@@ -59,6 +59,11 @@ async function api(path, opts) {
 
 const S = {
   view: 'library',
+  // The download page's URL box, kept across navigation and reloads: a list
+  // of twenty links is typed once, and losing it to a stray click on the
+  // sidebar is the kind of loss that makes people paste into Notepad first.
+  dlUrls: (() => { try { return localStorage.getItem('lz.dl.urls') || ''; }
+                   catch (e) { return ''; } })(),
   stats: null,
   devices: [],
   playlists: [],
@@ -76,6 +81,11 @@ const S = {
   sel: new Set(),
   anchor: null,          // row index a shift-click measures its range from
   detail: null,          // /enrich/track/<key>: the proposal being judged
+  // The track the inspector is showing, and what it knows about it. One
+  // selected row means one thing worth reading in full; a selection of
+  // forty is an action, not a subject.
+  inspectKey: null,
+  inspect: null,
   dialogKeys: [],        // what the open dialog acts on, fixed when it opened
   writePreview: null,    // what a write would put in each file, before it runs
   // The last finished enrich or write, kept on screen until it is dismissed.
@@ -117,9 +127,13 @@ function libraryParams() {
   return p;
 }
 
+// The library table and the inbox are the same table over two questions.
+function isTrackView() { return S.view === 'library' || S.view === 'inbox'; }
+
 async function loadLibrary() {
   const p = libraryParams();
   p.set('limit', S.limit); p.set('offset', S.offset);
+  if (S.view === 'inbox') { p.set('new', '1'); p.set('order', 'added'); }
   if (S.scopeId) p.set('device', S.scopeId);
   const [lib, facets] = await Promise.all([
     api('/library?' + p), api('/facets?' + p),
@@ -210,6 +224,9 @@ function renderSidebar() {
     sect('Library', undefined,
       navRow({ act: 'view', arg: 'library', label: 'Music', icon: 'i-disc',
                n: num(st.tracks), on: S.view === 'library' }) +
+      navRow({ act: 'view', arg: 'inbox', label: 'Inbox', icon: 'i-inbox',
+               n: num(st.inbox), on: S.view === 'inbox',
+               title: 'Everything indexed since you last emptied the inbox' }) +
       navRow({ act: 'view', arg: 'problems', label: 'Needs attention',
                icon: 'i-warn', n: num(st.attention), on: S.view === 'problems' })) +
 
@@ -293,19 +310,41 @@ function stateTag(t) {
     + (t.overrides ? '<span class="tag" title="carries hand-typed values">edited</span>' : '');
 }
 
-function renderLibrary() {
+// How long ago, in the words a person uses about a download that just
+// finished. Exact timestamps are what the title attribute is for.
+function ago(ts) {
+  if (!ts) return '';
+  const secs = Math.max(0, Date.now() / 1000 - ts);
+  if (secs < 90) return 'just now';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return mins + ' min ago';
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return hrs + (hrs === 1 ? ' hour ago' : ' hours ago');
+  const days = Math.round(hrs / 24);
+  if (days < 30) return days + (days === 1 ? ' day ago' : ' days ago');
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+/* The track table, shared by the library and the inbox. They are the same
+   rows over two questions - "what do I have" and "what just arrived" - so
+   they are one table with one selection model and one set of shortcuts.
+   The only difference is the second column: the library asks whether a
+   track is on the device you are syncing, the inbox asks when it landed. */
+function trackTable(opts) {
+  const inbox = !!(opts && opts.inbox);
   const scope = S.devices.find(d => d.id === S.scopeId);
-  const counts = (S.stats && S.stats.enrich_states) || {};
   const rows = S.tracks.map((t, i) => `
     <tr data-track="${t.id}" data-row="${i}" data-key="${h(t.content_key)}"
         class="${S.sel.has(t.content_key) ? 'sel' : ''}">
       <td class="tick"><input type="checkbox" data-pick="${i}" tabindex="-1"
         ${S.sel.has(t.content_key) ? 'checked' : ''}></td>
-      <td class="tick">${scope
-        ? `<span title="${t.on_device ? 'on ' + h(scope.name) : 'not on ' + h(scope.name)}"
-             style="color:${t.on_device ? 'var(--accent)' : 'var(--line-2)'}">
-             ${t.on_device ? '&#9679;' : '&#9675;'}</span>`
-        : ''}</td>
+      ${inbox
+        ? `<td class="mono" title="${h(when(t.added_at))}">${h(ago(t.added_at))}</td>`
+        : `<td class="tick">${scope
+            ? `<span title="${t.on_device ? 'on ' + h(scope.name) : 'not on ' + h(scope.name)}"
+                 style="color:${t.on_device ? 'var(--accent)' : 'var(--line-2)'}">
+                 ${t.on_device ? '&#9679;' : '&#9675;'}</span>`
+            : ''}</td>`}
       <td class="num">${t.track_no || ''}</td>
       <td class="clip" title="${h(t.path)}">${h(t.title || (t.rel_path || '').split('/').pop())}
         ${t.empty ? '<span class="tag bad">empty</span>' : ''}
@@ -316,12 +355,154 @@ function renderLibrary() {
       <td>${stateTag(t)}</td>
       <td class="mono">${h((t.ext || '').replace('.', '').toUpperCase())}
         ${t.bitrate ? Math.round(t.bitrate / 1000) : ''}</td>
+      ${inbox ? '' : `<td class="mono" title="added ${h(when(t.added_at))}
+        \u00b7 file modified ${h(when(t.mtime))}">${h(ago(t.added_at))}</td>`}
       <td class="mono">${h(t.isrc || '')}</td>
     </tr>`).join('');
 
-  const shown = S.tracks.length;
-  const allShown = shown > 0 && S.tracks.every(t => S.sel.has(t.content_key));
+  const allShown = S.tracks.length > 0
+    && S.tracks.every(t => S.sel.has(t.content_key));
   const from = S.offset + 1, to = Math.min(S.offset + S.limit, S.tracksTotal);
+  const empty = inbox
+    ? 'Nothing new. Everything indexed has been looked at.'
+    : 'No tracks match.';
+
+  return renderOutcome() + renderSelectionBar(allShown) + `
+    <div class="withside">
+    <div class="withside-main">
+    <table class="tbl" id="lib-table">
+      <thead><tr>
+        <th class="tick"><input type="checkbox" id="pick-all"
+          title="Select everything on this page" ${allShown ? 'checked' : ''}></th>
+        ${inbox
+          ? '<th style="width:104px">Added</th>'
+          : '<th class="tick" title="On the device selected above">ON</th>'}
+        <th class="num" style="width:34px">#</th>
+        <th style="width:26%">Name</th>
+        <th class="num" style="width:48px">Time</th>
+        <th style="width:19%">Artist</th>
+        <th style="width:19%">Album</th>
+        <th style="width:120px" title="Enrichment state">Metadata</th>
+        <th style="width:82px">Format</th>
+        ${inbox ? '' : `<th style="width:96px"
+          title="When the catalog first saw this file. Hover a cell for the exact time and the file's own modified date."
+          >Added</th>`}
+        <th style="width:104px">ISRC</th>
+      </tr></thead>
+      <tbody>${rows || `<tr><td colspan="${inbox ? 10 : 11}" class="empty">${h(empty)}</td></tr>`}</tbody>
+    </table>
+    <div class="footnote hstack">
+      <span>${S.tracksTotal ? `SHOWING ${num(from)}–${num(to)} OF ${num(S.tracksTotal)}` : 'NOTHING TO SHOW'}</span>
+      <span style="flex:1"></span>
+      <span style="text-transform:none;letter-spacing:0">click select · shift+click range ·
+        ctrl+click add · ctrl+A page · E enrich · A accept ·
+        R reject · S skip · U raw · Enter edit · Esc clear</span>
+      <span style="flex:1"></span>
+      <button class="btn sm" data-page="-1" ${S.offset === 0 ? 'disabled' : ''}>Previous</button>
+      <button class="btn sm" data-page="1" ${to >= S.tracksTotal ? 'disabled' : ''}>Next</button>
+    </div>
+    </div>
+    ${renderInspector()}
+    </div>`;
+}
+
+/* What one track is, beside the table. Opened by clicking a row, because
+   that is the gesture that already means "this one" - and a library row is
+   nine columns of the fields that fit, which is never the artwork, the
+   path, or where the values came from. */
+function renderInspector() {
+  if (!S.inspectKey) return '';
+  const d = S.inspect;
+  const row = S.tracks.find(t => t.content_key === S.inspectKey) || {};
+  if (!d || d.content_key !== S.inspectKey) {
+    return `<aside class="inspector"><div class="pad"><span class="spin"></span></div></aside>`;
+  }
+  const value = (f) => {
+    if (d.overrides && d.overrides[f] !== undefined) return d.overrides[f];
+    const v = d.current[f];
+    return v === null || v === undefined ? '' : v;
+  };
+  const line = (label, text, cls) => text === '' || text === null
+    || text === undefined ? ''
+    : `<dt>${h(label)}</dt><dd class="${cls || ''}">${h(String(text))}</dd>`;
+  const edited = (f) => d.overrides && d.overrides[f] !== undefined
+    ? ' <span class="tag">edited</span>' : '';
+
+  // The file's own picture first, the release's as the fallback: a download
+  // carries a video frame, and seeing that is the whole reason to look.
+  const art = `<div class="art">
+      <img src="/api/art/${encodeURIComponent(d.content_key)}" alt=""
+        ${d.cover ? `data-fallback="${h(d.cover)}"` : ''}
+        onerror="this.dataset.fallback &amp;&amp; this.src !== this.dataset.fallback
+          ? (this.src = this.dataset.fallback)
+          : (this.style.display = 'none', this.parentNode.classList.add('none'))">
+      <span class="none-note">no artwork in this file</span>
+    </div>`;
+
+  return `<aside class="inspector">
+    ${art}
+    <div class="in">
+      <h3 class="pick">${h(value('title') || (d.rel_path || '').split('/').pop())}${edited('title')}</h3>
+      <div class="muted pick">${h(value('artist') || 'unknown artist')}</div>
+      <div class="hstack" style="margin:6px 0">
+        ${stateTag({ state: d.state, confidence: d.confidence,
+                     enrich_source: d.source,
+                     overrides: Object.keys(d.overrides || {}).length })}
+        ${d.copies > 1 ? `<span class="tag" title="the same audio appears ${d.copies} times">${d.copies} copies</span>` : ''}
+        ${d.mbid ? `<a class="tag" target="_blank" rel="noopener"
+          href="https://musicbrainz.org/recording/${h(d.mbid)}">musicbrainz</a>` : ''}
+      </div>
+      <dl class="kv">
+        ${line('album', value('album'))}
+        ${line('album artist', value('album_artist'))}
+        ${line('genre', value('genre') || '\u2014')}
+        ${line('year', value('year'))}
+        ${line('track', [value('track_no'), value('disc_no')
+          ? 'disc ' + value('disc_no') : ''].filter(Boolean).join(' \u00b7 '))}
+        ${line('length', dur(d.duration))}
+        ${line('format', [(row.ext || '').replace('.', '').toUpperCase(),
+          row.bitrate ? Math.round(row.bitrate / 1000) + ' kbps' : '',
+          bytes(row.size)].filter(Boolean).join(' \u00b7 '))}
+        ${line('isrc', value('isrc'))}
+        ${line('added', when(row.added_at))}
+        ${line('modified', when(row.mtime))}
+      </dl>
+      <div class="path pick mono" title="${h(d.path || '')}">${h(d.path || '')}</div>
+      ${d.purl ? `<a class="mono" style="font-size:10px;word-break:break-all"
+        href="${h(d.purl)}" target="_blank" rel="noreferrer">${h(d.purl)}</a>` : ''}
+      ${Object.keys(d.proposed || {}).length && d.state === 'awaiting'
+        ? `<div class="notice warn" style="margin-top:8px">${icon('i-warn')}
+            <div>A match is waiting on you. Open <b>Edit metadata</b> to see
+            it field by field, or accept it here.</div></div>
+           <div class="hstack" style="margin-top:6px">
+             <button class="btn sm" data-sel-act="accept">Accept</button>
+             <button class="btn sm" data-sel-act="reject">Reject</button>
+           </div>` : ''}
+      <div class="hstack" style="margin-top:8px">
+        <button class="btn sm" data-sel-act="edit">Edit metadata</button>
+        <button class="btn sm" data-sel-act="enrich">Identify again</button>
+        <span class="grow" style="flex:1"></span>
+        <button class="btn sm" data-close-inspector="1" title="Close">&times;</button>
+      </div>
+    </div>
+  </aside>`;
+}
+
+// The inspector follows the selection: one row, one subject.
+function syncInspector() {
+  const key = S.sel.size === 1 ? Array.from(S.sel)[0] : null;
+  if (key === S.inspectKey) return;
+  S.inspectKey = key;
+  S.inspect = null;
+  if (!key) return;
+  api('/enrich/track/' + encodeURIComponent(key)).then((d) => {
+    // The selection may have moved on while the request was in flight.
+    if (S.inspectKey === key) { S.inspect = d; render(); }
+  }, () => { /* an inspector that cannot load is not an error worth a banner */ });
+}
+
+function renderLibrary() {
+  const counts = (S.stats && S.stats.enrich_states) || {};
   const stateChip = (key, label) => `<button class="chip ${S.filter.state === key ? 'on' : ''}"
       data-state-filter="${key}">${label}${key
         ? `<span class="n">${num(counts[key] || 0)}</span>` : ''}</button>`;
@@ -351,34 +532,33 @@ function renderLibrary() {
       <span class="faint" style="font-size:10px">New files are identified and
         tagged automatically. Pick tracks to redo, correct or skip them.</span>
     </div>
-    ${renderOutcome()}
-    ${renderSelectionBar(allShown)}
-    <table class="tbl" id="lib-table">
-      <thead><tr>
-        <th class="tick"><input type="checkbox" id="pick-all"
-          title="Select everything on this page" ${allShown ? 'checked' : ''}></th>
-        <th class="tick" title="On the device selected above">ON</th>
-        <th class="num" style="width:34px">#</th>
-        <th style="width:26%">Name</th>
-        <th class="num" style="width:48px">Time</th>
-        <th style="width:19%">Artist</th>
-        <th style="width:19%">Album</th>
-        <th style="width:120px" title="Enrichment state">Metadata</th>
-        <th style="width:82px">Format</th>
-        <th style="width:104px">ISRC</th>
-      </tr></thead>
-      <tbody>${rows || '<tr><td colspan="10" class="empty">No tracks match.</td></tr>'}</tbody>
-    </table>
-    <div class="footnote hstack">
-      <span>${S.tracksTotal ? `SHOWING ${num(from)}\u2013${num(to)} OF ${num(S.tracksTotal)}` : 'NOTHING TO SHOW'}</span>
-      <span style="flex:1"></span>
-      <span style="text-transform:none;letter-spacing:0">click select \u00b7 shift+click range \u00b7
-        ctrl+click add \u00b7 ctrl+A page \u00b7 E enrich \u00b7 A accept \u00b7
-        R reject \u00b7 S skip \u00b7 U raw \u00b7 Enter edit \u00b7 Esc clear</span>
-      <span style="flex:1"></span>
-      <button class="btn sm" data-page="-1" ${S.offset === 0 ? 'disabled' : ''}>Previous</button>
-      <button class="btn sm" data-page="1" ${to >= S.tracksTotal ? 'disabled' : ''}>Next</button>
-    </div>`;
+    ${trackTable({})}`;
+}
+
+/* The inbox: everything indexed since it was last emptied, newest first.
+   It exists because a library is the wrong place to find the six tracks
+   that arrived this morning - they sort into the middle of an alphabet
+   thousands of rows long. Emptying it moves a watermark and nothing else:
+   no file is touched, no row leaves the library. */
+function renderInbox() {
+  const n = S.tracksTotal;
+  return `
+    <div class="hstack" style="padding:6px 10px;border-bottom:1px solid var(--line-2)">
+      <span class="faint mono" style="font-size:9px;letter-spacing:.1em">NEW SINCE LAST EMPTIED</span>
+      <strong style="font-size:11px">${num(n)} track${n === 1 ? '' : 's'}</strong>
+      <span class="faint" style="font-size:10px">Downloads and scanned files
+        land here first. Identification runs on them automatically; this is
+        where you check what it did.</span>
+      <span class="grow" style="flex:1"></span>
+      <span style="position:relative">
+        <input id="q" placeholder="Search title, artist, album" value="${h(S.filter.q)}"
+          style="width:230px;border:1px solid var(--line-2);border-radius:3px;padding:2px 6px 2px 22px">
+        <svg width="11" height="11" style="position:absolute;left:6px;top:5px;color:var(--faint)"><use href="#i-search"/></svg>
+      </span>
+      <button class="btn" data-inbox-seen="1" ${n ? '' : 'disabled'}
+        title="Stop treating everything indexed so far as new. Nothing is deleted.">Mark all as seen</button>
+    </div>
+    ${trackTable({ inbox: true })}`;
 }
 
 // A finished job, said out loud. Errors are the point: a run that failed
@@ -723,10 +903,28 @@ function renderImport() {
     <div class="card">
       <header><h3>Library folders</h3></header>
       <div class="in stack">
-        ${(st.roots || []).map(r => `<div class="hstack">
-          <span class="mono clip" style="flex:1">${h(r)}</span>
-          <button class="btn sm" data-scan="${h(r)}">Rescan</button></div>`).join('')
+        ${(st.root_detail || []).map(r => `<div class="hstack">
+          <span class="mono clip" style="flex:1;${r.hidden
+            ? 'color:var(--fainter);text-decoration:line-through' : ''}"
+            title="${h(r.root)}">${h(r.root)}</span>
+          ${r.hidden ? '<span class="tag">hidden</span>' : ''}
+          <span class="faint mono" style="font-size:10px">${num(r.tracks)} tracks
+            \u00b7 ${bytes(r.bytes)}</span>
+          <button class="btn sm" data-scan="${h(r.root)}"
+            ${r.hidden ? 'disabled' : ''}>Rescan</button>
+          <button class="btn sm" data-root-hide="${h(r.root)}"
+            data-hidden="${r.hidden ? '0' : '1'}"
+            title="${r.hidden
+              ? 'Show this folder in the library again'
+              : 'Keep it indexed but leave it out of the library, the facets and the inbox'
+            }">${r.hidden ? 'Show' : 'Hide'}</button>
+          <button class="btn sm danger" data-root-remove="${h(r.root)}"
+            title="Forget this folder and its tracks. No file is deleted."
+            >Remove</button></div>`).join('')
           || '<span class="faint">No folders indexed yet.</span>'}
+        <span class="faint" style="font-size:10.5px">Hiding keeps the catalog
+          and drops the folder out of the library; removing forgets its rows.
+          Neither one deletes a file.</span>
         <form id="scan-form" class="hstack">
           <input name="root" placeholder="C:/Users/you/Music/library" required
             style="flex:1;border:1px solid var(--line-2);border-radius:3px;padding:4px 7px">
@@ -766,9 +964,14 @@ function renderImport() {
 
 function renderDownload() {
   const d = S.dl;
-  if (!d) return '<div class="empty"><span class="spin"></span></div>';
+  if (!d) {
+    return `<div class="empty"><span class="spin"></span>
+      <div style="margin-top:8px">Checking what is installed...</div></div>`;
+  }
   const cfg = d.config, ck = d.cookies;
   const js = d.js_runtime || { found: [], chosen: null, detail: '' };
+  const bn = d.bundled || { frozen: false, tools: {} };
+  const bundledTool = (name) => bn.frozen && bn.tools && bn.tools[name];
   const job = S.job && S.job.kind === 'download' ? S.job : null;
   const res = S.dlResult;
   const failed = !!(job && job.state === 'failed');
@@ -792,6 +995,14 @@ function renderDownload() {
       Install it with <span class="mono">pip install yt-dlp</span>
       (and ffmpeg, which it uses to extract the audio).</div></div>`}
 
+    ${bn.frozen ? `<div class="notice ok">${icon('i-check')}<div>
+      <b>Everything downloading needs is inside this executable.</b>
+      yt-dlp, ffmpeg, Deno and fpcalc ship with it and are used without
+      being installed - ${['ffmpeg', 'deno', 'fpcalc']
+        .filter(n => bundledTool(n)).join(', ') || 'none found in the bundle'}.
+      A copy of any of them on your PATH is still preferred for yt-dlp, so
+      one you keep updated wins.</div></div>` : ''}
+
     <div class="card">
       <header><h3>Download from YouTube</h3>
         <span class="muted">audio only, straight into a library folder and
@@ -799,7 +1010,15 @@ function renderDownload() {
       <div class="in stack">
         <form id="dl-form" class="stack">
           <textarea name="urls" rows="3" required placeholder="https://www.youtube.com/watch?v=...&#10;one URL per line; a playlist or channel URL fetches all of it"
-            style="${field};width:100%;font-family:var(--mono);resize:vertical"></textarea>
+            style="${field};width:100%;font-family:var(--mono);resize:vertical"
+            >${h(S.dlUrls)}</textarea>
+          ${S.dlUrls.trim() ? `<div class="hstack">
+            <span class="faint" style="font-size:10px">${num(S.dlUrls.trim().split(/\s+/).length)}
+              URL${S.dlUrls.trim().split(/\s+/).length === 1 ? '' : 's'} kept from last time -
+              this box survives a reload.</span>
+            <span class="grow" style="flex:1"></span>
+            <button class="btn sm" type="button" data-clear-urls="1">Clear the list</button>
+          </div>` : ''}
           <div class="hstack">
             <label class="muted">Into</label>
             <select name="root" style="${field};flex:1 1 12em;min-width:0">
@@ -921,7 +1140,9 @@ function renderDownload() {
         <p class="muted">${h(js.detail)}</p>
         ${js.found.length ? `<table class="tbl"><tbody>${js.found.map(r => `<tr>
           <td>${h(r.name)}${js.chosen && js.chosen.name === r.name
-            ? ' <span class="tag ok">in use</span>' : ''}</td>
+            ? ' <span class="tag ok">in use</span>' : ''}${
+            bundledTool(r.name) && r.path === norm(bundledTool(r.name))
+              ? ' <span class="tag">bundled</span>' : ''}</td>
           <td class="mono clip pick" title="${h(r.path)}">${h(r.path)}</td>
         </tr>`).join('')}</tbody></table>`
         : `<div class="notice bad">${icon('i-warn')}<div>None installed.
@@ -952,7 +1173,9 @@ function renderDownload() {
           </select>
           <button class="btn" type="submit">Save</button>
         </form>
-        <span class="faint">yt-dlp ${d.ytdlp ? h(d.ytdlp) : 'not installed'}</span>
+        <span class="faint">yt-dlp ${d.ytdlp ? h(d.ytdlp) : 'not installed'}${
+          bn.frozen ? ' · ffmpeg ' + (bundledTool('ffmpeg')
+            ? 'bundled with this build' : 'from PATH') : ''}</span>
       </div>
     </div>
   </div>`;
@@ -1034,10 +1257,35 @@ function pickSetModal(device) {
      <button class="btn primary" data-save-set="${device.id}">Save set</button>`);
 }
 
+/* Removing a library folder forgets rows, never files. Said in the dialog
+   rather than in a tooltip, because "remove" next to a path is exactly the
+   word people expect to mean "delete my music". */
+function removeRootModal(root) {
+  const info = ((S.stats && S.stats.root_detail) || [])
+    .find(r => r.root === root) || { tracks: 0 };
+  showModal('Remove this library folder?', `
+    <p class="mono" style="margin-bottom:10px">${h(root)}</p>
+    <div class="notice ok" style="margin-bottom:10px">${icon('i-check')}
+      <div><b>Your audio files are not touched.</b> This removes
+      ${num(info.tracks)} row${info.tracks === 1 ? '' : 's'} from the catalog
+      and stops the folder being scanned. Scanning it again brings everything
+      back.</div></div>
+    <p class="muted">Playlist entries pointing at these tracks go back to
+      unmatched, and any device set built from them will copy less on its
+      next sync. To keep the catalog and only take the folder out of sight,
+      hide it instead.</p>`,
+    `<button class="btn" data-close="1">Cancel</button>
+     <button class="btn" data-root-hide="${h(root)}" data-hidden="1"
+       >Hide instead</button>
+     <button class="btn danger" data-root-forget="${h(root)}"
+       >Remove from library</button>`);
+}
+
 // ---------------------------------------------------------------- render
 
 const TITLES = {
   library: () => `MUSIC \u2014 ${num(S.tracksTotal)} TRACKS`,
+  inbox: () => `INBOX \u2014 ${num(S.tracksTotal)} NEW`,
   device: () => {
     const d = S.devices.find(x => x.id === S.deviceId);
     return d ? (d.name + ' \u2014 SYNC PLAN').toUpperCase() : 'DEVICE';
@@ -1079,12 +1327,14 @@ function renderStatus() {
 }
 
 function render() {
+  if (isTrackView()) syncInspector();
   renderSidebar();
   $('#titlebar').innerHTML = `<span>${h((TITLES[S.view] || (() => S.view))())}</span>
     <span class="grow"></span>
     ${S.error ? `<span style="color:var(--bad);text-transform:none;font-family:var(--sans);font-size:11px">${h(S.error)}</span>` : ''}`;
   const body = {
-    library: renderLibrary, device: renderDevice, playlist: renderPlaylist,
+    library: renderLibrary, inbox: renderInbox,
+    device: renderDevice, playlist: renderPlaylist,
     addDevice: renderAddDevice, import: renderImport, problems: renderProblems,
     download: renderDownload,
   }[S.view];
@@ -1144,6 +1394,11 @@ function selectRow(index, ev) {
   if (!t) return;
   const key = t.content_key;
   if (ev && ev.shiftKey && S.anchor !== null) {
+    // Text is selectable everywhere now, so a shift-click on the table
+    // would leave a stray highlight dragged across the rows behind the
+    // real selection. Drop it: the rows are the selection here.
+    const native = window.getSelection();
+    if (native) native.removeAllRanges();
     const [a, b] = S.anchor <= index ? [S.anchor, index] : [index, S.anchor];
     // A shift-click extends rather than replaces, so two ranges can be
     // collected without holding a third modifier down.
@@ -1233,8 +1488,47 @@ function decide(act, keys) {
 // ------------------------------------------------------- enrich a picking
 
 function enrichModal(keys) {
+  if (keys.length === 1) {
+    // The terms are worth showing even when nothing is wrong with them:
+    // "no result" is unreadable until you can see what was asked.
+    return guard(async () => {
+      S.detail = await api('/enrich/track/' + encodeURIComponent(keys[0]));
+      showEnrichModal(keys);
+    });
+  }
+  S.detail = null;
+  showEnrichModal(keys);
+}
+
+function showEnrichModal(keys) {
   S.dialogKeys = keys.slice();
-  const body = `<p class="muted" style="margin-bottom:10px">
+  const one = keys.length === 1 ? (S.detail || null) : null;
+  const search = (one && one.search) || {};
+  const field = (name, label, value, ph) => `<label class="field"
+      style="flex:1 1 10em;min-width:0;margin-bottom:0"><span>${h(label)}</span>
+    <input name="${name}" value="${h(value || '')}" placeholder="${h(ph || '')}"
+      autocomplete="off"></label>`;
+  const terms = one ? `
+    <div class="card" style="margin-bottom:10px">
+      <header><h3>What to search for</h3>
+        <span class="muted">the terms this lookup will send</span></header>
+      <div class="in">
+        <form id="enrich-query" class="hstack" style="align-items:flex-end;gap:8px">
+          ${field('artist', 'Artist', search.artist, 'blank searches on the title alone')}
+          ${field('title', 'Title', search.title)}
+          ${field('album', 'Album', search.album, 'used to prefer one release')}
+        </form>
+        <p class="muted" style="margin-top:8px;font-size:11px">
+          These start as what an automatic lookup would use - the tags, or
+          the two halves of a video title when the artist tag is a channel
+          name. Trim them when the tag is the problem: <em>Song (Single
+          Version)</em>, <em>Song - Official Video</em> and
+          <em>Song feat. Someone</em> are the three that find nothing, and
+          <em>Song</em> finds it. Edited terms are searched exactly as typed,
+          once - the automatic rewrites are not tried on top of them.</p>
+      </div>
+    </div>` : '';
+  const body = terms + `<p class="muted" style="margin-bottom:10px">
       Look up ${num(keys.length)} selected track${keys.length === 1 ? '' : 's'}
       against MusicBrainz again. New files are already done automatically as
       they arrive, so this is for asking a second time - after correcting the
@@ -1265,6 +1559,19 @@ function startEnrich(keys) {
   const fp = $('#en-fp'), wt = $('#en-write');
   const body = { content_keys: keys, fingerprint: !!(fp && fp.checked),
                  write_tags: !!(wt && wt.checked) };
+  // Only sent when a person actually changed something: an unedited box is
+  // the automatic search, and passing it back as a query would silently
+  // disable the rewrites that make the automatic search work.
+  const qf = $('#enrich-query');
+  if (qf && S.detail && S.detail.search) {
+    const typed = { artist: qf.artist.value.trim(),
+                    title: qf.title.value.trim(),
+                    album: qf.album.value.trim() };
+    const was = S.detail.search;
+    const same = ['artist', 'title', 'album']
+      .every(k => (typed[k] || '') === ((was[k] || '')));
+    if (!same && typed.title) body.query = typed;
+  }
   closeModal();
   return guard(async () => {
     const res = await api('/enrich/run', {
@@ -1540,7 +1847,7 @@ async function guard(fn) {
 }
 
 document.addEventListener('click', (ev) => {
-  if (S.view !== 'library') return;
+  if (!isTrackView()) return;
   const box = ev.target.closest('[data-pick]');
   if (box) {
     // The checkbox is a plain toggle whatever modifier is held: it is the
@@ -1593,7 +1900,9 @@ document.addEventListener('click', (ev) => {
     + '[data-plan],[data-sync],[data-unset],[data-pick-set],[data-save-set],'
     + '[data-detect-pl],'
     + '[data-close],[data-scrim],[data-usevol],[data-scan],[data-volumes],'
-    + '[data-probe],[data-copylog],'
+    + '[data-probe],[data-copylog],[data-inbox-seen],[data-clear-urls],'
+    + '[data-close-inspector],'
+    + '[data-root-hide],[data-root-remove],[data-root-forget],'
     + '[data-plsync],[data-playlist],[data-track]');
   if (!t) return;
 
@@ -1604,13 +1913,23 @@ document.addEventListener('click', (ev) => {
 
   if (d.act === 'view') {
     S.view = d.arg;
-    if (d.arg === 'library') return guard(loadLibrary);
+    if (d.arg === 'library' || d.arg === 'inbox') {
+      // The two views share the table, and the offset and selection belong
+      // to the question that was asked, not to the one being left.
+      S.offset = 0; S.sel.clear(); S.anchor = null;
+      return guard(loadLibrary);
+    }
     if (d.arg === 'problems') {
       S.problems = null;
+      render();
       return guard(async () => { S.problems = await api('/problems'); });
     }
     if (d.arg === 'download') {
       S.dlProbe = null;
+      // Painted first, loaded second: the config asks yt-dlp its version and
+      // looks for a JavaScript runtime, and a click that waits on both is a
+      // click that feels broken.
+      render();
       return guard(loadDownload);
     }
     return render();
@@ -1753,6 +2072,12 @@ document.addEventListener('click', (ev) => {
     }
     return;
   }
+  if (d.clearUrls) {
+    setDownloadUrls('');
+    const form = $('#dl-form');
+    if (form) { form.urls.value = ''; form.urls.focus(); }
+    return render();
+  }
   if (d.probe) {
     const form = $('#dl-form');
     const url = ((form && form.urls.value) || '').trim().split(/\s+/)[0];
@@ -1763,6 +2088,42 @@ document.addEventListener('click', (ev) => {
         method: 'POST', body: JSON.stringify({ url }),
       });
     });
+  }
+  if (d.inboxSeen) {
+    return guard(async () => {
+      await api('/inbox/seen', { method: 'POST', body: JSON.stringify({}) });
+      S.sel.clear(); S.anchor = null; S.offset = 0;
+      await loadCore();
+      await loadLibrary();
+    });
+  }
+  if (d.rootHide) {
+    const hidden = d.hidden === '1';
+    return guard(async () => {
+      await api('/roots/hide', {
+        method: 'POST',
+        body: JSON.stringify({ root: d.rootHide, hidden }),
+      });
+      await loadCore();
+      if (isTrackView()) await loadLibrary();
+    });
+  }
+  if (d.rootRemove) return removeRootModal(d.rootRemove);
+  if (d.rootForget) {
+    const root = d.rootForget;
+    closeModal();
+    return guard(async () => {
+      await api('/roots/remove', {
+        method: 'POST',
+        body: JSON.stringify({ root, forget_tracks: true }),
+      });
+      await loadCore();
+      if (isTrackView()) await loadLibrary();
+    });
+  }
+  if (d.closeInspector) {
+    S.sel.clear(); S.anchor = null;
+    return render();
   }
   if (d.volumes) return loadVolumes();
   if (d.scan) return startScan(d.scan);
@@ -1872,9 +2233,22 @@ document.addEventListener('submit', (ev) => {
   }
 });
 
+function setDownloadUrls(text) {
+  S.dlUrls = text;
+  try {
+    if (text.trim()) localStorage.setItem('lz.dl.urls', text);
+    else localStorage.removeItem('lz.dl.urls');
+  } catch (e) { /* private mode, or storage full: the box still works */ }
+}
+
 let filterTimer = null;
 document.addEventListener('input', (ev) => {
   const el = ev.target;
+  if (el.name === 'urls' && el.form && el.form.id === 'dl-form') {
+    // Kept on every keystroke rather than on submit: the list is worth most
+    // exactly when the download failed and has to be tried again.
+    return setDownloadUrls(el.value);
+  }
   if (el.dataset.filter) {
     S.navFilter[el.dataset.filter] = el.value;
     renderSidebar();
@@ -1917,7 +2291,7 @@ document.addEventListener('keydown', (ev) => {
 
   if (ev.key === 'Escape') {
     if (modal) return closeModal();
-    if (S.view === 'library' && S.sel.size) {
+    if (isTrackView() && S.sel.size) {
       S.sel.clear(); S.anchor = null;
       return render();
     }
@@ -1932,7 +2306,7 @@ document.addEventListener('keydown', (ev) => {
     }
     return;
   }
-  if (typing || S.view !== 'library') return;
+  if (typing || !isTrackView()) return;
 
   if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a') {
     ev.preventDefault();

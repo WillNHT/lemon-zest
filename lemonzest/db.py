@@ -2,7 +2,7 @@
 import os
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -34,12 +34,17 @@ CREATE TABLE IF NOT EXISTS track (
     codec        TEXT,
     bitrate      INTEGER,
     sample_rate  INTEGER,
-    seen_at      REAL NOT NULL
+    seen_at      REAL NOT NULL,
+    -- When the catalog first saw this file. Distinct from seen_at, which
+    -- every rescan moves forward: the inbox is "what arrived since I last
+    -- looked", and that question needs a timestamp that does not change.
+    added_at     REAL
 );
 CREATE INDEX IF NOT EXISTS ix_track_isrc   ON track(isrc);
 CREATE INDEX IF NOT EXISTS ix_track_artist ON track(artist);
 CREATE INDEX IF NOT EXISTS ix_track_album  ON track(album);
 CREATE INDEX IF NOT EXISTS ix_track_root   ON track(root);
+CREATE INDEX IF NOT EXISTS ix_track_added  ON track(added_at);
 
 -- Library folders the scanner watches. Kept apart from track.root so a
 -- folder that holds no music yet is still a place downloads can land: an
@@ -47,7 +52,11 @@ CREATE INDEX IF NOT EXISTS ix_track_root   ON track(root);
 CREATE TABLE IF NOT EXISTS library_root (
     root       TEXT PRIMARY KEY,   -- absolute, NFC-normalised
     added_at   REAL,
-    scanned_at REAL
+    scanned_at REAL,
+    -- Hidden folders stay indexed but drop out of the library, the facets
+    -- and the inbox. Removing a folder is the other option, and that one
+    -- forgets its tracks; neither ever touches a file on disk.
+    hidden     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS playlist (
@@ -206,14 +215,26 @@ def migrate(con):
     the database actually holds rather than by a stored version number, so
     a half-applied upgrade finishes on the next open.
     """
+    track_cols = _columns(con, "track")
+    if track_cols and "added_at" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN added_at REAL")
+        # Every file already in the catalog counts as arrived when it was
+        # last seen. Backdating them all to now would put an existing
+        # library in the inbox, which is exactly what the inbox is not for.
+        con.execute("UPDATE track SET added_at = seen_at WHERE added_at IS NULL")
+
+    root_cols = _columns(con, "library_root")
+    if root_cols and "hidden" not in root_cols:
+        con.execute("ALTER TABLE library_root ADD COLUMN hidden "
+                    "INTEGER NOT NULL DEFAULT 0")
+
     cols = _columns(con, "device")
-    if not cols:
-        return
-    if "hoard_id" in cols and "device_uid" not in cols:
-        con.execute("ALTER TABLE device RENAME COLUMN hoard_id TO device_uid")
-    if "playlist_template" not in cols:
-        con.execute("ALTER TABLE device ADD COLUMN playlist_template "
-                    "TEXT NOT NULL DEFAULT '{name}.m3u8'")
+    if cols:
+        if "hoard_id" in cols and "device_uid" not in cols:
+            con.execute("ALTER TABLE device RENAME COLUMN hoard_id TO device_uid")
+        if "playlist_template" not in cols:
+            con.execute("ALTER TABLE device ADD COLUMN playlist_template "
+                        "TEXT NOT NULL DEFAULT '{name}.m3u8'")
     con.commit()
 
 
@@ -261,11 +282,93 @@ def add_root(con, root, scanned=False):
     return root
 
 
-def roots(con):
+def roots(con, include_hidden=True):
     """Every library folder, registered or merely inferred from its tracks."""
-    return [r["root"] for r in con.execute(
+    rows = con.execute(
         "SELECT root FROM library_root "
-        "UNION SELECT DISTINCT root FROM track ORDER BY root")]
+        "UNION SELECT DISTINCT root FROM track ORDER BY root")
+    out = [r["root"] for r in rows]
+    if include_hidden:
+        return out
+    hidden = hidden_roots(con)
+    return [r for r in out if r not in hidden]
+
+
+def hidden_roots(con):
+    """Folders the user has hidden. Their tracks stay in the catalog."""
+    return {r["root"] for r in con.execute(
+        "SELECT root FROM library_root WHERE hidden = 1")}
+
+
+def roots_detail(con):
+    """Every library folder with what the catalog knows about it."""
+    known = {r["root"]: r for r in con.execute("SELECT * FROM library_root")}
+    out = []
+    for root in roots(con):
+        row = known.get(root)
+        counts = con.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(size),0) b FROM track WHERE root=?",
+            (root,)).fetchone()
+        out.append({
+            "root": root,
+            "tracks": counts["n"],
+            "bytes": counts["b"],
+            "hidden": bool(row["hidden"]) if row else False,
+            "scanned_at": row["scanned_at"] if row else None,
+            "registered": row is not None,
+        })
+    return out
+
+
+def set_root_hidden(con, root, hidden):
+    """Hide or unhide a library folder. Nothing on disk is touched."""
+    from .paths import norm
+
+    root = norm(os.path.abspath(root))
+    # A folder known only through its tracks has no row to flag yet.
+    con.execute(
+        "INSERT INTO library_root(root, added_at, scanned_at, hidden) "
+        "VALUES (?, NULL, NULL, ?) "
+        "ON CONFLICT(root) DO UPDATE SET hidden = excluded.hidden",
+        (root, 1 if hidden else 0),
+    )
+    con.commit()
+    return root
+
+
+def remove_root(con, root, forget_tracks=True):
+    """Drop a library folder from the catalog.
+
+    The audio files are left exactly where they are: this forgets rows, it
+    does not delete music. Playlist entries pointing at forgotten tracks go
+    back to unmatched rather than disappearing, which is what the schema's
+    ON DELETE SET NULL already does.
+    """
+    from .paths import norm
+
+    root = norm(os.path.abspath(root))
+    removed = 0
+    if forget_tracks:
+        removed = con.execute(
+            "SELECT COUNT(*) FROM track WHERE root=?", (root,)).fetchone()[0]
+        con.execute("DELETE FROM track WHERE root=?", (root,))
+    con.execute("DELETE FROM library_root WHERE root=?", (root,))
+    con.commit()
+    return {"root": root, "tracks_removed": removed}
+
+
+def meta_get(con, key, default=None):
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def meta_set(con, key, value):
+    con.execute(
+        "INSERT INTO meta(key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+    con.commit()
 
 
 def log(con, device_id, kind, detail=None, size=None):

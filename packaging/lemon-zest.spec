@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for the standalone Lemon Zest executable.
+"""PyInstaller spec for the standalone Lemon Zest build.
 
 Build it from the repository root:
 
     pip install -e . -r packaging/requirements-build.txt
     pyinstaller --clean --noconfirm packaging/lemon-zest.spec
+    python packaging/make_zip.py            # what the release ships
 
-The result is dist/lemon-zest.exe on Windows, dist/lemon-zest elsewhere.
+The result is a folder, dist/lemon-zest/, with lemon-zest.exe at the top of
+it. A folder rather than one file because of what travels with it: ffmpeg,
+Deno and yt-dlp are a quarter of a gigabyte, and a onefile build unpacks
+every byte of that into a temporary directory on **every** launch, which
+turns a double-click into a five-second wait. Unpacked once, by whoever
+extracts the zip, it starts immediately and every launch after is free.
 
 Everything the build needs to know is derived here rather than passed in, so
 the same command works on a laptop and on a CI runner: the version comes
@@ -23,6 +29,7 @@ HERE = SPECPATH
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+import fetch_tools  # noqa: E402
 import stage_frontend  # noqa: E402
 import version_info  # noqa: E402
 
@@ -48,6 +55,19 @@ if sys.platform == "win32":
 # with the binary under the package path the server looks in.
 datas = [(WORK, os.path.join("lemonzest", "web"))]
 
+# ffmpeg, Deno and fpcalc, downloaded at build time and folded in whole.
+# They are the difference between "install these three first" and a binary
+# that works on a machine with nothing on it: lemonzest.bundled puts this
+# folder at the front of PATH at startup, and yt-dlp finds them there.
+#
+# They go in as binaries rather than datas so PyInstaller treats them as
+# executables on the platforms where that matters, and land under `tools`,
+# which is the one name lemonzest.bundled looks for.
+TOOLS = os.path.join(ROOT, "build", "tools")
+binaries = [(path, fetch_tools.TOOLS_DEST) for path in fetch_tools.stage(TOOLS)]
+if not binaries:
+    print("WARNING: no bundled tools staged - this build needs ffmpeg on PATH")
+
 # Flask and Click are imported directly; the rest are pulled in by name at
 # runtime and would otherwise be missed by the import graph.
 hiddenimports = [
@@ -68,6 +88,10 @@ hiddenimports = [
     "mutagen.oggopus",
     "mutagen.oggvorbis",
     "psutil",
+    # Bundled rather than expected on PATH: the executable re-runs itself
+    # with --yt-dlp and becomes it. Nothing imports it at module scope, so
+    # the import graph would not find it.
+    "yt_dlp",
 ]
 
 excludes = [
@@ -80,7 +104,7 @@ excludes = [
 a = Analysis(
     [os.path.join(HERE, "entry.py")],
     pathex=[ROOT],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -94,9 +118,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    # exclude_binaries: the libraries and the bundled tools are collected
+    # beside the executable rather than packed inside it. This is what makes
+    # the build a folder, and what makes it start instantly.
+    exclude_binaries=True,
     name="lemon-zest",
     debug=False,
     bootloader_ignore_signals=False,
@@ -111,4 +136,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version=VERSION_FILE,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name="lemon-zest",
 )
