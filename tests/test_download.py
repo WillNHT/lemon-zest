@@ -15,6 +15,7 @@ import os
 # should be making rate-limited calls to somebody else's service.
 os.environ["LEMONZEST_AUTO_ENRICH"] = "0"
 
+import contextlib
 import sys
 import tempfile
 import time
@@ -76,6 +77,17 @@ for name in names:
     if archive:
         with open(archive, "a", encoding="utf-8") as fh:
             fh.write(name + "\\n")
+    # A gate, when the test asks for one: the file is written and then
+    # nothing more happens until whoever is watching says so. It is how a
+    # test can insist that the work following a file happened before the
+    # next file was fetched, rather than hoping the timing lands that way.
+    gate = os.environ.get("LZ_FAKE_GATE")
+    if gate:
+        marker = os.path.join(gate, str(idx) + ".go")
+        waited = 0.0
+        while not os.path.exists(marker) and waited < 10.0:
+            time.sleep(0.02)
+            waited += 0.02
 sys.stdout.write(os.environ.get("LZ_FAKE_STDERR", ""))
 linger = float(os.environ.get("LZ_FAKE_LINGER", "0"))
 if linger:
@@ -85,6 +97,28 @@ if linger:
     time.sleep(linger)
 sys.exit(int(os.environ.get("LZ_FAKE_CODE", "0")))
 '''
+
+
+@contextlib.contextmanager
+def _stub_stream(cls):
+    """Put a stand-in in place of the identification pass.
+
+    The queue builds its own on a thread of its own, so there is nothing to
+    hand one to: it is swapped on the module instead. The queue itself is
+    reset around this, because it is one per catalog for the life of the
+    process and would otherwise carry a stream - and a backlog - from one
+    test into the next.
+    """
+    from lemonzest import enrich as en
+    from lemonzest import enrichq
+    enrichq.reset_queues()
+    was = en.IngestStream
+    en.IngestStream = cls
+    try:
+        yield
+    finally:
+        en.IngestStream = was
+        enrichq.reset_queues()
 
 
 class DownloadTests(unittest.TestCase):
@@ -103,6 +137,7 @@ class DownloadTests(unittest.TestCase):
         os.environ.pop("LZ_FAKE_CODE", None)
         os.environ.pop("LZ_FAKE_STDERR", None)
         os.environ.pop("LZ_FAKE_LINGER", None)
+        os.environ.pop("LZ_FAKE_GATE", None)
 
     def tearDown(self):
         download.ytdlp_command = self._real_command
@@ -375,6 +410,212 @@ class DownloadTests(unittest.TestCase):
                                     cfg=self.cfg())
         self.assertEqual(summary["downloaded"], 2)
         self.assertEqual(summary["playlist"]["added"], 2)
+
+    # -------------------------------------------------- the arrival pipeline
+
+    def test_each_file_is_carried_the_rest_of_the_way_as_it_lands(self):
+        """Track one is finished while track two is still being fetched.
+
+        The gate is the whole test: the stub will not write the second file
+        until the first has been identified, so a run that waited for the
+        download to finish before identifying anything cannot complete. The
+        batch form this replaced could not pass it.
+        """
+        gate = os.path.join(self.tmp, "gate")
+        os.makedirs(gate)
+        os.environ["LZ_FAKE_GATE"] = gate
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a;A/x/three.m4a"
+
+        seen = []
+
+        class Stream:
+            """Stands in for the identification pass. Opens the next gate."""
+
+            def __init__(self, con, **kw):
+                self.counts = dict(applied=0, candidates=0, unmatched=0,
+                                   written=0, failed=0, skipped=0,
+                                   backfilled=0, write_failed=0, stopped=None,
+                                   errors=[], auto=True)
+
+            def add(self, content_key):
+                seen.append(content_key)
+                self.counts["applied"] += 1
+                open(os.path.join(gate, "%d.go" % len(seen)), "w").close()
+                return {"state": "applied", "detail": "identified: A - x"}
+
+        started = time.time()
+        with _stub_stream(Stream):
+            summary = download.download(self.con, ["https://example.test/l"],
+                                        root=self.root, cfg=self.cfg())
+        elapsed = time.time() - started
+
+        # The gate gives up after ten seconds so a regression fails rather
+        # than hangs. Finishing well inside that is the proof that each gate
+        # was opened by the work rather than by the timeout.
+        self.assertLess(elapsed, 5.0,
+                        "the arrivals were not identified as they landed")
+        self.assertEqual(summary["downloaded"], 3)
+        self.assertEqual(len(seen), 3, "every arrival should have been "
+                                       "identified as it landed")
+        self.assertEqual(summary["queued"], 3)
+
+    def test_the_batch_says_what_each_arrival_is_doing(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+
+        class Stream:
+            def __init__(self, con, **kw):
+                self.counts = dict(applied=0, candidates=0, unmatched=0,
+                                   written=0, failed=0, skipped=0,
+                                   backfilled=0, write_failed=0, stopped=None,
+                                   errors=[], auto=True)
+
+            def add(self, content_key):
+                self.counts["applied"] += 1
+                return {"state": "applied", "detail": "identified: A - x"}
+
+        snapshots = []
+        with _stub_stream(Stream):
+            summary = download.download(
+                self.con, ["https://example.test/l"], root=self.root,
+                cfg=self.cfg(),
+                on_batch=lambda b: snapshots.append(b["items"]))
+
+        states = {i["state"] for snap in snapshots for i in snap}
+        self.assertTrue({"indexing", "queued"} <= states, states)
+        self.assertEqual(summary["downloaded"], 2)
+        self.assertEqual(summary["queued"], 2)
+        # The queue works on its own clock, so the last word on each item
+        # arrives after the download itself is over - and the batch, which
+        # the page is still watching, keeps taking it.
+        from lemonzest import enrichq
+        enrichq.get_queue(download.db.path_of(self.con)).drain(timeout=10)
+        final = snapshots[-1]
+        self.assertEqual([i["n"] for i in final], [1, 2])
+
+    def test_a_snapshot_is_a_copy_the_caller_can_keep(self):
+        """The batch keeps changing under a caller that holds one."""
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        snapshots = []
+        download.download(self.con, ["https://example.test/l"],
+                          root=self.root, cfg=self.cfg(),
+                          on_batch=lambda b: snapshots.append(b["items"]))
+        first = next(s for s in snapshots if s)
+        self.assertEqual(len(first), 1,
+                         "a snapshot taken at one file grew a second one")
+
+    def test_the_pipeline_can_be_turned_off(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a"
+        summary = download.download(self.con, ["https://example.test/v"],
+                                    root=self.root, cfg=self.cfg(),
+                                    pipeline=False)
+        self.assertEqual(summary["added"], 1)
+        self.assertEqual(summary["queued"], 0)
+
+    def test_a_file_that_cannot_be_catalogued_is_said_so_and_not_fatal(self):
+        """Written outside the library: no catalog row, nothing to look up."""
+        outside = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(outside)
+        os.environ["LZ_FAKE_FILES"] = "../elsewhere/stray.m4a;A/x/one.m4a"
+        summary = download.download(self.con, ["https://example.test/l"],
+                                    root=self.root, cfg=self.cfg())
+        items = {i["n"]: i for i in summary["batch"]["items"]}
+        self.assertEqual(items[1]["state"], "failed")
+        self.assertEqual(items[1]["detail"], "could not be catalogued")
+        self.assertEqual(items[2]["state"], "done")
+        self.assertEqual(summary["failed_index"], 1)
+        self.assertEqual(summary["added"], 1)
+
+    # ------------------------------------------------ playlists and memory
+
+    def test_a_playlist_url_becomes_a_playlist_without_being_asked(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root, cfg=self.cfg())
+        self.assertEqual([p["name"] for p in summary["playlists"]],
+                         ["stub list"])
+        self.assertEqual(summary["playlist"]["added"], 2)
+
+    def test_a_single_video_does_not_become_a_playlist_of_one(self):
+        summary = download.download(self.con, ["https://example.test/v"],
+                                    root=self.root, cfg=self.cfg())
+        self.assertEqual(summary["playlists"], [])
+        self.assertIsNone(summary["playlist"])
+
+    def test_a_named_playlist_still_wins(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root, playlist="mine",
+                                    cfg=self.cfg())
+        self.assertEqual([p["name"] for p in summary["playlists"]], ["mine"])
+
+    def test_the_playlist_is_written_beside_the_library(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root, cfg=self.cfg())
+        path = summary["playlists"][0]["file"]
+        self.assertTrue(path.endswith("playlists/stub list.m3u8"), path)
+        body = open(path, encoding="utf-8").read()
+        self.assertIn("#PLAYLIST: stub list", body)
+        # Relative to the playlist file, so the folder can be moved whole.
+        self.assertIn("../A/x/one.m4a", body)
+        self.assertNotIn(self.root, body)
+
+    def test_a_second_run_rewrites_the_file_rather_than_growing_it(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        for _ in range(3):
+            summary = download.download(self.con, ["https://example.test/l"],
+                                        root=self.root, cfg=self.cfg())
+        body = open(summary["playlists"][0]["file"], encoding="utf-8").read()
+        self.assertEqual(body.count("../A/x/one.m4a"), 1)
+
+    def test_the_urls_asked_for_are_remembered(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        download.download(self.con, ["https://example.test/list"],
+                          root=self.root, cfg=self.cfg())
+        recent = download.recent_urls(self.con)
+        self.assertEqual(len(recent), 1)
+        self.assertEqual(recent[0]["url"], "https://example.test/list")
+        self.assertEqual(recent[0]["title"], "stub list")
+        self.assertEqual(recent[0]["is_playlist"], 1)
+        self.assertEqual(recent[0]["playlist_name"], "stub list")
+        self.assertEqual(recent[0]["uses"], 1)
+
+    def test_the_recent_list_is_the_last_few_newest_first(self):
+        for i in range(7):
+            download.remember_url(self.con, "https://example.test/%d" % i)
+        recent = download.recent_urls(self.con, 5)
+        self.assertEqual(len(recent), 5)
+        self.assertEqual(recent[0]["url"], "https://example.test/6")
+
+    def test_asking_twice_moves_a_url_up_rather_than_repeating_it(self):
+        download.remember_url(self.con, "https://example.test/a")
+        download.remember_url(self.con, "https://example.test/b")
+        download.remember_url(self.con, "https://example.test/a")
+        recent = download.recent_urls(self.con)
+        self.assertEqual([r["url"] for r in recent],
+                         ["https://example.test/a", "https://example.test/b"])
+        self.assertEqual(recent[0]["uses"], 2)
+
+    def test_a_kept_url_carries_its_playlist_and_where_it_stands(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        download.download(self.con, ["https://example.test/list"],
+                          root=self.root, cfg=self.cfg())
+        download.keep_url(self.con, "https://example.test/list",
+                          playlist_name="stub list")
+        kept = download.kept_urls(self.con)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["playlist_name"], "stub list")
+        self.assertEqual(kept[0]["entries"], 2)
+        download.keep_url(self.con, "https://example.test/list", kept=False)
+        self.assertEqual(download.kept_urls(self.con), [])
+
+    def test_keeping_a_url_does_not_count_as_asking_for_it(self):
+        """Keeping is not downloading: the recent list must not reorder."""
+        download.remember_url(self.con, "https://example.test/a")
+        download.keep_url(self.con, "https://example.test/b",
+                          playlist_name="b")
+        self.assertEqual(download.recent_urls(self.con)[0]["url"],
+                         "https://example.test/a")
 
     # ------------------------------------------------------------- failures
 

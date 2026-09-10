@@ -130,6 +130,23 @@ def write(path, name, rows, source_uri=None, encode_paths=False):
     return len(rows)
 
 
+# Which service a "#Collection URI" names. A playlist that came from
+# somewhere should go on saying so: it is written into the file, so a
+# re-import of a file this program wrote does not quietly demote a
+# downloaded playlist to a local one.
+ORIGINS = (("music.youtube.", "youtube"), ("youtube.com", "youtube"),
+           ("youtu.be", "youtube"), ("apple.com", "apple_music"),
+           ("spotify.com", "spotify"))
+
+
+def origin_of(source_uri):
+    uri = (source_uri or "").lower()
+    for needle, name in ORIGINS:
+        if needle in uri:
+            return name
+    return "local"
+
+
 def import_dir(con, directory, recursive=False):
     """Import every playlist in a directory into the catalog.
 
@@ -152,15 +169,11 @@ def import_dir(con, directory, recursive=False):
     for f in files:
         pl = read(f)
         matched = unmatched = 0
-        origin = "local"
+        origin = origin_of(pl["source_uri"])
         # How many of these entries actually resolve to catalogued files?
         incoming_matched = sum(
             1 for e in pl["entries"] if e["abs_path"] and e["abs_path"] in by_path
         )
-        if pl["source_uri"] and "apple.com" in pl["source_uri"]:
-            origin = "apple_music"
-        elif pl["source_uri"] and "spotify.com" in pl["source_uri"]:
-            origin = "spotify"
         con.execute(
             "INSERT INTO playlist(name, origin, source_uri, imported_from, imported_at) "
             "VALUES (?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
@@ -202,6 +215,15 @@ def import_dir(con, directory, recursive=False):
                             "enriched": enriched})
             continue
 
+        # An import replaces the entries wholesale, so when each one first
+        # joined has to be carried across by hand. Without this, every scan
+        # of the library folder would re-import its own playlists and mark
+        # all of them new.
+        was = {r["raw_path"]: r["added_at"] for r in con.execute(
+            "SELECT raw_path, added_at FROM playlist_entry "
+            "WHERE playlist_id = ?", (pid,))}
+        now = time.time()
+        joined = 0
         con.execute("DELETE FROM playlist_entry WHERE playlist_id=?", (pid,))
         for pos, e in enumerate(pl["entries"]):
             tid = by_path.get(e["abs_path"]) if e["abs_path"] else None
@@ -209,12 +231,23 @@ def import_dir(con, directory, recursive=False):
                 matched += 1
             else:
                 unmatched += 1
+            when = was.get(e["raw_path"])
+            if when is None:
+                when = now
+                joined += 1
             con.execute(
                 "INSERT INTO playlist_entry(playlist_id,pos,track_id,raw_path,"
-                "title_hint,duration,source_uri) VALUES (?,?,?,?,?,?,?)",
+                "title_hint,duration,source_uri,added_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (pid, pos, tid, e["raw_path"], e["title_hint"], e["duration"],
-                 e["source_uri"]),
+                 e["source_uri"], when),
             )
+        if joined and was:
+            # `was` empty means this playlist is new to the catalog, and a
+            # playlist that has just been imported for the first time is not
+            # a playlist that has changed.
+            con.execute("UPDATE playlist SET updated_at = ? WHERE id = ?",
+                        (now, pid))
         results.append({"name": pl["name"], "file": f, "total": len(pl["entries"]),
                         "matched": matched, "unmatched": unmatched,
                         "source_uri": pl["source_uri"], "mode": "imported",
@@ -223,7 +256,7 @@ def import_dir(con, directory, recursive=False):
     return results
 
 
-def append_tracks(con, name, track_ids, origin="local"):
+def append_tracks(con, name, track_ids, origin="local", source_uri=None):
     """Add catalogued tracks to the end of a playlist, creating it if new.
 
     This is the path a download takes: the file is already in the catalog,
@@ -238,10 +271,17 @@ def append_tracks(con, name, track_ids, origin="local"):
     name = norm_name(name)
     if not name:
         raise ValueError("a playlist needs a name")
+    now = time.time()
     con.execute(
-        "INSERT INTO playlist(name, origin, imported_at) VALUES (?,?,?) "
-        "ON CONFLICT(name) DO NOTHING",
-        (name, origin, time.time()),
+        "INSERT INTO playlist(name, origin, source_uri, imported_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+        # Where it came from is worth keeping even when the playlist is
+        # already here: a run that learns the URL should not have to wait
+        # for the playlist to be deleted before it can say so.
+        "source_uri = COALESCE(excluded.source_uri, playlist.source_uri), "
+        "origin = CASE WHEN excluded.origin = 'local' THEN playlist.origin "
+        "         ELSE excluded.origin END",
+        (name, origin, source_uri, time.time()),
     )
     pid = con.execute("SELECT id FROM playlist WHERE name=?", (name,)).fetchone()["id"]
 
@@ -268,15 +308,69 @@ def append_tracks(con, name, track_ids, origin="local"):
             title = f"{t['artist']} - {title}"
         con.execute(
             "INSERT INTO playlist_entry(playlist_id,pos,track_id,raw_path,"
-            "title_hint,duration,source_uri) VALUES (?,?,?,?,?,?,?)",
-            (pid, pos, tid, norm(t["path"]), title, t["duration"], t["purl"]),
+            "title_hint,duration,source_uri,added_at) VALUES (?,?,?,?,?,?,?,?)",
+            (pid, pos, tid, norm(t["path"]), title, t["duration"], t["purl"],
+             now),
         )
         have.add(tid)
         pos += 1
         added += 1
+    if added:
+        # Only when something actually joined: a run that fetched a playlist
+        # and found nothing new has not updated it, whatever it cost.
+        con.execute("UPDATE playlist SET updated_at = ? WHERE id = ?",
+                    (now, pid))
     con.commit()
     return {"name": name, "id": pid, "added": added, "skipped": skipped,
             "entries": pos}
+
+
+# Where a playlist lives on the PC side: a folder of its own inside the
+# library folder it describes. One place for both halves of a library, so a
+# library that is copied, moved or backed up takes its playlists with it,
+# and a scan of the folder finds them without being told where to look.
+LOCAL_DIR = "playlists"
+
+
+def local_path(root, name, directory=LOCAL_DIR):
+    return os.path.join(root, directory, safe_filename(name))
+
+
+def write_local(con, name, root, directory=LOCAL_DIR):
+    """Write a catalog playlist out as a file beside the library.
+
+    The device copies are written at sync time, against that device's own
+    folder layout and filename template. This is the PC-side copy: the one a
+    player pointed at the library reads, and the one a person looks at to
+    see whether the playlist really did get the new tracks.
+
+    Entries whose file is missing are left out rather than written as dead
+    lines - a player that hits one stops rather than skipping it. Returns the
+    path written and how many entries it holds.
+    """
+    name = norm_name(name)
+    row = con.execute("SELECT id, source_uri FROM playlist WHERE name = ?",
+                      (name,)).fetchone()
+    if row is None:
+        raise ValueError("no such playlist: " + name)
+    path = local_path(root, name, directory)
+    folder = os.path.dirname(path)
+    rows = []
+    for e in con.execute(
+            "SELECT e.raw_path, e.title_hint, e.duration, e.source_uri, "
+            "t.path AS track_path FROM playlist_entry e "
+            "LEFT JOIN track t ON t.id = e.track_id "
+            "WHERE e.playlist_id = ? ORDER BY e.pos", (row["id"],)):
+        target = e["track_path"] or e["raw_path"]
+        if not target or not os.path.isfile(target):
+            continue
+        rows.append((norm(os.path.relpath(target, folder)), e["title_hint"],
+                     e["duration"], e["source_uri"]))
+    # The source goes in the file, not only in the catalog: a re-import -
+    # which every scan of the library folder now does - would otherwise
+    # read back a playlist that had forgotten where it came from.
+    write(path, name, rows, source_uri=row["source_uri"])
+    return {"path": norm(path), "entries": len(rows)}
 
 
 DEFAULT_TEMPLATE = "{name}.m3u8"

@@ -393,11 +393,12 @@ class AutomaticTests(unittest.TestCase):
             if job and job["state"] != "running":
                 break
             time.sleep(0.02)
-        # The scan reports when the scan finished; the identification pass is
-        # its own job, so a rate-limited hour does not hide behind a
-        # scan that was over in a second.
+        # The scan reports when the scan finished. Identification is not a
+        # job of its own any more - it is a backlog the program works
+        # through at one request a second - so what the scan reports is how
+        # many files it put on the queue.
         self.assertEqual(job["state"], "done")
-        self.assertIn("enrich_job", job["result"])
+        self.assertIn("queued", job["result"])
 
 
 class StateApiTests(unittest.TestCase):

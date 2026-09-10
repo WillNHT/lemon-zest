@@ -22,6 +22,8 @@
   <symbol id="i-clock" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="5.6"/><polyline points="8,4.6 8,8.3 11,9.8"/></g></symbol>
   <symbol id="i-level" viewBox="0 0 16 16"><g fill="currentColor"><rect x="2.4" y="9" width="2.4" height="5"/><rect x="6.8" y="5" width="2.4" height="9"/><rect x="11.2" y="2" width="2.4" height="12"/></g></symbol>
   <symbol id="i-dl" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.6"><line x1="8" y1="1.8" x2="8" y2="10"/><polyline points="4.4,6.6 8,10.2 11.6,6.6"/><line x1="2.6" y1="13.4" x2="13.4" y2="13.4"/></g></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><polygon points="4,2.6 13,8 4,13.4" fill="currentColor"/></symbol>
+  <symbol id="i-keep" viewBox="0 0 16 16"><polygon points="8,1.8 10,6 14.4,6.5 11.2,9.6 12,14 8,11.9 4,14 4.8,9.6 1.6,6.5 6,6" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-search" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6.8" cy="6.8" r="4.2"/><line x1="10.1" y1="10.1" x2="14" y2="14"/></g></symbol>
 </defs></svg>
 
@@ -50,6 +52,11 @@
     </main>
   </div>
 </div>
+
+<!-- The listening bar. Outside #app because it is not part of any view:
+     it survives navigation, and the audio element inside it is built once
+     and kept, so a re-render does not restart the track. -->
+<div id="player" class="player" hidden></div>
 
 <div id="modal-root"></div>
 <script src="app.js"></script>

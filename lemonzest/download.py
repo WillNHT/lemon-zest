@@ -25,6 +25,7 @@ Firefox, falls back to the file, and then proceeds without cookies rather
 than refusing to start.
 """
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -736,7 +737,13 @@ def _new_batch(urls):
     return {"total": 0, "done": 0, "downloaded": 0, "skipped": 0,
             "failed": 0, "urls": len(urls), "listed": False,
             "started": time.time(), "finished": None,
-            "current": None}
+            "current": None,
+            # One entry per file that arrives, carrying what has happened to
+            # it since. A download used to be a single bar and a log; the
+            # thing a person actually wants to know is which of their forty
+            # tracks are finished, and finished means identified and tagged,
+            # not merely written to disk.
+            "items": []}
 
 
 def _count_items(urls, cfg, log):
@@ -766,14 +773,136 @@ def _count_items(urls, cfg, log):
 _ERROR_LINE = re.compile(r"^\s*ERROR:", re.I)
 
 
+def remember_url(con, url, info=None, playlist_name=None, root=None,
+                 used=True):
+    """Write down that this URL was asked for, and what was at it.
+
+    Two things read this back: the short list of recent URLs on the download
+    page, which is what stops a person going to find the link a second time,
+    and the kept playlists, which are the same rows with a flag set.
+
+    What was at the URL is only known when it could be listed, so a probe
+    that failed leaves the title alone rather than blanking one an earlier
+    run learned.
+    """
+    now = time.time()
+    con.execute(
+        "INSERT INTO download_url(url, first_used, last_used, uses) "
+        "VALUES (?,?,?,0) ON CONFLICT(url) DO NOTHING", (url, now, now))
+    sets, params = [], []
+    if info:
+        sets += ["title = ?", "uploader = ?", "is_playlist = ?",
+                 "item_count = ?"]
+        params += [info.get("title"), info.get("uploader"),
+                   1 if info.get("is_playlist") else 0, info.get("count")]
+    if playlist_name:
+        sets.append("playlist_name = ?")
+        params.append(playlist_name)
+    if root:
+        sets.append("root = ?")
+        params.append(root)
+    if used:
+        sets += ["last_used = ?", "uses = uses + 1",
+                 "seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM download_url)"]
+        params.append(now)
+    if sets:
+        con.execute("UPDATE download_url SET " + ", ".join(sets)
+                    + " WHERE url = ?", params + [url])
+    con.commit()
+
+
+def recent_urls(con, limit=5):
+    """The last few URLs, newest first. What the download page offers back."""
+    return [dict(r) for r in con.execute(
+        "SELECT * FROM download_url WHERE uses > 0 "
+        "ORDER BY seq DESC LIMIT ?", (limit,))]
+
+
+def kept_urls(con):
+    """The playlist URLs somebody asked to keep, with where they stand."""
+    out = []
+    for row in con.execute("SELECT * FROM download_url WHERE kept = 1 "
+                           "ORDER BY COALESCE(title, url)"):
+        row = dict(row)
+        got = con.execute(
+            "SELECT p.id, COUNT(e.pos) AS entries FROM playlist p "
+            "LEFT JOIN playlist_entry e ON e.playlist_id = p.id "
+            "WHERE p.name = ? GROUP BY p.id",
+            (row["playlist_name"] or "",)).fetchone()
+        row["entries"] = got["entries"] if got else 0
+        out.append(row)
+    return out
+
+
+def keep_url(con, url, kept=True, info=None, playlist_name=None, root=None):
+    """Keep a playlist URL on the page, or stop keeping it."""
+    remember_url(con, url, info=info, playlist_name=playlist_name, root=root,
+                 used=False)
+    con.execute("UPDATE download_url SET kept = ? WHERE url = ?",
+                (1 if kept else 0, url))
+    con.commit()
+    return con.execute("SELECT * FROM download_url WHERE url = ?",
+                       (url,)).fetchone()
+
+
+def _auto_playlists(con, urls, cfg, probes, downloaded, log):
+    """A playlist URL becomes a playlist, without being asked.
+
+    The point of downloading somebody's playlist is usually to have that
+    playlist, and a playlist is what a player syncs. Naming one by hand was
+    the only way to get it, so a run that forgot to left forty tracks in the
+    library with nothing tying them together.
+
+    Only a URL that listed as a playlist makes one, and only under the name
+    the source gives it. A single video does not become a playlist of one.
+    """
+    made = []
+    for url in urls:
+        info = (probes or {}).get(url)
+        if not info or not info.get("is_playlist"):
+            continue
+        name = pl_mod.norm_name(info.get("title") or "")
+        if not name:
+            continue
+        # In the source's order, and the whole of it: the half this run
+        # skipped as already downloaded belongs in the playlist too.
+        wanted = _requested_track_ids(
+            con, [url], cfg, downloaded if len(urls) == 1 else [], log,
+            probes=probes)
+        # Even with nothing new to add: the playlist is what the source
+        # says it is, and a run that turned up nothing still ends with the
+        # file on disk agreeing with the catalog.
+        # Named for the service rather than for how it arrived: "download"
+        # says what this program did, and what a person wants to see beside
+        # a playlist is where it came from.
+        got = pl_mod.append_tracks(con, name, wanted,
+                                   origin=pl_mod.origin_of(url) if
+                                   pl_mod.origin_of(url) != "local"
+                                   else "download",
+                                   source_uri=url)
+        got["url"] = url
+        made.append(got)
+    return made
+
+
 def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
              on_batch=None, no_playlist=False, archive=True, output=None,
-             audio_format=None, audio_quality=None):
+             audio_format=None, audio_quality=None, pipeline=True):
     """Download ``urls`` into a library folder and index what arrives.
 
     Returns a summary dict. The files that arrive are indexed one by one
     rather than by rescanning: a download is a handful of files, and walking
     a 2,300-file library to find three of them is work nobody asked for.
+
+    Each file is also carried the rest of the way - catalogued, identified
+    and tagged - as soon as yt-dlp has finished writing it, on a worker
+    thread beside the download. That is what ``pipeline`` turns off. The
+    batch form it replaces made the whole run feel unfinished until the last
+    second of it: forty tracks would sit in the library with channel names
+    for artists and video frames for covers until the fortieth had been
+    fetched, and only then begin a rate-limited pass that took as long
+    again. Pass ``pipeline=False`` to index at the end instead and leave
+    identification to the caller.
     """
     cfg = cfg or get_config(con)
     urls = [u.strip() for u in ([urls] if isinstance(urls, str) else urls)
@@ -790,12 +919,21 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
             on_event(kind, detail, done, total)
 
     batch = _new_batch(urls)
+    # Two threads write to the batch now - this one as yt-dlp talks, and the
+    # pipeline worker as each file is finished - so the snapshot is taken
+    # under a lock. Without it a copy taken mid-append raises rather than
+    # returning a slightly stale picture, which is all a progress view ever
+    # needs.
+    lock = threading.Lock()
 
     def report():
         """Hand the caller a copy: this dict keeps changing under them."""
         if on_batch:
-            snapshot = dict(batch)
-            snapshot["current"] = dict(batch["current"]) if batch["current"] else None
+            with lock:
+                snapshot = dict(batch)
+                snapshot["current"] = (dict(batch["current"])
+                                       if batch["current"] else None)
+                snapshot["items"] = [dict(i) for i in batch["items"]]
             on_batch(snapshot)
 
     emit("start", "%d URL%s" % (len(urls), "" if len(urls) == 1 else "s"))
@@ -833,6 +971,81 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     files = []
     tail = []
     skipped = 0      # already in the download archive
+
+    # Everything each finished file still needs doing to it, on a thread of
+    # its own: catalogued here, and handed to the identification queue,
+    # which is the only thing in the program that talks to MusicBrainz and
+    # therefore the only thing that can keep to one request a second.
+    db_path = db.path_of(con)
+    arrivals = queue.Queue()
+    indexed = {"added": 0, "updated": 0, "failed": 0}
+    track_ids = []
+    box = {"queue": None}
+
+    def set_state(item, state, detail, **fields):
+        with lock:
+            item["state"] = state
+            item["detail"] = detail
+            item.update(fields)
+        report()
+
+    def carry_on(item, c2):
+        """Catalog one arrival, then hand it to the identification queue."""
+        set_state(item, "indexing", "adding to the catalog")
+        counts_one, ids = scan_mod.index_paths(c2, root, [item["path"]])
+        for key in indexed:
+            indexed[key] += counts_one[key]
+        track_ids.extend(ids)
+        if not ids:
+            # Outside the library root, or unreadable: the catalog has no
+            # row for it, so there is nothing to look up.
+            set_state(item, "failed", "could not be catalogued")
+            return
+        row = c2.execute("SELECT title, artist, content_key FROM track "
+                         "WHERE id = ?", (ids[0],)).fetchone()
+        name = " - ".join(x for x in (row["artist"], row["title"]) if x)
+        set_state(item, "queued", "waiting to be identified",
+                  **({"title": name} if name else {}))
+
+        def on_state(key, state, detail, enrich=None):
+            # The queue works on its own clock, so these arrive after the
+            # download itself has finished. The batch keeps updating, which
+            # is the point: the run is not over until the last track has
+            # been looked at.
+            set_state(item, state, detail,
+                      **({"enrich": enrich} if enrich else {}))
+
+        box["queue"].submit([row["content_key"]], priority="arrival",
+                            label=name or item["title"], on_state=on_state)
+
+    def pipeline_worker():
+        from . import enrichq
+        try:
+            c2 = db.connect(db_path)
+            box["queue"] = enrichq.get_queue(db_path)
+        except Exception as exc:      # noqa: BLE001
+            # Nothing was catalogued, so the run falls back to indexing at
+            # the end. A download whose files never reach the catalog is a
+            # download that did not happen; a download that is not tagged
+            # as promptly as it might be is merely disappointing.
+            box["broken"] = exc
+            return
+        try:
+            for item in iter(arrivals.get, None):
+                try:
+                    carry_on(item, c2)
+                except Exception as exc:      # noqa: BLE001
+                    # A download does not fail because one file could not be
+                    # identified: the audio is on disk either way.
+                    set_state(item, "failed", str(exc))
+        finally:
+            c2.close()
+
+    worker = None
+    if pipeline and db_path:
+        worker = threading.Thread(target=pipeline_worker, daemon=True)
+        worker.start()
+
     proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
                             encoding="utf-8", errors="replace", bufsize=1,
@@ -871,6 +1084,16 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                     batch["done"] += 1
                     batch["total"] = max(batch["total"], batch["done"])
                     batch["current"] = None
+                    item = {"n": len(batch["items"]) + 1,
+                            "title": os.path.splitext(
+                                os.path.basename(path))[0],
+                            "path": norm(path), "state": "queued",
+                            "detail": "waiting to be identified",
+                            "enrich": None}
+                    with lock:
+                        batch["items"].append(item)
+                    if worker:
+                        arrivals.put(item)
                     emit("file", path, batch["done"], batch["total"])
                     report()
                 continue
@@ -897,6 +1120,21 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         proc.stdout.close()
         code = proc.wait()
 
+    # yt-dlp is done; the worker may not be. The last file to arrive is
+    # still being looked up, and the run is not finished until it is - the
+    # whole point being that the library is never left half-tagged.
+    batch["current"] = None
+    report()
+    if worker:
+        arrivals.put(None)
+        if batch["items"]:
+            emit("index", "the last of them", batch["done"], batch["total"])
+        worker.join()
+        # The files are on disk and in the catalog; identifying them is the
+        # queue's business now, and it goes on after this returns. Waiting
+        # for it here would put the download back behind a rate limit it
+        # does not need to be behind.
+
     # A partial success is the normal outcome for a playlist with one dead
     # video in it, so a non-zero exit only aborts when nothing was fetched.
     if code != 0 and not files:
@@ -907,17 +1145,29 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         raise DownloadError(explain(text) or last
                             or "yt-dlp exited with status %d" % code, log=log)
 
-    batch["current"] = None
     batch["finished"] = time.time()
     report()
 
     arrived = [f for f in files if os.path.isfile(f)]
-    emit("index", "%d file%s" % (len(arrived), "" if len(arrived) == 1 else "s"),
-         len(arrived), len(arrived))
-    counts, track_ids = scan_mod.index_paths(con, root, arrived)
+    if worker and not box.get("broken"):
+        # Already done, one file at a time, as they landed.
+        counts = indexed
+    else:
+        emit("index", "%d file%s" % (len(arrived),
+                                     "" if len(arrived) == 1 else "s"),
+             len(arrived), len(arrived))
+        counts, track_ids = scan_mod.index_paths(con, root, arrived)
+    if box.get("broken"):
+        log.append("identifying arrivals as they landed could not be "
+                   "started (%s); indexed at the end instead" % box["broken"])
     log.append("yt-dlp exited with status %d" % code)
     log.append("indexed %d added, %d updated, %d not catalogued"
                % (counts["added"], counts["updated"], counts["failed"]))
+    queued = sum(1 for i in batch["items"]
+                 if i["state"] not in ("failed", "skipped"))
+    if queued:
+        log.append("%d file%s queued for identification"
+                   % (queued, "" if queued == 1 else "s"))
 
     # A run that was interrupted leaves audio on disk and a line in the
     # archive, but no catalog row - the indexing happens here, after yt-dlp
@@ -935,7 +1185,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         log.append("rescan: %d added, %d updated, %d unchanged"
                    % (rescan["added"], rescan["updated"], rescan["unchanged"]))
 
-    added_to = None
+    made = []
     if playlist:
         # Everything the request asked for, not merely what this run
         # fetched: the skipped ones belong in the playlist too, and asking
@@ -944,11 +1194,37 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                                       probes=probes) \
             if skipped else track_ids
         if wanted:
-            added_to = pl_mod.append_tracks(con, playlist, wanted,
-                                            origin="download")
-            log.append("playlist %s: %d added, %d already there, %d entries"
-                       % (added_to["name"], added_to["added"],
-                          added_to["skipped"], added_to["entries"]))
+            made.append(pl_mod.append_tracks(con, playlist, wanted,
+                                             origin="download"))
+    else:
+        # Nobody named one, but a playlist URL is a playlist: it gets one
+        # under the name the source gives it.
+        made = _auto_playlists(con, urls, cfg, probes, track_ids, log)
+    for got in made:
+        log.append("playlist %s: %d added, %d already there, %d entries"
+                   % (got["name"], got["added"], got["skipped"],
+                      got["entries"]))
+        # And on disk beside the library, not only in the catalog. The
+        # device copies are written at sync time against that device's own
+        # layout; this is the one a player pointed at the library reads.
+        try:
+            wrote = pl_mod.write_local(con, got["name"], root)
+            got["file"] = wrote["path"]
+            log.append("wrote %s (%d entries)"
+                       % (wrote["path"], wrote["entries"]))
+        except Exception as exc:      # noqa: BLE001
+            # The catalog has the playlist either way; a folder that cannot
+            # be written is not a reason to fail a download that worked.
+            got["file"] = None
+            log.append("could not write the playlist file: %s" % exc)
+    added_to = made[0] if made else None
+
+    # Written down last, when what was at each URL and what it fed is known.
+    for url in urls:
+        by_url = next((m for m in made if m.get("url") == url), None)
+        fed = by_url or (added_to if playlist else None)
+        remember_url(con, url, info=(probes or {}).get(url),
+                     playlist_name=(fed or {}).get("name"), root=norm(root))
     del log[:-MAX_LOG]
 
     summary = {
@@ -959,6 +1235,18 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         "updated": counts["updated"],
         "failed_index": counts["failed"],
         "playlist": added_to,
+        # Every playlist this run touched, which is more than one when
+        # several playlist URLs were fetched at once. ``playlist`` is the
+        # first of them, kept for callers that only ever expected one.
+        "playlists": made,
+        # How many arrivals went to the identification queue. Zero with
+        # the pipeline turned off, and then the caller still owes these
+        # files a look.
+        "queued": queued if worker and not box.get("broken") else 0,
+        # Whether the run had to fall back to a full rescan, which can turn
+        # up files an interrupted earlier run left uncatalogued. Those never
+        # went past the pipeline, so they are still owed a look.
+        "rescanned": bool(skipped),
         "exit_code": code,
         "skipped": skipped,
         "errors": [l for l in tail if "ERROR" in l][-10:],

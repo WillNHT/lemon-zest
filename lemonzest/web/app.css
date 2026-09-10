@@ -59,6 +59,7 @@ body { display: flex; align-items: stretch; justify-content: center; padding: 0;
 #app {
   display: flex; flex-direction: column;
   width: 100%; height: 100vh;
+  --player-h: 52px;
   background: var(--paper);
   border: 1px solid var(--line-4);
   overflow: hidden;
@@ -236,6 +237,10 @@ button { cursor: default; }
   text-transform: uppercase; padding: 1px 5px; border: 1px solid var(--line-2);
   border-radius: 2px; color: var(--muted); background: #f6f3ec;
 }
+/* What arrived since you last looked. Loud enough to find while scanning
+   a page of rows, quiet enough not to be a warning: nothing is wrong. */
+.tag.new  { color: var(--accent-ink); background: var(--sel);
+  border-color: var(--accent); font-weight: 600; }
 .tag.ok   { color: var(--ok);   background: var(--ok-bg);   border-color: var(--ok-line); }
 .tag.warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-line); }
 .tag.bad  { color: var(--bad);  background: var(--bad-bg);  border-color: var(--bad-line); }
@@ -252,6 +257,26 @@ button { cursor: default; }
 }
 .tbl td { padding: 3px 10px; border-bottom: 1px solid var(--line);
   vertical-align: top; }
+
+/* The track table: fixed columns, and one line per row whatever a cell
+   happens to hold. A row that grows to two because a track carries an
+   extra tag makes the whole table jump under the eye. */
+.tbl.cols { table-layout: fixed; }
+.tbl.cols td { height: 23px; line-height: 17px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+.tbl.cols td .tag { vertical-align: baseline; }
+.tbl.cols td.empty { white-space: normal; text-align: center; }
+.tbl.cols .play { padding: 0 4px; line-height: 1; vertical-align: middle; }
+
+/* A heading you can pick up and put down, and an edge you can pull. */
+.tbl.cols th { position: relative; cursor: grab; }
+.tbl.cols th.dragging { opacity: .45; }
+.tbl.cols th.dropinto { box-shadow: inset 2px 0 0 var(--accent); }
+.tbl.cols th .grip { position: absolute; top: 0; right: -3px; width: 7px;
+  height: 100%; cursor: col-resize; }
+.tbl.cols th .grip:hover { background: var(--accent); opacity: .35; }
+body.resizing, body.resizing * { cursor: col-resize !important;
+  user-select: none; }
 .tbl tbody tr { background: var(--white); }
 .tbl tbody tr:nth-child(even) { background: var(--paper-2); }
 .tbl tbody tr:hover { background: #eee7db; }
@@ -264,9 +289,30 @@ button { cursor: default; }
   white-space: nowrap; }
 .tbl .tick { width: 26px; text-align: center; }
 
+/* A playlist that has gained something since it was last opened. A dot
+   rather than a count: what matters is that something arrived. */
+.row .dot { width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); flex: none; margin-left: 2px; }
+
 .footnote { padding: 6px 10px; font: 9px var(--mono); letter-spacing: .08em;
   text-transform: uppercase; color: var(--fainter);
   border-top: 1px solid var(--line); background: var(--paper); }
+
+/* Paging belongs to the table, not to the bottom of a list that may be two
+   thousand rows long: scrolling to the end to find "next page" is the
+   opposite of what paging is for. Pinned to the foot of the pane, above
+   whatever else is down there. */
+.footnote.pinned { position: sticky; bottom: 0; z-index: 3;
+  box-shadow: 0 -4px 8px -6px rgba(0, 0, 0, .35); }
+.footnote .pager { display: flex; align-items: center; gap: 3px; }
+.footnote .pager .btn { min-width: 22px; }
+.footnote .pager select { border: 1px solid var(--line-2); border-radius: 3px;
+  font: 10px var(--mono); padding: 1px 2px; margin-left: 4px; }
+/* The shortcut list is the first thing to give up room: it is a reminder,
+   and the paging beside it is a control. */
+.footnote .keys { overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0; text-transform: none;
+  letter-spacing: 0; }
 
 /* ----------------------------------------------------- column browser */
 
@@ -275,6 +321,9 @@ button { cursor: default; }
 .browser .col { flex: 1 1 0; display: flex; flex-direction: column;
   min-width: 0; border-right: 1px solid var(--line); }
 .browser .col:last-child { border-right: 0; }
+/* Decades are four characters wide; giving them an equal quarter of the
+   browser would take that width off the album names, which need it. */
+.browser .col.decade { flex: 0 0 118px; }
 .browser .col > h5 {
   display: flex; gap: 6px; align-items: baseline; padding: 5px 8px;
   font: 9px var(--mono); letter-spacing: .1em; text-transform: uppercase;
@@ -370,6 +419,12 @@ button { cursor: default; }
   font-size: 12px; }
 .empty h3 { font-size: 15px; color: var(--ink-2); margin-bottom: 6px; }
 
+/* A heading you can sort by. The arrow is on the sorted column only. */
+.tbl th.sortable { cursor: pointer; user-select: none; }
+.tbl th.sortable:hover { color: var(--ink); background: var(--paper); }
+.tbl th.sorted { color: var(--accent-ink); }
+.tbl th .arrow { font-size: 9px; }
+
 /* -------------------------------------------------------- download batch */
 
 .batch > header .count { font: 15px/1 var(--mono); font-weight: 600;
@@ -379,6 +434,49 @@ button { cursor: default; }
 .bar.big { height: 12px; border-radius: 3px; }
 .batch .now { margin-top: 10px; padding-top: 8px;
   border-top: 1px solid var(--line); }
+
+/* One line per file that has landed, and what is being done to it. Capped
+   in height and scrolled: a forty-track playlist must not push the rest of
+   the page off the screen. */
+.batch .items { margin-top: 8px; padding-top: 6px;
+  border-top: 1px solid var(--line); max-height: 232px; overflow-y: auto; }
+.batch .item { display: flex; align-items: center; gap: 7px;
+  padding: 3px 0; font-size: 12px; }
+.batch .item + .item { border-top: 1px solid var(--line); }
+.batch .item .n { font-size: 10px; min-width: 18px; text-align: right;
+  font-variant-numeric: tabular-nums; }
+.batch .item .detail { flex: 0 1 42%; color: var(--muted); font-size: 11px;
+  text-align: right; }
+.batch .item.failed .detail { color: var(--warn); }
+.batch .item.queued { color: var(--muted); }
+
+/* ------------------------------------------------------- recent + kept */
+
+.urlrow { display: flex; align-items: center; gap: 8px; padding: 4px 0;
+  font-size: 12px; }
+.urlrow + .urlrow { border-top: 1px solid var(--line); }
+.urlrow .u { font: 10.5px var(--mono); color: var(--fainter); }
+.urlrow .btn { flex: none; }
+
+/* ---------------------------------------------------------- the player */
+
+.player {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 12px; background: var(--paper-2);
+  border-top: 1px solid var(--line-2);
+  box-shadow: 0 -2px 10px rgba(0, 0, 0, .07);
+}
+.player .what { min-width: 0; flex: 0 1 auto; }
+.player .what .t { font-weight: 600; }
+.player .what .a { color: var(--muted); font-size: 11px; }
+.player audio { flex: 1 1 auto; height: 30px; min-width: 220px; }
+.player .bad { color: var(--bad); font-size: 11px; }
+/* The bar takes its height out of the app rather than lying over the
+   bottom of it. Padding inside the scroller was not enough: what gets
+   covered is the row of controls pinned to the bottom of the table, and
+   that is not part of the scrolled content. */
+body.playing #app { height: calc(100vh - var(--player-h)); }
 
 /* ---------------------------------------------------------- inspector */
 
@@ -393,6 +491,23 @@ button { cursor: default; }
   border-left: 1px solid var(--line-2); background: var(--paper-2);
   position: sticky; top: 0;
 }
+/* The panel's controls, above the cover: what to do with the track comes
+   before the picture of it. */
+.inspector .tools { padding: 6px 8px; border-bottom: 1px solid var(--line);
+  background: var(--paper); }
+
+/* Where else this track turns up. */
+.inspector .pl-seen { margin-top: 10px; padding-top: 8px;
+  border-top: 1px solid var(--line); }
+.inspector .pl-seen h4 { font: 9px var(--mono); letter-spacing: .1em;
+  text-transform: uppercase; color: var(--fainter); margin-bottom: 5px; }
+.pl-list { list-style: none; }
+.pl-list li { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+.pl-list li .faint { font-size: 10px; white-space: nowrap; }
+.linkish { border: 0; background: none; padding: 0; text-align: left;
+  color: var(--accent-ink); font: inherit; cursor: pointer; }
+.linkish:hover { text-decoration: underline; }
+
 .inspector .art {
   display: grid; place-items: center;
   aspect-ratio: 1 / 1; background: var(--white);

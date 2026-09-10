@@ -68,6 +68,13 @@ async function api(path, opts) {
 
 // ----------------------------------------------------------------- state
 
+
+// One question's worth of filtering. A function rather than a shared
+// object: three views hold one each, and they must not be the same one.
+function BLANK_FILTER() {
+  return { q: '', decade: '', genre: '', artist: '', album: '', state: '' };
+}
+
 const S = {
   view: 'library',
   // The download page's URL box, kept across navigation and reloads: a list
@@ -78,14 +85,26 @@ const S = {
   stats: null,
   devices: [],
   playlists: [],
+  syncList: null,        // /sync-list: what is prepared to go out
   deviceId: null,        // device being viewed
   scopeId: null,         // device the library's tick column edits
   playlistId: null,
-  facets: { genre: [], artist: [], album: [] },
-  filter: { q: '', genre: '', artist: '', album: '', state: '' },
-  paneFilter: { genre: '', artist: '', album: '' },
+  facets: { decade: [], genre: [], artist: [], album: [] },
+  // One set of filters per question, not one for the whole app. A search
+  // typed in the library used to follow you into the inbox, which then
+  // showed nothing while the badge beside it said six - the badge counting
+  // what arrived, the page answering a question you had asked somewhere
+  // else and forgotten.
+  filters: {
+    library: BLANK_FILTER(), inbox: BLANK_FILTER(), playlist: BLANK_FILTER(),
+  },
+  paneFilter: { decade: '', genre: '', artist: '', album: '' },
   navFilter: { device: '', playlist: '' },
   tracks: [], tracksTotal: 0, offset: 0, limit: 200,
+  // Which column the table is ordered by, and which way. Null means the
+  // view's own default: newest first in the inbox, the source's order in a
+  // playlist, the album shelf in the library.
+  sort: { col: null, dir: 'asc' },
   // The library selection, kept as content keys rather than track ids:
   // enrichment is keyed by content key, and two copies of one recording are
   // one thing to identify, so ticking either has to mean the same row.
@@ -110,6 +129,7 @@ const S = {
   dl: null,              // /download/config: settings, cookie status, yt-dlp
   dlResult: null,        // summary of the last finished download
   dlProbe: null,         // what is at the URL, when asked before downloading
+  play: null,            // the track in the listening bar: {id, title, artist}
   job: null,
   log: [],
   busy: false,
@@ -130,16 +150,36 @@ async function loadCore() {
   if (!S.scopeId && devices.length) S.scopeId = devices[0].id;
 }
 
+/* `S.filter` is whichever set belongs to the view being looked at.
+
+   A property rather than a lookup at each site: every reader and writer of
+   a filter already says `S.filter`, and what was wrong was never how they
+   said it - it was that there was only one of them. */
+Object.defineProperty(S, 'filter', {
+  get() { return S.filters[S.view] || S.filters.library; },
+});
+
+function anyFilter(f) {
+  return !!(f.q || f.decade || f.genre || f.artist || f.album || f.state);
+}
+
 function libraryParams() {
   const p = new URLSearchParams();
-  for (const k of ['q', 'genre', 'artist', 'album', 'state']) {
+  for (const k of ['q', 'decade', 'genre', 'artist', 'album', 'state']) {
     if (S.filter[k]) p.set(k, S.filter[k]);
   }
+  // A playlist narrows the same table rather than replacing it.
+  if (S.view === 'playlist' && S.playlistId) p.set('playlist', S.playlistId);
+  if (S.sort.col) { p.set('sort', S.sort.col); p.set('dir', S.sort.dir); }
   return p;
 }
 
-// The library table and the inbox are the same table over two questions.
-function isTrackView() { return S.view === 'library' || S.view === 'inbox'; }
+/* The library, the inbox and a playlist are one table over three questions.
+   They share the row model, the selection, the shortcuts and the inspector,
+   because a track is the same track whichever way you arrived at it. */
+function isTrackView() {
+  return S.view === 'library' || S.view === 'inbox' || S.view === 'playlist';
+}
 
 async function loadLibrary() {
   const p = libraryParams();
@@ -151,6 +191,26 @@ async function loadLibrary() {
   ]);
   S.tracks = lib.tracks; S.tracksTotal = lib.total;
   S.facets = facets;
+}
+
+/* Open a playlist: its own details, and the library narrowed to it.
+
+   One function for both ways in - the sidebar and a link from the
+   inspector - because arriving from either has to leave the page in the
+   same state. */
+function openPlaylist(id) {
+  S.view = 'playlist';
+  S.offset = 0; S.sel.clear(); S.anchor = null;
+  S.sort = { col: null, dir: 'asc' };
+  return guard(async () => {
+    await loadPlaylist(id);
+    // The dot in the sidebar is drawn from the listing, which nothing else
+    // is about to reload. Opening the playlist is what clears it, so it
+    // clears now rather than at whatever moment the next poll lands.
+    const row = S.playlists.find(x => x.id === id);
+    if (row) row.fresh = 0;
+    await loadLibrary();
+  });
 }
 
 async function loadPlaylist(id) {
@@ -181,6 +241,77 @@ async function loadLog(deviceId) {
 
 // ------------------------------------------------------------------ jobs
 
+/* Work belongs to the program, not to the tab that started it.
+
+   A download runs on a worker inside Lemon Zest and goes on running whether
+   or not anybody is looking at it. The interface used to know that only if
+   this tab was the one that pressed the button: reload the page, or open a
+   second tab, and a forty-track download in full flight was invisible -
+   which reads as "it stopped", and the reasonable response to that is to
+   press Download again.
+
+   So the page asks what is running rather than remembering what it started.
+   Whatever it finds, it watches, with the same handler the button would
+   have attached. */
+async function adoptRunningJob() {
+  let jobs = [];
+  try { jobs = await api('/jobs'); } catch (e) { return; }
+  const running = jobs.find(j => j.state === 'running');
+  if (running) {
+    if (S.job && S.job.id === running.id && pollTimer) return;
+    S.job = running;
+    if (running.kind === 'download') S.dlResult = null;
+    watchJob(running.id, (job) => jobFinished(job));
+    return;
+  }
+  // Nothing running. A download that finished while this tab was closed
+  // still has a report worth showing on the page it belongs to.
+  if (!S.dlResult) {
+    const done = jobs.find(j => j.kind === 'download' && j.state === 'done');
+    if (done && done.result) S.dlResult = done.result;
+  }
+}
+
+/* What to do when a job ends, decided by what it was rather than by who
+   started it - so a job this tab adopted finishes the same way as one it
+   began itself. */
+async function jobFinished(job) {
+  if (job.kind === 'download') {
+    S.dlResult = job.result || null;
+    await loadCore();
+    await loadDownload();
+    if (S.view === 'playlist' && S.playlistId) {
+      await loadPlaylist(S.playlistId, { peek: true });
+    }
+    if (isTrackView()) await loadLibrary();
+    followAutoEnrich(job, 'the new files');
+    return;
+  }
+  if (job.kind === 'enrich' || job.kind === 'write-tags') {
+    S.outcome = job;
+    await loadCore();
+    if (isTrackView()) await loadLibrary();
+    return;
+  }
+  await loadCore();
+  if (isTrackView()) await loadLibrary();
+}
+
+/* Look in on the program every few seconds when nothing is being watched.
+
+   This is what makes a second tab notice a download the first one started,
+   and what lets a tab opened mid-run pick it up. Cheap: the job list is a
+   dictionary in memory, and the timer stops itself while a job is being
+   polled properly. */
+const ADOPT_EVERY = 4000;
+setInterval(() => {
+  if (pollTimer) return;               // already watching one, closely
+  if (document.hidden) return;         // a background tab needs nothing
+  adoptRunningJob().then(() => {
+    if (S.job && S.job.state === 'running') render();
+  }, () => { /* the server may be restarting; the next tick will find it */ });
+}, ADOPT_EVERY);
+
 function watchJob(id, onDone) {
   clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
@@ -207,9 +338,29 @@ function navRow(opts) {
       title="${h(opts.title || opts.label)}">
     ${icon(opts.icon)}
     <span class="txt">${h(opts.label)}</span>
+    ${opts.dot ? '<span class="dot" aria-label="new"></span>' : ''}
     ${opts.pill ? `<span class="pill">${h(opts.pill)}</span>` : ''}
     ${opts.n !== undefined ? `<span class="n">${h(opts.n)}</span>` : ''}
   </button>`;
+}
+
+// Where a playlist came from, said in full. A downloaded playlist that
+// reads LOCAL is the sidebar contradicting the page, and an abbreviation
+// nobody can expand is barely better.
+const PL_ORIGIN = {
+  apple_music: 'apple music', spotify: 'spotify', youtube: 'youtube',
+  download: 'download', local: 'local',
+};
+
+function originLabel(pl) {
+  if (!pl) return 'local';
+  // YouTube Music and YouTube are different services with one domain
+  // between them, and which one a playlist came from is worth keeping.
+  if (pl.origin === 'youtube') {
+    return /music\.youtube\./i.test(pl.source_uri || '')
+      ? 'youtube music' : 'youtube';
+  }
+  return PL_ORIGIN[pl.origin] || 'local';
 }
 
 function renderSidebar() {
@@ -248,6 +399,10 @@ function renderSidebar() {
         on: S.view === 'device' && S.deviceId === d.id,
         title: d.mounted_at ? d.name + ' - ' + d.mounted_at : d.name + ' - not mounted',
       })).join('') +
+      navRow({ act: 'view', arg: 'syncList', label: 'Sync list',
+               icon: 'i-list', n: num((S.stats || {}).sync_list || 0),
+               on: S.view === 'syncList',
+               title: 'Prepare what goes on a card before the card is plugged in' }) +
       navRow({ act: 'view', arg: 'addDevice', label: 'Add device...',
                icon: 'i-plus', add: true, on: S.view === 'addDevice' }),
       S.devices.length > 6 ? 'device' : null,
@@ -258,8 +413,13 @@ function renderSidebar() {
     sect('Playlists', String(S.playlists.length),
       pls.map(p => navRow({
         act: 'playlist', arg: p.id, label: p.name, icon: 'i-list',
-        n: num(p.n), pill: p.origin === 'apple_music' ? 'APPL'
-          : p.origin === 'spotify' ? 'SPOT' : 'LOCAL',
+        n: num(p.n), pill: originLabel(p),
+        // A dot, not a number: what matters is that something arrived, and
+        // how much is in the playlist itself, one click away.
+        dot: p.fresh > 0,
+        title: p.fresh
+          ? `${p.name} - ${num(p.fresh)} added since you last looked`
+          : p.name,
         on: S.view === 'playlist' && S.playlistId === p.id,
       })).join('') || '<div class="foot">nothing imported yet</div>',
       S.playlists.length > 6 ? 'playlist' : null,
@@ -268,11 +428,12 @@ function renderSidebar() {
       S.playlists.length > 5) +
 
     sect('Tools', undefined,
-      navRow({ act: 'view', arg: 'import', label: 'Scan & import',
-               icon: 'i-clock', on: S.view === 'import' }) +
-      navRow({ act: 'view', arg: 'download', label: 'Download',
+      navRow({ act: 'view', arg: 'download', label: 'Add music',
                icon: 'i-dl', on: S.view === 'download',
-               title: 'Fetch audio from YouTube into the library' }));
+               title: 'Scan a folder, import playlists, or fetch from YouTube' }) +
+      navRow({ act: 'view', arg: 'normalize', label: 'Normalize volume',
+               icon: 'i-level', on: S.view === 'normalize',
+               title: 'Even out loudness across the library - not built yet' }));
 }
 
 // --------------------------------------------------------------- library
@@ -282,7 +443,7 @@ function renderBrowser() {
     const all = S.facets[key] || [];
     const f = S.paneFilter[key].toLowerCase();
     const shown = f ? all.filter(x => x.value.toLowerCase().includes(f)) : all;
-    return `<div class="col">
+    return `<div class="col ${key}">
       <h5>${h(label)}<span class="n">${num(all.length)}</span></h5>
       <div class="filter"><input data-pane="${key}" placeholder="Filter ${h(label.toLowerCase())}"
         value="${h(S.paneFilter[key])}"></div>
@@ -297,7 +458,8 @@ function renderBrowser() {
       </div>
     </div>`;
   };
-  return `<div class="browser">${pane('genre', 'Genre')}${pane('artist', 'Artist')}${pane('album', 'Album')}</div>`;
+  return `<div class="browser">${pane('decade', 'Decade')}${pane('genre', 'Genre')}${
+    pane('artist', 'Artist')}${pane('album', 'Album')}</div>`;
 }
 
 // The four enrichment states, and how each one reads in the table. The
@@ -336,91 +498,404 @@ function ago(ts) {
   return new Date(ts * 1000).toLocaleDateString();
 }
 
-/* The track table, shared by the library and the inbox. They are the same
-   rows over two questions - "what do I have" and "what just arrived" - so
-   they are one table with one selection model and one set of shortcuts.
-   The only difference is the second column: the library asks whether a
-   track is on the device you are syncing, the inbox asks when it landed. */
+/* The track table, shared by the library, the inbox and a playlist.
+
+   One table over three questions, so one row model, one selection, one set
+   of shortcuts and one inspector. What differs between them is which
+   columns are worth showing and in what order, and that is not something to
+   decide on somebody's behalf: the layout is theirs, per page, kept in the
+   browser, and resettable.
+
+   Every cell is one line. A row that grows to two because a track happens
+   to carry an extra tag makes the whole table jump, and a table you cannot
+   scan is worse than one that hides four characters of an album name. */
+const COLUMNS = {
+  on: {
+    label: 'ON', w: 34, cls: 'tick', sort: null,
+    title: 'On the device selected above',
+    cell: (t) => {
+      const scope = S.devices.find(d => d.id === S.scopeId);
+      if (!scope) return '';
+      return `<span title="${t.on_device ? 'on ' + h(scope.name)
+        : 'not on ' + h(scope.name)}"
+        style="color:${t.on_device ? 'var(--accent)' : 'var(--line-2)'}"
+        >${t.on_device ? '&#9679;' : '&#9675;'}</span>`;
+    },
+  },
+  no: {
+    label: '#', w: 40, cls: 'num',
+    sort: () => (S.view === 'playlist' ? 'pos' : 'track_no'),
+    title: () => (S.view === 'playlist' ? 'Position in the playlist'
+                                        : 'Track number'),
+    cell: (t) => (S.view === 'playlist'
+      ? (t.playlist_pos === null || t.playlist_pos === undefined
+         ? '' : num(t.playlist_pos + 1))
+      : (t.track_no || '')),
+  },
+  title: {
+    label: 'Name', w: 260, cls: 'clip', sort: 'title',
+    cell: (t) => `<button class="btn sm play" data-play="${t.id}"
+        title="Listen to it">${icon('i-play')}</button> ${
+        h(t.title || (t.rel_path || '').split('/').pop())}${
+        isFreshHere(t) ? ' <span class="tag new">new</span>' : ''}${
+        t.empty ? ' <span class="tag bad">empty</span>' : ''}${
+        !t.title && !t.empty ? ' <span class="tag warn">untagged</span>' : ''}`,
+    cellTitle: (t) => t.path,
+  },
+  duration: {
+    label: 'Time', w: 56, cls: 'num', sort: 'duration',
+    cell: (t) => dur(t.duration),
+  },
+  artist: {
+    label: 'Artist', w: 180, cls: 'clip', sort: 'artist',
+    cell: (t) => h(t.artist || ''), cellTitle: (t) => t.artist || '',
+  },
+  album: {
+    label: 'Album', w: 180, cls: 'clip', sort: 'album',
+    cell: (t) => h(t.album || ''), cellTitle: (t) => t.album || '',
+  },
+  state: {
+    label: 'Metadata', w: 128, cls: 'clip', sort: 'state',
+    title: 'Enrichment state', cell: (t) => stateTag(t),
+  },
+  format: {
+    label: 'Format', w: 86, cls: 'mono', sort: 'format',
+    cell: (t) => `${h((t.ext || '').replace('.', '').toUpperCase())} ${
+      t.bitrate ? Math.round(t.bitrate / 1000) : ''}`,
+  },
+  added: {
+    label: 'Added', w: 104, cls: 'mono', sort: 'added',
+    title: 'When the catalog first saw this file',
+    cell: (t) => h(ago(t.added_at)),
+    cellTitle: (t) => `added ${when(t.added_at)} · file modified ${when(t.mtime)}`,
+  },
+  isrc: {
+    label: 'ISRC', w: 110, cls: 'mono', sort: 'isrc',
+    cell: (t) => h(t.isrc || ''),
+  },
+};
+
+// What each page starts out showing. The inbox leads with when a file
+// landed, because that is the question it is asking.
+const DEFAULT_COLS = {
+  library: ['on', 'no', 'title', 'duration', 'artist', 'album', 'state',
+            'format', 'added', 'isrc'],
+  inbox: ['added', 'no', 'title', 'duration', 'artist', 'album', 'state',
+          'format', 'isrc'],
+  playlist: ['on', 'no', 'title', 'duration', 'artist', 'album', 'state',
+             'format', 'added', 'isrc'],
+};
+
+const COLS_KEY = (view) => 'lz.cols.' + view;
+
+/* The layout in force for a page: the columns, in order, with their widths.
+
+   Read from what was saved, then reconciled with the defaults - a column
+   added to a later version of this program appears rather than being
+   invisible to everybody who ever dragged a heading, and one that is gone
+   is dropped rather than throwing. */
+function columnLayout(view) {
+  const defaults = DEFAULT_COLS[view] || DEFAULT_COLS.library;
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(COLS_KEY(view)) || 'null'); }
+  catch (e) { saved = null; }
+  const out = [];
+  const seen = new Set();
+  for (const col of (Array.isArray(saved) ? saved : [])) {
+    const k = col && col.k;
+    if (!COLUMNS[k] || !defaults.includes(k) || seen.has(k)) continue;
+    seen.add(k);
+    out.push({ k, w: Math.max(28, +col.w || COLUMNS[k].w) });
+  }
+  for (const k of defaults) {
+    if (!seen.has(k)) out.push({ k, w: COLUMNS[k].w });
+  }
+  return out;
+}
+
+function saveColumnLayout(view, layout) {
+  try { localStorage.setItem(COLS_KEY(view), JSON.stringify(layout)); }
+  catch (e) { /* private mode: the layout lasts as long as the page does */ }
+}
+
+function resetColumnLayout(view) {
+  try { localStorage.removeItem(COLS_KEY(view)); } catch (e) { /* as above */ }
+}
+
+/* Did this row join the playlist since the last time it was opened?
+
+   Measured against the watermark the view was opened with, not the one now
+   stored - opening the playlist is what marks it seen, and the rows have to
+   go on looking new for as long as you are looking at them. Come back later
+   and they are ordinary rows, which is what short-lived means here: seen
+   once, done. */
+function isFreshHere(t) {
+  if (S.view !== 'playlist' || !S.playlistDetail) return false;
+  const since = S.playlistDetail.since || 0;
+  return !!(t.playlist_added_at && t.playlist_added_at > since);
+}
+
+// A column's sort key, heading and tooltip may depend on the page.
+const colValue = (v, t) => (typeof v === 'function' ? v(t) : v);
+
 function trackTable(opts) {
   const inbox = !!(opts && opts.inbox);
-  const scope = S.devices.find(d => d.id === S.scopeId);
+  const layout = columnLayout(S.view);
   const rows = S.tracks.map((t, i) => `
     <tr data-track="${t.id}" data-row="${i}" data-key="${h(t.content_key)}"
         class="${S.sel.has(t.content_key) ? 'sel' : ''}">
       <td class="tick"><input type="checkbox" data-pick="${i}" tabindex="-1"
         ${S.sel.has(t.content_key) ? 'checked' : ''}></td>
-      ${inbox
-        ? `<td class="mono" title="${h(when(t.added_at))}">${h(ago(t.added_at))}</td>`
-        : `<td class="tick">${scope
-            ? `<span title="${t.on_device ? 'on ' + h(scope.name) : 'not on ' + h(scope.name)}"
-                 style="color:${t.on_device ? 'var(--accent)' : 'var(--line-2)'}">
-                 ${t.on_device ? '&#9679;' : '&#9675;'}</span>`
-            : ''}</td>`}
-      <td class="num">${t.track_no || ''}</td>
-      <td class="clip" title="${h(t.path)}">${h(t.title || (t.rel_path || '').split('/').pop())}
-        ${t.empty ? '<span class="tag bad">empty</span>' : ''}
-        ${!t.title && !t.empty ? '<span class="tag warn">untagged</span>' : ''}</td>
-      <td class="num">${dur(t.duration)}</td>
-      <td class="clip">${h(t.artist || '')}</td>
-      <td class="clip">${h(t.album || '')}</td>
-      <td>${stateTag(t)}</td>
-      <td class="mono">${h((t.ext || '').replace('.', '').toUpperCase())}
-        ${t.bitrate ? Math.round(t.bitrate / 1000) : ''}</td>
-      ${inbox ? '' : `<td class="mono" title="added ${h(when(t.added_at))}
-        \u00b7 file modified ${h(when(t.mtime))}">${h(ago(t.added_at))}</td>`}
-      <td class="mono">${h(t.isrc || '')}</td>
+      ${layout.map(({ k }) => {
+        const col = COLUMNS[k];
+        const tip = col.cellTitle ? colValue(col.cellTitle, t) : '';
+        return `<td class="${col.cls || ''}"${tip ? ` title="${h(tip)}"` : ''}
+          >${col.cell(t)}</td>`;
+      }).join('')}
     </tr>`).join('');
 
   const allShown = S.tracks.length > 0
     && S.tracks.every(t => S.sel.has(t.content_key));
-  const from = S.offset + 1, to = Math.min(S.offset + S.limit, S.tracksTotal);
-  const empty = inbox
-    ? 'Nothing new. Everything indexed has been looked at.'
-    : 'No tracks match.';
+  const filtered = anyFilter(S.filter);
+  const empty = filtered
+    ? 'Nothing here matches the filters on this page.'
+    : inbox
+      ? 'Nothing still arriving. Everything indexed has settled.'
+      : S.view === 'playlist'
+        ? 'This playlist holds nothing the catalog has.'
+        : 'No tracks match.';
 
   return renderOutcome() + renderSelectionBar(allShown) + `
     <div class="withside">
     <div class="withside-main">
-    <table class="tbl" id="lib-table">
+    <table class="tbl cols" id="lib-table">
+      <colgroup><col style="width:26px">${
+        layout.map(c => `<col style="width:${c.w}px">`).join('')}</colgroup>
       <thead><tr>
         <th class="tick"><input type="checkbox" id="pick-all"
           title="Select everything on this page" ${allShown ? 'checked' : ''}></th>
-        ${inbox
-          ? '<th style="width:104px">Added</th>'
-          : '<th class="tick" title="On the device selected above">ON</th>'}
-        <th class="num" style="width:34px">#</th>
-        <th style="width:26%">Name</th>
-        <th class="num" style="width:48px">Time</th>
-        <th style="width:19%">Artist</th>
-        <th style="width:19%">Album</th>
-        <th style="width:120px" title="Enrichment state">Metadata</th>
-        <th style="width:82px">Format</th>
-        ${inbox ? '' : `<th style="width:96px"
-          title="When the catalog first saw this file. Hover a cell for the exact time and the file's own modified date."
-          >Added</th>`}
-        <th style="width:104px">ISRC</th>
+        ${layout.map(({ k }) => {
+          const col = COLUMNS[k];
+          const sortKey = colValue(col.sort, null);
+          const on = sortKey && S.sort.col === sortKey;
+          const arrow = on ? (S.sort.dir === 'desc' ? ' ▾' : ' ▴') : '';
+          const tip = colValue(col.title, null)
+            || (sortKey ? 'Sort by ' + col.label.toLowerCase() : col.label);
+          return `<th draggable="true" data-col="${k}"
+            ${sortKey ? `data-sort="${h(sortKey)}"` : ''}
+            class="${on ? 'sorted' : ''} ${sortKey ? 'sortable' : ''}"
+            title="${h(tip)} · drag to move, drag the edge to resize"
+            >${h(col.label)}<span class="arrow">${arrow}</span
+            ><span class="grip" data-grip="${k}"></span></th>`;
+        }).join('')}
       </tr></thead>
-      <tbody>${rows || `<tr><td colspan="${inbox ? 10 : 11}" class="empty">${h(empty)}</td></tr>`}</tbody>
+      <tbody>${rows || `<tr><td colspan="${layout.length + 1}" class="empty">
+        ${h(empty)}${filtered
+          ? ' <button class="btn sm" data-clear-filters="1">Clear them</button>'
+          : ''}</td></tr>`}</tbody>
     </table>
-    <div class="footnote hstack">
-      <span>${S.tracksTotal ? `SHOWING ${num(from)}–${num(to)} OF ${num(S.tracksTotal)}` : 'NOTHING TO SHOW'}</span>
-      <span style="flex:1"></span>
-      <span style="text-transform:none;letter-spacing:0">click select · shift+click range ·
-        ctrl+click add · ctrl+A page · E enrich · A accept ·
-        R reject · S skip · U raw · Enter edit · Esc clear</span>
-      <span style="flex:1"></span>
-      <button class="btn sm" data-page="-1" ${S.offset === 0 ? 'disabled' : ''}>Previous</button>
-      <button class="btn sm" data-page="1" ${to >= S.tracksTotal ? 'disabled' : ''}>Next</button>
-    </div>
+    ${renderPager()}
     </div>
     ${renderInspector()}
     </div>`;
 }
 
+/* Paging that says where you are and lets you go elsewhere.
+
+   Previous and Next alone answer "is there more" and nothing else: on two
+   thousand tracks, page 1 to page 9 was eight clicks and no way to know it
+   was eight. Five numbered pages around the current one, the ends always
+   reachable, and a box to pick from when the answer is page 47. */
+function renderPager() {
+  const per = S.limit;
+  const total = S.tracksTotal;
+  const pages = Math.max(1, Math.ceil(total / per));
+  const page = Math.floor(S.offset / per) + 1;
+  const from = total ? S.offset + 1 : 0;
+  const to = Math.min(S.offset + per, total);
+
+  // Five, centred on where you are, sliding rather than jumping so the
+  // window does not change shape as you walk through it.
+  let first = Math.max(1, page - 2);
+  const last = Math.min(pages, first + 4);
+  first = Math.max(1, last - 4);
+  const numbers = [];
+  for (let n = first; n <= last; n += 1) {
+    numbers.push(`<button class="btn sm ${n === page ? 'primary' : ''}"
+      data-goto="${n}" ${n === page ? 'disabled' : ''}>${num(n)}</button>`);
+  }
+
+  return `<div class="footnote pinned hstack">
+    <span>${total ? `SHOWING ${num(from)}–${num(to)} OF ${num(total)}`
+                  : 'NOTHING TO SHOW'}</span>
+    <button class="btn sm" data-cols-reset="1"
+      title="Put this page's columns back to their default order and width"
+      >RESET COLUMNS</button>
+    <span class="grow" style="flex:1"></span>
+    <span class="keys">click select · shift+click range ·
+      ctrl+click add · ctrl+A page · E enrich · A accept ·
+      R reject · S skip · U raw · Enter edit · Esc clear</span>
+    <span class="grow" style="flex:1"></span>
+    ${pages > 1 ? `<span class="pager">
+      <button class="btn sm" data-goto="1" ${page === 1 ? 'disabled' : ''}
+        title="First page">«</button>
+      <button class="btn sm" data-page="-1" ${page === 1 ? 'disabled' : ''}
+        >Previous</button>
+      ${numbers.join('')}
+      <button class="btn sm" data-page="1" ${page >= pages ? 'disabled' : ''}
+        >Next</button>
+      <button class="btn sm" data-goto="${pages}" ${page >= pages ? 'disabled' : ''}
+        title="Last page">»</button>
+      ${pages > 5 ? `<select id="page-jump" title="Go to a page">
+        ${Array.from({ length: pages }, (unused, i) => `<option value="${i + 1}"
+          ${i + 1 === page ? 'selected' : ''}>${num(i + 1)} of ${num(pages)}</option>`
+        ).join('')}
+      </select>` : ''}
+    </span>` : ''}
+  </div>`;
+}
+
+/* Moving and resizing columns.
+
+   Kept out of the render loop on purpose: a resize redraws nothing until
+   the mouse comes up, because re-rendering a two hundred row table on every
+   mousemove is how a drag turns into a slideshow. The width goes straight
+   onto the <col> element, and only the finished number is written down. */
+const DRAG = { key: null, grip: null, startX: 0, startW: 0, moved: false };
+
+function tableColEl(index) {
+  // The first <col> is the tick column, which is not one of ours.
+  const cols = $('#lib-table') && $('#lib-table').querySelectorAll('colgroup col');
+  return cols ? cols[index + 1] : null;
+}
+
+document.addEventListener('mousedown', (ev) => {
+  const grip = ev.target.closest('[data-grip]');
+  if (!grip) return;
+  const layout = columnLayout(S.view);
+  const index = layout.findIndex(c => c.k === grip.dataset.grip);
+  if (index < 0) return;
+  // The heading is draggable, and a drag beginning on the grip would move
+  // the column instead of widening it.
+  ev.preventDefault();
+  ev.stopPropagation();
+  DRAG.key = grip.dataset.grip;
+  DRAG.grip = index;
+  DRAG.startX = ev.clientX;
+  DRAG.startW = layout[index].w;
+  DRAG.moved = false;
+  document.body.classList.add('resizing');
+});
+
+document.addEventListener('mousemove', (ev) => {
+  if (DRAG.grip === null) return;
+  const width = Math.max(28, DRAG.startW + (ev.clientX - DRAG.startX));
+  DRAG.width = width;
+  DRAG.moved = true;
+  const col = tableColEl(DRAG.grip);
+  if (col) col.style.width = width + 'px';
+});
+
+document.addEventListener('mouseup', () => {
+  if (DRAG.grip === null) return;
+  const index = DRAG.grip;
+  const moved = DRAG.moved;
+  const width = DRAG.width;
+  DRAG.grip = null; DRAG.key = null; DRAG.width = null;
+  document.body.classList.remove('resizing');
+  if (!moved) return;
+  const layout = columnLayout(S.view);
+  layout[index].w = width;
+  saveColumnLayout(S.view, layout);
+  // Suppress the click that follows this mouseup, or the heading sorts
+  // itself the moment you finish widening it.
+  DRAG.justResized = true;
+  setTimeout(() => { DRAG.justResized = false; }, 0);
+});
+
+document.addEventListener('dragstart', (ev) => {
+  const th = ev.target.closest && ev.target.closest('th[data-col]');
+  if (!th) return;
+  ev.dataTransfer.effectAllowed = 'move';
+  // Firefox refuses to start a drag with nothing in the payload.
+  ev.dataTransfer.setData('text/plain', th.dataset.col);
+  DRAG.key = th.dataset.col;
+  th.classList.add('dragging');
+});
+
+document.addEventListener('dragover', (ev) => {
+  const th = ev.target.closest && ev.target.closest('th[data-col]');
+  if (!th || !DRAG.key || th.dataset.col === DRAG.key) return;
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = 'move';
+  for (const el of document.querySelectorAll('th.dropinto')) {
+    el.classList.remove('dropinto');
+  }
+  th.classList.add('dropinto');
+});
+
+document.addEventListener('drop', (ev) => {
+  const th = ev.target.closest && ev.target.closest('th[data-col]');
+  if (!th || !DRAG.key) return;
+  ev.preventDefault();
+  const from = DRAG.key;
+  const onto = th.dataset.col;
+  DRAG.key = null;
+  if (from === onto) return render();
+  const layout = columnLayout(S.view);
+  const moving = layout.find(c => c.k === from);
+  const rest = layout.filter(c => c.k !== from);
+  const at = rest.findIndex(c => c.k === onto);
+  rest.splice(at, 0, moving);
+  saveColumnLayout(S.view, rest);
+  render();
+});
+
+document.addEventListener('dragend', () => {
+  DRAG.key = null;
+  for (const el of document.querySelectorAll('th.dragging, th.dropinto')) {
+    el.classList.remove('dragging', 'dropinto');
+  }
+});
+
 /* What one track is, beside the table. Opened by clicking a row, because
    that is the gesture that already means "this one" - and a library row is
    nine columns of the fields that fit, which is never the artwork, the
    path, or where the values came from. */
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'];
+
+/* A release date, as it would be said out loud.
+
+   The tag holds whatever the file or the lookup gave it, and the spellings
+   differ by where it came from: MusicBrainz writes 2018-06-13, and a file
+   tagged from a YouTube upload date carries 20241010 with no separators at
+   all. Both are a date; only one of them looked like one to the old reader,
+   which took the first four digits and showed a bare year for every file in
+   a library downloaded from YouTube.
+
+   A year, a year and a month, or a full date - each is shown for what it
+   is rather than padded out into a precision nobody supplied. */
+function releaseDate(value) {
+  const v = String(value || '').trim();
+  const m = /^(\d{4})(?:[-/.]?(\d{2}))?(?:[-/.]?(\d{2}))?/.exec(v);
+  if (!m) return v;
+  const [, year, mon, day] = m;
+  // A zero month or day is a tag saying "not known", which some writers
+  // spell 2018-00-00 rather than leaving off. Shown as the year it is,
+  // not as the nought-th of nothing.
+  const name = +mon ? MONTHS[+mon - 1] : null;
+  if (!name) return year;
+  if (!+day) return `${name} ${year}`;
+  return `${name} ${ordinal(+day)}, ${year}`;
+}
+
+function ordinal(n) {
+  const rest = n % 100;
+  if (rest >= 11 && rest <= 13) return n + 'th';
+  return n + ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th');
+}
+
 function renderInspector() {
   if (!S.inspectKey) return '';
   const d = S.inspect;
@@ -450,7 +925,21 @@ function renderInspector() {
       <span class="none-note">no artwork in this file</span>
     </div>`;
 
+  // The controls first: what to do with this track, before the picture of
+  // it. Closing is on the right, away from the three that act on the track,
+  // so the one that undoes the panel is not next to the one that rewrites
+  // the file.
+  const controls = `<div class="hstack tools">
+      ${row.id ? `<button class="btn sm" data-play="${row.id}"
+        title="Listen to it">${icon('i-play')} Play</button>` : ''}
+      <button class="btn sm" data-sel-act="edit">Edit metadata</button>
+      <button class="btn sm" data-sel-act="enrich">Identify again</button>
+      <span class="grow" style="flex:1"></span>
+      <button class="btn sm" data-close-inspector="1" title="Close">&times;</button>
+    </div>`;
+
   return `<aside class="inspector">
+    ${controls}
     ${art}
     <div class="in">
       <h3 class="pick">${h(value('title') || (d.rel_path || '').split('/').pop())}${edited('title')}</h3>
@@ -467,7 +956,7 @@ function renderInspector() {
         ${line('album', value('album'))}
         ${line('album artist', value('album_artist'))}
         ${line('genre', value('genre') || '\u2014')}
-        ${line('year', value('year'))}
+        ${line('released', releaseDate(value('year')))}
         ${line('track', [value('track_no'), value('disc_no')
           ? 'disc ' + value('disc_no') : ''].filter(Boolean).join(' \u00b7 '))}
         ${line('length', dur(d.duration))}
@@ -489,11 +978,16 @@ function renderInspector() {
              <button class="btn sm" data-sel-act="accept">Accept</button>
              <button class="btn sm" data-sel-act="reject">Reject</button>
            </div>` : ''}
-      <div class="hstack" style="margin-top:8px">
-        <button class="btn sm" data-sel-act="edit">Edit metadata</button>
-        <button class="btn sm" data-sel-act="enrich">Identify again</button>
-        <span class="grow" style="flex:1"></span>
-        <button class="btn sm" data-close-inspector="1" title="Close">&times;</button>
+      <div class="pl-seen">
+        <h4>As seen in</h4>
+        ${(d.playlists || []).length
+          ? `<ul class="pl-list">${d.playlists.map(pl => `<li>
+              <button class="linkish clip" data-playlist="${pl.id}"
+                title="Open ${h(pl.name)}">${h(pl.name)}</button>
+              <span class="faint mono">#${num(pl.pos + 1)} of ${num(pl.entries)}</span>
+            </li>`).join('')}</ul>`
+          : '<div class="muted">no playlists - this track is in the library '
+            + 'only, so nothing carries it to a player.</div>'}
       </div>
     </div>
   </aside>`;
@@ -555,11 +1049,12 @@ function renderInbox() {
   const n = S.tracksTotal;
   return `
     <div class="hstack" style="padding:6px 10px;border-bottom:1px solid var(--line-2)">
-      <span class="faint mono" style="font-size:9px;letter-spacing:.1em">NEW SINCE LAST EMPTIED</span>
+      <span class="faint mono" style="font-size:9px;letter-spacing:.1em">STILL ARRIVING</span>
       <strong style="font-size:11px">${num(n)} track${n === 1 ? '' : 's'}</strong>
       <span class="faint" style="font-size:10px">Downloads and scanned files
-        land here first. Identification runs on them automatically; this is
-        where you check what it did.</span>
+        land here first and leave on their own once they have settled -
+        identified, skipped, or a day old. What stays is what is still
+        waiting on you.</span>
       <span class="grow" style="flex:1"></span>
       <span style="position:relative">
         <input id="q" placeholder="Search title, artist, album" value="${h(S.filter.q)}"
@@ -567,8 +1062,9 @@ function renderInbox() {
         <svg width="11" height="11" style="position:absolute;left:6px;top:5px;color:var(--faint)"><use href="#i-search"/></svg>
       </span>
       <button class="btn" data-inbox-seen="1" ${n ? '' : 'disabled'}
-        title="Stop treating everything indexed so far as new. Nothing is deleted.">Mark all as seen</button>
+        title="Clear the rest now, without waiting for them to settle. Nothing is deleted.">Clear the rest</button>
     </div>
+    ${filterNotice()}
     ${trackTable({ inbox: true })}`;
 }
 
@@ -581,6 +1077,17 @@ function fingerprintReady() {
 function renderOutcome() {
   const o = S.outcome;
   if (!o) return '';
+  // A plain sentence, for the things that are not jobs: a rule added, a
+  // list applied. Same place on the page as a finished run's report, so
+  // there is one spot to look for "what did that do".
+  if (o.text) {
+    return `<div class="notice ${o.ok === false ? 'bad' : 'ok'}"
+        style="margin:8px 10px">
+      ${icon(o.ok === false ? 'i-warn' : 'i-check')}<div>${h(o.text)}</div>
+      <span class="grow" style="flex:1"></span>
+      <button class="btn sm" data-dismiss-outcome="1">Dismiss</button>
+    </div>`;
+  }
   const r = o.result || {};
   const errors = r.errors || [];
   const bad = o.state === 'failed' || errors.length
@@ -645,6 +1152,7 @@ function renderSelectionBar(allShown) {
     <button class="btn sm" data-sel-act="all-matching">Select all ${num(S.tracksTotal)} matching</button>
     <button class="btn sm" data-sel-act="clear">Clear</button>
     <span class="grow" style="flex:1"></span>
+    ${btn('to-sync-list', 'Add to sync list', '+')}
     ${btn('enrich', 'Enrich', 'E', 'primary')}
     ${btn('accept', 'Accept', 'A', '', offPage > 0 || has('awaiting'))}
     ${btn('reject', 'Reject', 'R', '', offPage > 0 || has('awaiting'))}
@@ -657,33 +1165,44 @@ function renderSelectionBar(allShown) {
 
 // -------------------------------------------------------------- playlist
 
+/* A playlist, shown the way the library is shown.
+
+   It used to be its own table: seven columns of its own, no selection, no
+   inspector, no way to play anything or fix a tag from where you noticed it
+   was wrong. A playlist is a question about the library - "which of these
+   are in it, and in what order" - so it gets the same answer, narrowed.
+
+   What is genuinely its own lives in the header: where it came from, which
+   devices carry it, and the entries that never matched a file, which have
+   no track row and so cannot be rows in a table of tracks. */
 function renderPlaylist() {
   const d = S.playlistDetail;
   if (!d) return '<div class="empty">Select a playlist.</div>';
   const pl = d.playlist;
-  const rows = d.entries.map(e => `
-    <tr>
-      <td class="num">${e.pos + 1}</td>
-      <td class="clip">${h(e.title || (e.title_hint || '').split(' - ').slice(1).join(' - ') || e.title_hint || '')}</td>
-      <td class="num">${dur(e.duration)}</td>
-      <td class="clip">${h(e.artist || (e.title_hint || '').split(' - ')[0] || '')}</td>
-      <td class="mono">${h((e.ext || '').replace('.', '').toUpperCase())}</td>
-      <td>${e.track_id
-        ? '<span class="tag ok">matched</span>'
-        : '<span class="tag bad">unmatched</span>'}</td>
-      <td class="mono clip faint" title="${h(e.source_uri || '')}">${h(e.source_uri || '')}</td>
-    </tr>`).join('');
-  const unmatched = d.entries.filter(e => !e.track_id).length;
+  const unmatched = d.entries.filter(e => !e.track_id);
+  // Only a playlist that knows where it came from can be fetched again.
+  const fetchable = pl.origin === 'youtube' && !!pl.source_uri;
+  const running = !!(S.job && S.job.kind === 'download'
+                     && S.job.state === 'running');
 
-  return `<div class="pad stack">
+  return `<div class="pad" style="padding-bottom:0">
     <div class="card">
       <header>
         <h3>${h(pl.name)}</h3>
-        <span class="tag">${h(pl.origin || 'local')}</span>
-        <span class="muted">${num(d.entries.length)} entries \u00b7
-          ${num(d.entries.length - unmatched)} matched
-          ${unmatched ? `\u00b7 <b style="color:var(--bad)">${num(unmatched)} unmatched</b>` : ''}</span>
+        <span class="tag">${h(originLabel(pl))}</span>
+        ${d.fresh ? `<span class="tag new">${num(d.fresh)} new</span>` : ''}
+        <span class="muted">${num(d.entries.length)} entries ·
+          ${num(d.entries.length - unmatched.length)} matched
+          ${unmatched.length ? `· <b style="color:var(--bad)">${
+            num(unmatched.length)} unmatched</b>` : ''}</span>
         <span style="flex:1"></span>
+        <button class="btn sm" data-pl-tolist="${h(pl.name)}"
+          title="Prepare this playlist for a device, connected or not"
+          >Add to sync list</button>
+        ${fetchable ? `<button class="btn" data-pl-refresh="${pl.id}"
+          ${running ? 'disabled' : ''}
+          title="Fetch this playlist from ${h(pl.source_uri)} again: new entries, and any track not in the library yet"
+          >${icon('i-sync')} ${running ? 'Fetching...' : 'Fetch from ' + h(originLabel(pl))}</button>` : ''}
         ${S.devices.map(dv => {
           const on = d.devices.some(x => x.id === dv.id);
           return `<button class="chip ${on ? 'on' : ''}" data-plsync="${dv.id}"
@@ -694,14 +1213,177 @@ function renderPlaylist() {
       ${pl.source_uri ? `<div class="in"><span class="faint mono" style="font-size:10px">
         MIRRORED FROM</span> <a href="${h(pl.source_uri)}" target="_blank"
         rel="noreferrer" class="mono" style="font-size:10.5px">${h(pl.source_uri)}</a></div>` : ''}
+      ${S.view === 'playlist' && S.job && S.job.kind === 'download'
+        ? `<div class="in">
+        ${renderBatch((S.job && S.job.batch) || (S.dlResult && S.dlResult.batch),
+                      S.job.state === 'running')}
+        <div class="hstack"><span class="${
+          S.job.state === 'running' ? 'spin' : ''}"></span>
+          <span class="muted clip">${h(S.job.detail || S.job.state)}</span></div>
+        ${S.job.state === 'failed' ? `<div class="notice bad" style="margin-top:8px">
+          ${icon('i-warn')}<div>${h(S.job.error)}</div></div>` : ''}
+      </div>` : ''}
+      ${unmatched.length ? `<div class="in">
+        <div class="notice warn">${icon('i-warn')}<div>
+          ${num(unmatched.length)} entr${unmatched.length === 1 ? 'y names a file' : 'ies name files'}
+          the catalog does not hold, so ${unmatched.length === 1 ? 'it is' : 'they are'}
+          not in the table below.
+          <div class="mono faint" style="margin-top:4px">${unmatched.slice(0, 6)
+            .map(e => h(e.title_hint || e.raw_path)).join('<br>')}
+            ${unmatched.length > 6 ? `<br>... ${num(unmatched.length - 6)} more` : ''}</div>
+        </div></div>
+      </div>` : ''}
     </div>
+  </div>
+  ${filterNotice()}
+  ${trackTable()}`;
+}
+
+/* What is being filtered out of this page, and one click to stop.
+
+   The library says this with its facet columns, which are always on screen.
+   The inbox and a playlist have no such column, so a filter carried in
+   from a click elsewhere would be invisible. */
+function filterNotice() {
+  const f = S.filter;
+  if (!anyFilter(f)) return '';
+  const bits = [
+    f.q ? `search "${h(f.q)}"` : '',
+    f.decade ? 'decade ' + h(f.decade) : '',
+    f.genre ? 'genre ' + h(f.genre) : '',
+    f.artist ? 'artist ' + h(f.artist) : '',
+    f.album ? 'album ' + h(f.album) : '',
+    f.state ? 'metadata ' + h(f.state) : '',
+  ].filter(Boolean);
+  return `<div class="hstack" style="padding:5px 10px;border-bottom:1px solid var(--line-2)">
+    <span class="tag warn">FILTERED</span>
+    <span class="muted">showing only ${bits.join(' · ')}</span>
+    <span class="grow" style="flex:1"></span>
+    <button class="btn sm" data-clear-filters="1">Clear</button>
+  </div>`;
+}
+
+/* A card packed before there is a card.
+
+   Choosing what goes on a player used to need the player: the rules lived
+   on a device row, so deciding anything meant finding the cable first. This
+   holds the same rules against no device at all - prepare it on the train,
+   apply it when you get home - and because the rules are rules rather than
+   a frozen list of files, a playlist that gains a track gains it here too.
+*/
+function renderSyncList() {
+  const d = S.syncList;
+  if (!d) return '<div class="empty"><span class="spin"></span></div>';
+  const KIND = { playlist: 'PLAYLIST', artist: 'ARTIST', album: 'ALBUM',
+                 track: 'TRACK' };
+  const label = (r) => r.kind === 'track'
+    ? (r.ref.split('/').pop() || r.ref) : r.ref;
+
+  return `${renderOutcome()}<div class="pad stack">
     <div class="card">
-      <table class="tbl">
-        <thead><tr><th class="num">#</th><th>Name</th><th class="num">Time</th>
-          <th>Artist</th><th>Format</th><th>Match</th><th>Source URI</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-      <div class="footnote">ORDER AS PUBLISHED BY SOURCE</div>
+      <header><h3>Prepared to sync</h3>
+        <span class="tag">${num(d.tracks)} tracks</span>
+        <span class="tag">${h(bytes(d.bytes))}</span>
+        <span class="muted">no device needed to build this. Rules, not a
+          frozen list - a playlist that gains a track gains it here.</span>
+        <span class="grow" style="flex:1"></span>
+        ${d.rules.length ? '<button class="btn sm" data-sl-clear="1">Empty the list</button>' : ''}
+      </header>
+      <div class="in stack">
+        ${d.rules.length ? `<table class="tbl"><tbody>
+          ${d.rules.map(r => `<tr>
+            <td style="width:74px"><span class="tag">${h(KIND[r.kind] || r.kind)}</span></td>
+            <td class="clip" title="${h(r.ref)}">${h(label(r))}</td>
+            <td class="mono num" style="width:120px">${num(r.tracks)} tracks</td>
+            <td class="mono num" style="width:90px">${h(bytes(r.bytes))}</td>
+            <td style="width:70px"><button class="btn sm"
+              data-sl-remove="${h(r.kind)}" data-ref="${h(r.ref)}">Drop</button></td>
+          </tr>`).join('')}
+        </tbody></table>` : `<div class="empty">Nothing prepared yet. Select
+          tracks in the library and press <b>Add to sync list</b>, or add a
+          whole playlist from its page.</div>`}
+      </div>
+    </div>
+
+    <div class="card">
+      <header><h3>Send it to a device</h3>
+        <span class="muted">the rules are copied onto the device; the list
+          stays as it is, because the same set usually goes on more than one
+          card.</span></header>
+      <div class="in stack">
+        ${d.devices.length ? d.devices.map(dv => `<div class="hstack">
+          <span class="clip" style="flex:1"><b>${h(dv.name)}</b>
+            <span class="faint mono" style="font-size:10px">${dv.mounted_at
+              ? h(dv.mounted_at) : 'not connected - the rules will be waiting'
+            }</span></span>
+          <button class="btn ${dv.mounted_at ? 'primary' : ''}"
+            data-sl-apply="${dv.id}" ${d.rules.length ? '' : 'disabled'}
+            >Add to ${h(dv.name)}</button>
+        </div>`).join('') : `<div class="empty">No devices paired yet. The list
+          keeps until there is one.</div>`}
+      </div>
+    </div>
+  </div>`;
+}
+
+/* Not built yet, and saying so.
+
+   Loudness is the one thing a portable player cannot fix for you: an album
+   mastered quiet and a single mastered loud sit next to each other in a
+   playlist and you reach for the volume knob every third track. The plan is
+   to measure each file once and either write the gain tags a player already
+   understands or apply it on the way to the card - the second being the
+   only thing that helps a player that ignores the tags.
+
+   This page exists so the intention is visible and the shape is agreed
+   before anything writes to anybody's files. */
+function renderNormalize() {
+  const st = S.stats || {};
+  return `<div class="pad stack">
+    <div class="notice warn">${icon('i-warn')}<div>
+      <b>Not built yet.</b> Nothing on this page does anything to your files.
+      It is here to say what is planned and to be argued with first.</div></div>
+
+    <div class="card">
+      <header><h3>What it would do</h3></header>
+      <div class="in stack">
+        <p class="muted">Measure every track once with EBU R128 - the same
+          loudness measure streaming services use - and store the result
+          beside the track, so a file is measured once and not again on
+          every sync.</p>
+        <p class="muted">Then one of two things, per device, because players
+          differ:</p>
+        <ul class="muted" style="margin-left:16px">
+          <li><b>Write the tags.</b> <span class="mono">replaygain_track_gain</span>
+            and <span class="mono">replaygain_album_gain</span>, which a
+            player that understands them applies without re-encoding. The
+            audio is untouched; only the tags change.</li>
+          <li><b>Apply on the way out.</b> For a player that ignores the
+            tags: the gain is baked into the copy written to the card, and
+            the library keeps its original.</li>
+        </ul>
+        <p class="muted">Album gain and track gain both, kept apart: an album
+          played end to end wants its own quiet and loud passages left as the
+          record has them, while a shuffled playlist wants every track at the
+          same level.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <header><h3>What it needs</h3></header>
+      <div class="in stack">
+        <div class="hstack"><span class="tag ${
+          (S.dl && S.dl.bundled && S.dl.bundled.tools
+           && S.dl.bundled.tools.ffmpeg) ? 'ok' : ''}">ffmpeg</span>
+          <span class="muted">already used for downloading; it carries the
+            loudness filter this would measure with.</span></div>
+        <div class="hstack"><span class="tag">${num(st.tracks || 0)} tracks</span>
+          <span class="muted">to measure the first time, once each.</span></div>
+      </div>
+      <div class="in hstack">
+        <button class="btn" disabled title="Not built yet">Measure the library</button>
+        <span class="faint">disabled until this is real.</span>
+      </div>
     </div>
   </div>`;
 }
@@ -907,12 +1589,18 @@ function renderAddDevice() {
   </div>`;
 }
 
-function renderImport() {
+/* Where music comes into the library from: a folder that is already on
+   this machine, a folder of playlists, or a URL. All three used to be two
+   pages - "Scan & import" and "Download" - which meant the answer to "how
+   do I get music in" depended on where it happened to be already. */
+function renderSources() {
   const st = S.stats || {};
   const job = S.job;
-  return `<div class="pad stack">
+  return `
     <div class="card">
-      <header><h3>Library folders</h3></header>
+      <header><h3>Library folders</h3>
+        <span class="muted">music already on this machine. A scan also reads
+          the playlists inside the folder.</span></header>
       <div class="in stack">
         ${(st.root_detail || []).map(r => `<div class="hstack">
           <span class="mono clip" style="flex:1;${r.hidden
@@ -969,7 +1657,153 @@ function renderImport() {
         </form>
         <div id="pl-result"></div>
       </div>
+    </div>`;
+}
+
+/* What each file that has landed is doing now.
+
+   A file is not finished when yt-dlp stops writing it: it still has to be
+   catalogued, looked up and tagged, and until that happens it sits in the
+   library under a channel name with a video frame for a cover. Those steps
+   run per file as it arrives, so the row says which one it is on. */
+const ITEM = {
+  queued:      { tag: '',     label: 'waiting' },
+  indexing:    { tag: '',     label: 'cataloguing' },
+  identifying: { tag: '',     label: 'identifying' },
+  done:        { tag: 'ok',   label: 'done' },
+  skipped:     { tag: '',     label: 'skipped' },
+  failed:      { tag: 'warn', label: 'failed' },
+};
+
+function renderItems(items) {
+  if (!items || !items.length) return '';
+  // Newest first: the interesting end of a forty-track run is the one still
+  // moving, and it would otherwise walk off the bottom of the card.
+  const rows = items.slice().reverse().map(it => {
+    const spec = ITEM[it.state] || ITEM.queued;
+    const busy = it.state === 'indexing' || it.state === 'identifying';
+    return `<div class="item ${h(it.state)}">
+      <span class="faint mono n">${num(it.n)}</span>
+      <span class="clip" style="flex:1" title="${h(it.path || it.title)}"
+        >${h(it.title)}</span>
+      ${busy ? '<span class="spin"></span>' : ''}
+      <span class="clip detail" title="${h(it.detail || '')}">${
+        h(it.detail || '')}</span>
+      <span class="tag ${spec.tag}">${h(spec.label)}</span>
+    </div>`;
+  }).join('');
+  return `<div class="items">${rows}</div>`;
+}
+
+/* The identification queue, as a card.
+
+   Everything that arrives goes through here, one file at a time, because
+   MusicBrainz answers one request a second and asking faster gets the whole
+   program refused for a while. That is worth showing rather than hiding:
+   a download that finishes in a minute and a queue that takes ten is not a
+   program that has stopped. */
+function renderQueue() {
+  const q = (S.stats || {}).enrich_queue;
+  if (!q) return '';
+  const busy = q.waiting || q.current;
+  if (!busy && !q.done) return '';
+  const STATE = { applied: 'ok', candidate: 'warn', none: '', failed: 'warn',
+                  skipped: '' };
+  return `<div class="card">
+    <header><h3>Identifying</h3>
+      ${busy ? `<span class="tag">${num(q.waiting)} waiting</span>` : ''}
+      ${q.deferred ? `<span class="tag warn">${num(q.deferred)} retrying</span>` : ''}
+      ${q.paused ? '<span class="tag warn">paused</span>' : ''}
+      <span class="muted">one file at a time, because MusicBrainz answers
+        one request a second${q.interval && q.interval > 1.5
+          ? ` - currently ${q.interval.toFixed(1)}s, having been asked to slow down`
+          : ''}.</span>
+      <span class="grow" style="flex:1"></span>
+      ${busy ? `<button class="btn sm" data-queue="${q.paused ? 'resume' : 'pause'}"
+        >${q.paused ? 'Resume' : 'Pause'}</button>` : ''}
+      ${q.waiting ? '<button class="btn sm" data-queue="clear">Drop the backlog</button>' : ''}
+    </header>
+    <div class="in stack">
+      <div class="hstack">
+        <span class="muted">${[
+          q.applied ? `${num(q.applied)} identified` : '',
+          q.candidates ? `${num(q.candidates)} to review` : '',
+          q.unmatched ? `${num(q.unmatched)} not found` : '',
+          q.gave_up ? `${num(q.gave_up)} gave up` : '',
+        ].filter(Boolean).join(' \u00b7 ') || 'nothing yet'}</span>
+        ${q.current ? `<span class="spin"></span>` : ''}
+      </div>
+      ${q.last_error && q.deferred ? `<div class="notice warn">${icon('i-warn')}
+        <div>${h(q.last_error)} - trying again shortly.</div></div>` : ''}
+      ${(q.recent || []).length ? `<table class="tbl"><tbody>
+        ${q.recent.map(r => `<tr>
+          <td class="clip" title="${h(r.label || r.key)}">${h(r.label || r.key)}</td>
+          <td class="clip muted" style="width:45%">${h(r.detail || '')}</td>
+          <td style="width:78px"><span class="tag ${STATE[r.state] || ''}"
+            >${h(r.state || '')}</span></td>
+        </tr>`).join('')}
+      </tbody></table>` : ''}
     </div>
+  </div>`;
+}
+
+/* The last few URLs asked for.
+
+   The alternative is going back to the browser to find the link again,
+   which is the one part of downloading that Lemon Zest was making worse
+   rather than better. Click one and it goes back in the box. */
+function renderRecent(d) {
+  const rows = d.recent || [];
+  if (!rows.length) return '';
+  return `<div class="card">
+    <header><h3>Recent URLs</h3>
+      <span class="muted">the last ${num(rows.length)} asked for - click one
+        to put it back in the box.</span></header>
+    <div class="in">${rows.map(r => `<div class="urlrow">
+      <button class="btn sm" data-useurl="${h(r.url)}">Use</button>
+      <span class="clip" style="flex:1" title="${h(r.url)}">
+        ${h(r.title || r.url)}
+        ${r.is_playlist ? `<span class="tag">${num(r.item_count)} items</span>` : ''}
+        <span class="u">${h(r.url)}</span></span>
+      <span class="faint mono" style="font-size:10px">${h(ago(r.last_used))}</span>
+      ${r.is_playlist && !r.kept ? `<button class="btn sm" data-keep="${h(r.url)}"
+        title="Keep this playlist and fetch it again later"
+        >${icon('i-keep')} Keep</button>` : ''}
+    </div>`).join('')}</div>
+  </div>`;
+}
+
+/* The playlists being kept an eye on.
+
+   A playlist somebody follows is not a one-off download: tracks are added
+   to it for as long as it exists. Keeping the URL means the answer to "has
+   anything been added" is one click, and that click fetches only what is
+   new - the download archive skips the rest - appends it to the same
+   playlist, and rewrites the playlist file beside the library. Syncing it
+   to a player is still a sync, done when you choose. */
+function renderKept(d) {
+  const rows = d.kept || [];
+  if (!rows.length) return '';
+  const running = !!(S.job && S.job.kind === 'download'
+                     && S.job.state === 'running');
+  return `<div class="card">
+    <header><h3>Kept playlists</h3>
+      <span class="tag">${num(rows.length)}</span>
+      <span class="muted">fetch one again and it takes whatever is new,
+        nothing else.</span></header>
+    <div class="in">${rows.map(r => `<div class="urlrow">
+      <span class="clip" style="flex:1" title="${h(r.url)}">
+        <b>${h(r.playlist_name || r.title || r.url)}</b>
+        <span class="tag">${num(r.entries)} in the playlist</span>
+        <span class="u">${h(r.url)}</span></span>
+      <span class="faint mono" style="font-size:10px">${r.last_checked
+        ? 'checked ' + h(ago(r.last_checked))
+          + (r.last_added ? ', ' + num(r.last_added) + ' added' : ', nothing new')
+        : 'never checked'}</span>
+      <button class="btn sm" data-keeprun="${h(r.url)}" ${running ? 'disabled' : ''}
+        >${icon('i-sync')} Update</button>
+      <button class="btn sm" data-unkeep="${h(r.url)}">Forget</button>
+    </div>`).join('')}</div>
   </div>`;
 }
 
@@ -994,11 +1828,27 @@ function renderBatch(batch, running) {
 
   const c = batch.current;
   const cpct = c && c.bytes_total ? (100 * c.bytes) / c.bytes_total : 0;
+  // Identified, not merely fetched: a track is only finished when its tags
+  // are right, so that is the number worth putting beside the downloads.
+  const named = (batch.items || []).filter(i => i.enrich === 'applied').length;
+  // Named for what they are, so the three of them visibly account for the
+  // total. "Already had" read as "already in this playlist" - which is a
+  // different number, printed a few lines further down - and left the sum
+  // looking like it did not work out.
   const counted = [
-    batch.downloaded ? `${num(batch.downloaded)} downloaded` : '',
-    batch.skipped ? `${num(batch.skipped)} already had` : '',
-    batch.failed ? `${num(batch.failed)} failed` : '',
+    batch.downloaded ? `${num(batch.downloaded)} fetched` : '',
+    named ? `${num(named)} identified` : '',
+    batch.skipped ? `${num(batch.skipped)} already downloaded before` : '',
+    batch.failed ? `${num(batch.failed)} could not be fetched` : '',
   ].filter(Boolean).join(' \u00b7 ');
+  const sum = (batch.downloaded || 0) + (batch.skipped || 0) + (batch.failed || 0);
+  const reckoning = total
+    ? `${num(total)} item${total === 1 ? '' : 's'} asked for: `
+      + `${num(batch.downloaded || 0)} fetched, `
+      + `${num(batch.skipped || 0)} already in the download archive, `
+      + `${num(batch.failed || 0)} could not be fetched`
+      + (sum === total ? '' : ` (${num(total - sum)} still going)`)
+    : '';
 
   return `<div class="card batch">
     <header>
@@ -1015,7 +1865,7 @@ function renderBatch(batch, running) {
     <div class="in">
       <div class="bar big"><i style="width:${pct.toFixed(1)}%"></i></div>
       <div class="hstack" style="margin-top:6px">
-        <span class="muted">${counted || (batch.listed
+        <span class="muted" title="${h(reckoning)}">${counted || (batch.listed
           ? 'nothing fetched yet' : 'listing what is at the URLs...')}</span>
         <span class="grow" style="flex:1"></span>
         <span class="faint mono" style="font-size:10px">${pct.toFixed(0)}%</span>
@@ -1036,6 +1886,7 @@ function renderBatch(batch, running) {
             .filter(Boolean).join(' \u00b7 '))}</span>
         </div>
       </div>` : ''}
+      ${renderItems(batch.items)}
     </div>
   </div>`;
 }
@@ -1126,6 +1977,11 @@ function renderDownload() {
           ${S.dlProbe.uploader ? ' &middot; ' + h(S.dlProbe.uploader) : ''}
           &middot; ${S.dlProbe.is_playlist
             ? num(S.dlProbe.count) + ' items' : dur(S.dlProbe.duration)}
+          ${S.dlProbe.is_playlist ? `<div class="hstack" style="margin-top:6px">
+            <button class="btn sm" data-keep="${h(S.dlProbe.url)}"
+              >${icon('i-keep')} Keep this playlist</button>
+            <span class="faint">kept playlists sit above the log and fetch
+              only what is new.</span></div>` : ''}
         </div></div>` : ''}
 
         ${renderBatch((job && job.batch) || (res && res.batch),
@@ -1142,9 +1998,10 @@ function renderDownload() {
             ${num(res.downloaded)} downloaded into
             <span class="mono pick">${h(res.root)}</span> -
             ${num(res.added)} added to the catalog, ${num(res.updated)} updated.
-            ${res.playlist ? `Playlist <strong>${h(res.playlist.name)}</strong>:
-              ${num(res.playlist.added)} added${res.playlist.skipped
-                ? ', ' + num(res.playlist.skipped) + ' already there' : ''}.` : ''}
+            ${(res.playlists || []).map(pl => `<div>Playlist
+              <strong>${h(pl.name)}</strong>: ${num(pl.added)} added${pl.skipped
+                ? ', ' + num(pl.skipped) + ' were already in it' : ''} -
+              ${num(pl.entries)} entries.</div>`).join('')}
           </div></div>
           <table class="tbl"><tbody>${res.files.map(f => `<tr>
             <td class="mono clip pick" title="${h(f)}">${h(f.slice(res.root.length + 1))}</td>
@@ -1156,6 +2013,11 @@ function renderDownload() {
           ${icon('i-warn')}<div class="pick">${res.errors.map(e => h(e)).join('<br>')}</div></div>` : ''}
       </div>
     </div>
+
+    ${renderQueue()}
+    ${renderKept(d)}
+    ${renderRecent(d)}
+    ${renderSources()}
 
     <div class="card">
       <header><h3>Log</h3>
@@ -1262,7 +2124,8 @@ function renderDownload() {
 function renderProblems() {
   const p = S.problems;
   if (!p) return '<div class="empty"><span class="spin"></span></div>';
-  const clean = !p.empty_total && !p.untagged_total && !p.unmatched_total;
+  const clean = !p.empty_total && !p.untagged_total && !p.unmatched_total
+    && !p.awaiting;
   if (clean) {
     return `<div class="pad"><div class="notice ok">${icon('i-check')}
       <div>Nothing needs attention. Every file has content and tags, and every
@@ -1283,6 +2146,19 @@ function renderProblems() {
     </div>` : '';
 
   return `<div class="pad stack">
+    ${p.awaiting ? `<div class="card">
+      <header><h3>Waiting on you</h3>
+        <span class="tag warn">${num(p.awaiting)}</span>
+        <span class="muted">a match was found but is not certain enough to
+          write on its own.</span></header>
+      <div class="in hstack">
+        <span class="muted">${num(p.awaiting)} track${p.awaiting === 1 ? '' : 's'}
+          ${p.awaiting === 1 ? 'has' : 'have'} a proposed match to accept or
+          reject.</span>
+        <span class="grow" style="flex:1"></span>
+        <button class="btn" data-act="review">Review them</button>
+      </div>
+    </div>` : ''}
     ${fileCard('Empty files', 'zero bytes on disk - failed downloads. Lemon Zest skips these when syncing rather than putting dead entries on the card.', p.empty, p.empty_total)}
     ${fileCard('Untagged files', 'no title tag, so they sort last and their destination path falls back to the filename.', p.untagged, p.untagged_total)}
     ${p.unmatched.length ? `<div class="card">
@@ -1371,8 +2247,9 @@ const TITLES = {
   playlist: () => S.playlistDetail
     ? ('PLAYLIST \u2014 ' + S.playlistDetail.playlist.name).toUpperCase() : 'PLAYLIST',
   addDevice: () => 'ADD DEVICE',
-  import: () => 'SCAN & IMPORT',
-  download: () => 'DOWNLOAD',
+  download: () => 'ADD MUSIC',
+  syncList: () => `SYNC LIST — ${num((S.syncList || {}).tracks || 0)} TRACKS`,
+  normalize: () => 'NORMALIZE VOLUME',
   problems: () => 'NEEDS ATTENTION',
 };
 
@@ -1392,16 +2269,33 @@ function renderStatus() {
     // status strip is the only part of the interface visible from the
     // Library page, and "12 of 47" is the whole question.
     const b = job.batch;
+    // Whatever is actually moving. Once yt-dlp has written the last file
+    // there is no `current` any more, but the run is not over - the last
+    // track is still being identified, and the strip says so rather than
+    // freezing on a number.
+    const busy = b && (b.items || []).find(
+      i => i.state === 'indexing' || i.state === 'identifying');
     $('#status-meta').textContent = b && b.total
       ? `${num(b.done)} of ${num(b.total)}`
-        + (b.current ? ' \u00b7 ' + b.current.title : '')
+        + (b.current ? ' \u00b7 ' + b.current.title
+           : busy ? ' \u00b7 ' + busy.detail : '')
       : (job.detail || '');
     $('#status-bar').style.width =
       (job.total ? (100 * job.done / job.total) : 0) + '%';
   } else {
-    meter.classList.add('idle');
     const st = S.stats || {};
     const connected = S.devices.filter(d => d.mounted_at).length;
+    const queued = queueMeter();
+    if (queued) {
+      // Quieter than a job - no bar - because nobody is waiting on it, but
+      // said out loud, because it is work the program is doing.
+      meter.classList.remove('idle');
+      $('#status-label').textContent = queued.label;
+      $('#status-meta').textContent = queued.meta;
+      $('#status-bar').style.width = '0%';
+      return;
+    }
+    meter.classList.add('idle');
     $('#status-label').textContent = job && job.state === 'failed'
       ? 'Last job failed' : 'Ready';
     $('#status-meta').textContent =
@@ -1411,7 +2305,68 @@ function renderStatus() {
   }
 }
 
+/* A listen, which is the only way to tell some things.
+
+   A download that produced four seconds of silence, or a file whose audio
+   never arrived, is a perfectly healthy row in every column of the table:
+   right title, right length, right bitrate. The only check is to hear it.
+   Deliberately small - one track, the browser's own controls, no queue.
+
+   The audio element is built once and kept out of the re-rendered pane: a
+   render while a track is playing must not restart it. */
+const PLAYER = { audio: null };
+
+function playerNode() {
+  const box = $('#player');
+  if (!PLAYER.audio) {
+    box.innerHTML = `<div class="what clip">
+        <div class="t clip" id="play-title"></div>
+        <div class="a clip" id="play-artist"></div>
+      </div>
+      <audio id="play-audio" controls preload="metadata"></audio>
+      <span class="bad" id="play-error"></span>
+      <span class="grow" style="flex:1"></span>
+      <button class="btn sm" data-play-close="1">Close</button>`;
+    PLAYER.audio = $('#play-audio');
+    PLAYER.audio.addEventListener('error', () => {
+      // Worth saying which of the two it is: a browser that cannot decode
+      // the container is not a broken file, and telling somebody their
+      // download is corrupt when it plays fine on the player is worse than
+      // saying nothing.
+      $('#play-error').textContent =
+        'this browser could not play that file - try it on the device';
+    });
+  }
+  return box;
+}
+
+function playTrack(id) {
+  const t = (S.tracks || []).find(x => x.id === id)
+    || (S.detail && S.detail.track && S.detail.track.id === id
+        ? S.detail.track : null);
+  S.play = { id, title: (t && (t.title || (t.rel_path || '').split('/').pop()))
+                        || 'track ' + id,
+             artist: (t && [t.artist, t.album].filter(Boolean).join(' · ')) || '' };
+  const box = playerNode();
+  box.hidden = false;
+  document.body.classList.add('playing');
+  $('#play-title').textContent = S.play.title;
+  $('#play-artist').textContent = S.play.artist;
+  $('#play-error').textContent = '';
+  PLAYER.audio.src = '/api/audio/' + id;
+  PLAYER.audio.play().catch(() => { /* the controls are right there */ });
+}
+
+function stopPlaying() {
+  if (PLAYER.audio) { PLAYER.audio.pause(); PLAYER.audio.removeAttribute('src'); }
+  S.play = null;
+  const box = $('#player');
+  if (box) box.hidden = true;
+  document.body.classList.remove('playing');
+}
+
 function render() {
+  saveUiState();
   if (isTrackView()) syncInspector();
   renderSidebar();
   $('#titlebar').innerHTML = `<span>${h((TITLES[S.view] || (() => S.view))())}</span>
@@ -1420,7 +2375,8 @@ function render() {
   const body = {
     library: renderLibrary, inbox: renderInbox,
     device: renderDevice, playlist: renderPlaylist,
-    addDevice: renderAddDevice, import: renderImport, problems: renderProblems,
+    addDevice: renderAddDevice, normalize: renderNormalize,
+    syncList: renderSyncList, problems: renderProblems,
     download: renderDownload,
   }[S.view];
   $('#pane').innerHTML = body ? body() : '';
@@ -1529,6 +2485,17 @@ function selAction(act) {
   if (act === 'all-matching') return selectAllMatching();
   const keys = selectedKeys();
   if (!keys.length) return;
+  if (act === 'to-sync-list') {
+    return guard(async () => {
+      S.syncList = await api('/sync-list/keys', {
+        method: 'POST', body: JSON.stringify({ content_keys: keys }),
+      });
+      S.outcome = { ok: true, text: `${num(S.syncList.added)} added to the `
+        + `sync list, which now holds ${num(S.syncList.tracks)} tracks `
+        + `(${bytes(S.syncList.bytes)}).` };
+      await loadCore();
+    });
+  }
   if (act === 'edit') return editModal(keys);
   if (act === 'write') return writeTagsModal(keys);
   if (act === 'enrich') return enrichModal(keys);
@@ -1949,6 +2916,33 @@ document.addEventListener('click', (ev) => {
     S.outcome = null;
     return render();
   }
+  if (ev.target.closest('[data-clear-filters]')) {
+    S.filters[S.view] = BLANK_FILTER();
+    S.offset = 0;
+    return guard(loadLibrary);
+  }
+  const goto = ev.target.closest('[data-goto]');
+  if (goto) {
+    S.offset = (+goto.dataset.goto - 1) * S.limit;
+    return guard(loadLibrary);
+  }
+  if (ev.target.closest('[data-cols-reset]')) {
+    resetColumnLayout(S.view);
+    return render();
+  }
+  const th = ev.target.closest('[data-sort]');
+  // A heading that has just been widened is not a heading that was clicked.
+  if (th && !DRAG.justResized && !ev.target.closest('[data-grip]')) {
+    const col = th.dataset.sort;
+    // The same column again turns it around; a different one starts
+    // ascending, which is what "sort by this" means before you have said
+    // which way.
+    S.sort = S.sort.col === col
+      ? { col, dir: S.sort.dir === 'asc' ? 'desc' : 'asc' }
+      : { col, dir: 'asc' };
+    S.offset = 0;
+    return guard(loadLibrary);
+  }
   const chip = ev.target.closest('[data-state-filter]');
   if (chip) {
     S.filter.state = chip.dataset.stateFilter;
@@ -1986,7 +2980,11 @@ document.addEventListener('click', (ev) => {
     + '[data-detect-pl],'
     + '[data-close],[data-scrim],[data-usevol],[data-scan],[data-volumes],'
     + '[data-probe],[data-copylog],[data-inbox-seen],[data-clear-urls],'
-    + '[data-close-inspector],'
+    + '[data-play],[data-play-close],[data-useurl],[data-keep],[data-unkeep],'
+    + '[data-keeprun],[data-pl-refresh],[data-sl-remove],[data-sl-clear],'
+    + '[data-queue],'
+    + '[data-sl-apply],[data-pl-tolist],'
+    + '[data-close-inspector],[data-dismiss-outcome],'
     + '[data-root-hide],[data-root-remove],[data-root-forget],'
     + '[data-plsync],[data-playlist],[data-track]');
   if (!t) return;
@@ -1996,13 +2994,72 @@ document.addEventListener('click', (ev) => {
 
   if (d.close || d.scrim) return closeModal();
 
+  if (d.dismissOutcome) { S.outcome = null; return render(); }
+
+  if (d.play) return playTrack(+d.play);
+  if (d.playClose) return stopPlaying();
+  if (d.useurl) {
+    setDownloadUrls(d.useurl);
+    render();
+    const box = $('#dl-form') && $('#dl-form').urls;
+    if (box) box.focus();
+    return;
+  }
+  if (d.keep) {
+    // The listing is what names it, so this asks the server, which probes.
+    return guard(async () => {
+      S.dl = await api('/download/keep', {
+        method: 'POST',
+        body: JSON.stringify({ url: d.keep,
+                               root: (S.dl && S.dl.config.root) || '' }),
+      });
+    });
+  }
+  if (d.unkeep) {
+    return guard(async () => {
+      S.dl = await api('/download/keep', {
+        method: 'POST',
+        body: JSON.stringify({ url: d.unkeep, kept: false }),
+      });
+    });
+  }
+  if (d.keeprun) {
+    return guard(async () => {
+      const res = await api('/download/keep/run', {
+        method: 'POST', body: JSON.stringify({ url: d.keeprun }),
+      });
+      S.dlResult = null;
+      S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
+                total: 0, label: d.keeprun };
+      watchJob(res.job, async (job) => {
+        S.dlResult = job.result || null;
+        await loadCore();
+        await loadDownload();
+        followAutoEnrich(job, 'the new files');
+      });
+    });
+  }
+
+  if (d.act === 'review') {
+    // Out of the problems page and into the library, asking the one
+    // question the card was about.
+    S.view = 'library'; S.filter.state = 'awaiting';
+    S.offset = 0; S.sel.clear(); S.anchor = null;
+    return guard(loadLibrary);
+  }
   if (d.act === 'view') {
     S.view = d.arg;
     if (d.arg === 'library' || d.arg === 'inbox') {
-      // The two views share the table, and the offset and selection belong
-      // to the question that was asked, not to the one being left.
+      // The views share the table, and the offset, selection and sort
+      // belong to the question that was asked, not to the one being left.
       S.offset = 0; S.sel.clear(); S.anchor = null;
+      S.sort = { col: null, dir: 'asc' };
       return guard(loadLibrary);
+    }
+    if (d.arg === 'syncList') {
+      S.syncList = null;
+      render();
+      return guard(async () => { S.syncList = await api('/sync-list'); });
     }
     if (d.arg === 'problems') {
       S.problems = null;
@@ -2028,16 +3085,79 @@ document.addEventListener('click', (ev) => {
       if (dev && dev.mounted_at) await loadPlan(+d.arg);
     });
   }
-  if (d.act === 'playlist') {
-    S.view = 'playlist';
-    return guard(() => loadPlaylist(+d.arg));
+  if (d.slRemove) {
+    const body = { remove: [[d.slRemove, t.dataset.ref]] };
+    return guard(async () => {
+      S.syncList = await api('/sync-list', {
+        method: 'POST', body: JSON.stringify(body) });
+      await loadCore();
+    });
   }
-  if (d.playlist) {
-    S.view = 'playlist';
-    return guard(() => loadPlaylist(+d.playlist));
+  if (d.slClear) {
+    return guard(async () => {
+      S.syncList = await api('/sync-list', {
+        method: 'POST', body: JSON.stringify({ clear: true }) });
+      await loadCore();
+    });
   }
+  if (d.slApply) {
+    const did = +d.slApply;
+    return guard(async () => {
+      const out = await api('/sync-list/apply', {
+        method: 'POST', body: JSON.stringify({ device: did }) });
+      S.outcome = { ok: true, text: `${num(out.applied)} rules added - that `
+        + `device is now set to carry ${num(out.tracks)} tracks `
+        + `(${bytes(out.bytes)})`
+        + (out.mounted ? '.' : ', and will copy them when it is connected.') };
+      await loadCore();
+      S.syncList = await api('/sync-list');
+    });
+  }
+  if (d.queue) {
+    const body = { pause: d.queue === 'pause', resume: d.queue === 'resume',
+                   clear: d.queue === 'clear' };
+    return guard(async () => {
+      await api('/enrich/queue', { method: 'POST', body: JSON.stringify(body) });
+      await loadCore();
+    });
+  }
+  if (d.plRefresh) {
+    const id = +d.plRefresh;
+    return guard(async () => {
+      const res = await api('/playlists/' + id + '/refresh', { method: 'POST' });
+      S.dlResult = null;
+      S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
+                total: 0, label: S.playlistDetail.playlist.name };
+      watchJob(res.job, async (job) => {
+        S.dlResult = job.result || null;
+        // The playlist, the library and every device plan that mentions it
+        // have all just changed.
+        await loadCore();
+        await loadPlaylist(id, { peek: true });
+        await loadLibrary();
+        followAutoEnrich(job, 'the new files');
+      });
+    });
+  }
+  if (d.plTolist) {
+    return guard(async () => {
+      S.syncList = await api('/sync-list', {
+        method: 'POST',
+        body: JSON.stringify({ add: [['playlist', d.plTolist]] }) });
+      S.outcome = { ok: true, text: `Playlist added. The sync list now holds `
+        + `${num(S.syncList.tracks)} tracks (${bytes(S.syncList.bytes)}).` };
+      await loadCore();
+    });
+  }
+  if (d.act === 'playlist') return openPlaylist(+d.arg);
+  if (d.playlist) return openPlaylist(+d.playlist);
   if (d.facet !== undefined) {
     S.filter[d.facet] = d.value;
+    // The panes read left to right, so choosing in one clears the choices
+    // to its right rather than leaving a pair that matches nothing.
+    if (d.facet === 'decade') {
+      S.filter.genre = ''; S.filter.artist = ''; S.filter.album = '';
+    }
     if (d.facet === 'genre') { S.filter.artist = ''; S.filter.album = ''; }
     if (d.facet === 'artist') { S.filter.album = ''; }
     S.offset = 0;
@@ -2124,7 +3244,7 @@ document.addEventListener('click', (ev) => {
                                 : { add: [['playlist', name]] }),
       });
       await loadCore();
-      await loadPlaylist(S.playlistId);
+      await loadPlaylist(S.playlistId, { peek: true });
     });
   }
   if (d.usevol) {
@@ -2229,22 +3349,32 @@ function startScan(root) {
   });
 }
 
-// A scan and a download each hand back the id of the identification pass they
-// started. Picking it up is what keeps that pass visible: it is the longer of
-// the two jobs by far, and an hour of work with no progress bar reads as
-// nothing happening.
-function followAutoEnrich(job, label) {
-  const id = job && job.result && job.result.enrich_job;
-  if (!id) return;
-  S.outcome = null;
-  S.job = { id, kind: 'enrich', state: 'running', done: 0, total: 0,
-            label: label || 'new files' };
-  watchJob(id, async (done) => {
-    S.outcome = done;
-    await loadCore();
-    if (S.view === 'library') await loadLibrary();
-  });
+/* Identification is no longer a job that a scan or a download starts.
+
+   It is a queue the program works through at one request a second, whatever
+   else is going on - so what a finished download hands back is how many
+   files it put on that queue, and the queue says the rest itself, in the
+   status strip and on its own card. Kept as a function because both callers
+   still want the library to catch up with whatever just landed. */
+async function followAutoEnrich(job, label) {
+  await loadCore();
+  if (isTrackView()) await loadLibrary();
   render();
+}
+
+/* The backlog, in the status strip.
+
+   Shown only when nothing louder is happening: a download has a progress
+   bar of its own and this would only compete with it. What it says is the
+   thing that used to be invisible - that the program is still working
+   through the files that arrived twenty minutes ago. */
+function queueMeter() {
+  const q = (S.stats || {}).enrich_queue;
+  if (!q || (!q.waiting && !q.current)) return null;
+  const bits = [`${num(q.waiting)} waiting`];
+  if (q.paused) bits.unshift('paused');
+  if (q.deferred) bits.push(`${num(q.deferred)} retrying`);
+  return { label: 'Identifying', meta: bits.join(' \u00b7 ') };
 }
 
 document.addEventListener('submit', (ev) => {
@@ -2326,6 +3456,15 @@ function setDownloadUrls(text) {
   } catch (e) { /* private mode, or storage full: the box still works */ }
 }
 
+// The page picker. A select rather than a number box: the pages that
+// exist are known, so offering any other number would be offering a
+// mistake.
+document.addEventListener('change', (ev) => {
+  if (ev.target.id !== 'page-jump') return;
+  S.offset = Math.max(0, (+ev.target.value - 1) * S.limit);
+  guard(loadLibrary);
+});
+
 let filterTimer = null;
 document.addEventListener('input', (ev) => {
   const el = ev.target;
@@ -2366,7 +3505,7 @@ document.addEventListener('input', (ev) => {
 
 $('#btn-rescan').addEventListener('click', () => {
   const roots = (S.stats && S.stats.roots) || [];
-  if (!roots.length) { S.view = 'import'; return render(); }
+  if (!roots.length) { S.view = 'download'; return render(); }
   startScan(roots[0]);
 });
 
@@ -2427,11 +3566,63 @@ document.addEventListener('keydown', (ev) => {
 
 // ------------------------------------------------------------------ boot
 
+/* Where you were, so a reload puts you back there.
+
+   Only the page and what it is about - not the filters, which would be a
+   search you did not type reappearing on a page you thought was fresh, and
+   not the selection, which would be an action pointed at rows you cannot
+   remember choosing. */
+const UI_KEY = 'lz.ui';
+
+function saveUiState() {
+  try {
+    localStorage.setItem(UI_KEY, JSON.stringify({
+      view: S.view, playlistId: S.playlistId, deviceId: S.deviceId,
+      scopeId: S.scopeId,
+    }));
+  } catch (e) { /* private mode: the session is as long as the page */ }
+}
+
+function readUiState() {
+  try { return JSON.parse(localStorage.getItem(UI_KEY) || 'null') || {}; }
+  catch (e) { return {}; }
+}
+
 (async function boot() {
+  const was = readUiState();
   try {
     await loadCore();
-    await loadLibrary();
-    if (!S.stats.tracks) S.view = 'import';
+    if (was.scopeId && S.devices.some(d => d.id === was.scopeId)) {
+      S.scopeId = was.scopeId;
+    }
+    // Restored before the first load, so the first thing drawn is the page
+    // that was open rather than the library flashing past on the way to it.
+    if (was.view === 'playlist' && was.playlistId
+        && S.playlists.some(p => p.id === was.playlistId)) {
+      S.view = 'playlist';
+      S.playlistId = was.playlistId;
+      await loadPlaylist(was.playlistId);
+    } else if (['inbox', 'download', 'problems', 'syncList', 'normalize',
+                'device'].includes(was.view)) {
+      S.view = was.view;
+      if (was.view === 'device' && S.devices.some(d => d.id === was.deviceId)) {
+        S.deviceId = was.deviceId;
+      } else if (was.view === 'device') {
+        S.view = 'library';
+      }
+    }
+    if (isTrackView()) await loadLibrary();
+    if (S.view === 'download') await loadDownload();
+    if (S.view === 'problems') S.problems = await api('/problems');
+    if (S.view === 'syncList') S.syncList = await api('/sync-list');
+    if (S.view === 'device' && S.deviceId) {
+      await loadLog(S.deviceId);
+      const dev = S.devices.find(x => x.id === S.deviceId);
+      if (dev && dev.mounted_at) await loadPlan(S.deviceId);
+    }
+    if (!S.stats.tracks) S.view = 'download';
+    // Whatever the program is already doing, this tab now shows.
+    await adoptRunningJob();
   } catch (e) {
     S.error = e.message;
   }

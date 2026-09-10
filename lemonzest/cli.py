@@ -94,60 +94,87 @@ def scan_cmd(ctx, root, full, workers):
         f"{counts['unchanged']} unchanged, {counts['removed']} removed, "
         f"{counts['failed']} failed"
     )
+    # The folder's playlists are part of the folder. Read after the audio,
+    # because an entry can only be matched to a track already catalogued.
+    found = playlists.import_dir(con, root, recursive=True)
+    if found:
+        matched = sum(f["matched"] for f in found)
+        total = sum(f["total"] for f in found)
+        console.print(f"[green]{len(found)}[/] playlists - "
+                      f"{matched} of {total} entries matched")
     _auto_enrich(con, root=root)
 
 
 cli.add_command(scan_cmd, name="scan")
 
 
-def _auto_enrich(con, root=None, content_keys=None):
-    """Run the automatic pass and say what it did.
+def _drain_queue(con, total):
+    """Watch the identification queue empty, and say what it found.
 
-    Called after a scan and after a download, so the terminal behaves the way
-    the interface does. It is not optional and there is no flag: identifying
-    a file is part of taking it into the library.
+    The queue is one worker inside this process, and this process is a
+    command that is about to exit - so a terminal run waits for it rather
+    than walking away from work it started. The interface does not have to
+    wait, because it stays running.
     """
-    from . import enrich as en
+    from . import enrichq
+    from .db import path_of, promote_inbox
 
-    if not en.auto_enabled():
-        return
-    pend = (en.tracks_for_keys(con, content_keys) if content_keys is not None
-            else en.pending(con, root=root))
-    if not pend:
-        return
-    console.print(f"\n[cyan]identifying[/] {len(pend)} new file"
-                  + ("" if len(pend) == 1 else "s")
-                  + " [dim](MusicBrainz allows one request a second)[/]")
+    q = enrichq.get_queue(path_of(con))
+    before = q.done
     with Progress(SpinnerColumn(), TextColumn("[cyan]identifying"), BarColumn(),
                   TextColumn("{task.completed}/{task.total}"),
                   TimeRemainingColumn(), console=console) as prog:
-        task = prog.add_task("enrich", total=len(pend))
-
-        def cb(done, total, status):
-            prog.update(task, completed=done, total=total)
-
-        counts = en.auto_after_ingest(con, root=root, content_keys=content_keys,
-                                      progress=cb)
-    bits = [f"[green]{counts['applied']}[/] enriched"]
-    if counts["written"]:
-        bits.append(f"[green]{counts['written']}[/] tagged on disk")
-    if counts["candidates"]:
-        bits.append(f"[yellow]{counts['candidates']}[/] awaiting review")
-    if counts["unmatched"]:
-        bits.append(f"{counts['unmatched']} not found")
-    if counts["failed"]:
-        bits.append(f"[red]{counts['failed']}[/] failed")
-    if counts["skipped"]:
-        bits.append(f"{counts['skipped']} skipped")
+        task = prog.add_task("enrich", total=total)
+        while True:
+            st = q.status()
+            prog.update(task, completed=min(total, q.done - before))
+            if not st["waiting"] and not st["current"]:
+                break
+            time.sleep(0.2)
+    st = q.status()
+    # Identified is settled, and settled leaves the inbox.
+    promote_inbox(con)
+    bits = [f"[green]{q.applied}[/] enriched"]
+    if q.candidates:
+        bits.append(f"[yellow]{q.candidates}[/] awaiting review")
+    if q.unmatched:
+        bits.append(f"{q.unmatched} not found")
+    if q.gave_up:
+        bits.append(f"[red]{q.gave_up}[/] gave up")
     console.print(", ".join(bits))
-    for e in counts["errors"]:
-        console.print(f"  [red]{e['message']}[/]"
-                      + (f" [dim]({e['count']} files)[/]" if e["count"] > 1 else "")
-                      + (f" [dim]{e['track']}[/]" if e.get("track") else ""))
-    if counts["stopped"]:
-        console.print(f"[red]stopped early:[/] {counts['stopped']}")
-    if counts["candidates"]:
+    if st["last_error"]:
+        console.print(f"  [red]{st['last_error']}[/]")
+    if q.candidates:
         console.print("[dim]lemon-zest enrich review[/]")
+
+
+def _auto_enrich(con, root=None, content_keys=None):
+    """Queue what has never been looked at, and wait for the queue.
+
+    Called after a scan and after a download, so the terminal behaves the
+    way the interface does. It is not optional and there is no flag:
+    identifying a file is part of taking it into the library.
+
+    Everything goes through the one queue - here as in the interface -
+    because one queue with one worker is the only way the one-request-a-
+    second rule can be kept by a program that does more than one thing.
+    """
+    from . import enrich as en
+    from . import enrichq
+    from .db import path_of
+
+    if not en.auto_enabled():
+        return
+    keys = ([r["content_key"] for r in en.tracks_for_keys(con, content_keys)]
+            if content_keys is not None
+            else [r["content_key"] for r in en.pending(con, root=root)])
+    if not keys:
+        return
+    console.print(f"\n[cyan]identifying[/] {len(keys)} new file"
+                  + ("" if len(keys) == 1 else "s")
+                  + " [dim](MusicBrainz allows one request a second)[/]")
+    added = enrichq.get_queue(path_of(con)).submit(keys, priority="sweep")
+    _drain_queue(con, added or len(keys))
 
 
 @cli.command()
@@ -313,17 +340,19 @@ def download_cmd(ctx, urls, root, playlist_name, audio_format, audio_quality,
         console.print(f"[yellow]{summary['failed_index']}[/] of the files "
                       "yt-dlp wrote could not be catalogued - the output "
                       "template puts them outside the library folder.")
-    if summary["downloaded"]:
-        # Scoped to what this run fetched. A download into a big library must
-        # not turn into a pass over the whole of it.
-        keys = []
-        for f in summary["files"]:
-            row = con.execute("SELECT content_key FROM track WHERE path = ?",
-                              (f,)).fetchone()
-            if row and row["content_key"] not in keys:
-                keys.append(row["content_key"])
-        if keys:
-            _auto_enrich(con, content_keys=keys)
+    queued = summary.get("queued") or 0
+    if queued:
+        # Queued as each file landed. The interface can walk away and let
+        # the queue finish; a command has to wait for it.
+        console.print(f"\n[cyan]identifying[/] {queued} new file"
+                      + ("" if queued == 1 else "s")
+                      + " [dim](MusicBrainz allows one request a second)[/]")
+        _drain_queue(con, queued)
+    if summary.get("rescanned") or (summary["downloaded"] and not queued):
+        # The rescan turns up files an interrupted earlier run left
+        # uncatalogued, and a pipeline that could not start leaves its own
+        # arrivals unidentified. Either way they are owed a look.
+        _auto_enrich(con, root=summary["root"])
     if summary["playlist"]:
         p = summary["playlist"]
         console.print(f"[cyan]playlist[/] {p['name']}: {p['added']} added"

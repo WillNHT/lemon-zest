@@ -35,7 +35,17 @@ def desired_tracks(con, device_id):
         "SELECT kind, ref FROM device_set WHERE device_id=? ORDER BY kind, ref",
         (device_id,),
     ).fetchall()
+    return tracks_for_rules(con, rules)
 
+
+def tracks_for_rules(con, rules):
+    """Resolve a list of (kind, ref) rules to tracks and playlist names.
+
+    Split out of ``desired_tracks`` so the same rules can be resolved before
+    they belong to a device: a set can be prepared with nothing plugged in,
+    and it has to be able to say how many tracks and how many bytes that is
+    while the card is still in a drawer.
+    """
     ids = set()
     playlists = []
     for r in rules:
