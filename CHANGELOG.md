@@ -1,6 +1,31 @@
 # CHANGELOG
 
 
+## v0.6.1 (2026-09-10)
+
+### Bug Fixes
+
+- **download**: Stop the Download page hanging on the packaged build
+  ([`1aecc43`](https://github.com/WillNHT/lemon-zest/commit/1aecc43667b936f60361970d73928ac5403dc560))
+
+The page sat on "Checking what is installed..." forever in the 0.6.0 executable. Its render threw
+  `ReferenceError: norm is not defined` - `norm` is a Python helper, called from the JavaScript that
+  tags a JavaScript runtime as ours. Nothing catches a throw inside render, so the loading
+  placeholder was the last thing painted, and the server, which had answered /api/download/config in
+  77ms, looked like the culprit.
+
+The tag needed two paths compared, and the browser is the wrong place to do it. `shutil.which`
+  returns the extension in the case PATHEXT carries it - `deno.EXE` - while the bundle spells it
+  `deno.exe`, so even a correct string comparison would have failed on the machine this feature
+  exists for. The server now decides: each found runtime carries a `bundled` flag, settled by
+  `os.path.samefile` with a normcase fallback, and the page just reads it.
+
+`bundled.status()` reports normalised paths to match every other path shown; `tool()` keeps the
+  native spelling that actually gets executed.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.6.0 (2026-09-09)
 
 ### Features
