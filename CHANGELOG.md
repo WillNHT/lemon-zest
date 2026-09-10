@@ -1,6 +1,75 @@
 # CHANGELOG
 
 
+## v0.7.0 (2026-09-10)
+
+### Features
+
+- **app**: One identification queue, and a library you can arrange
+  ([`a31c345`](https://github.com/WillNHT/lemon-zest/commit/a31c345fa0bc6e3a4f2b64373ae3b09993acb147))
+
+Identification is the only part of Lemon Zest that talks to somebody else's service, and MusicBrainz
+  asks for one request a second from one client. That rule was kept by each caller separately - a
+  download built a client and paced itself, a scan built another and paced itself - so two of them
+  running at once politely went twice as fast as allowed. A 257-item download came back with a run
+  of 503s and a handful of files left unidentified for nobody to notice.
+
+There is now one queue, one worker and one client, per catalog. Not a policy the callers agree to
+  follow: nothing else holds a client, so there is never more than one request in flight. Retries
+  live there too - a 503 is almost always the service being busy for a minute, so the item goes back
+  with a longer fuse rather than being dropped on the floor. Manual work jumps the queue, because a
+  person clicking Identify is watching and a sweep over two thousand files is not. The client reads
+  Retry-After instead of guessing, widens its own interval when refused and eases back after a run
+  of answers, and caches a release's genres so an album asks once rather than once per track. The
+  backlog is rebuilt from the catalog at startup: a file that has never been looked at is already
+  `raw`, so it needs no second copy of the truth.
+
+Downloads no longer wait for the batch. Each file is catalogued and queued the moment yt-dlp
+  finishes writing it, so track one is finished while track two is still coming down the wire, and
+  the batch says what is happening to each file rather than only how many bytes are moving. A
+  playlist URL becomes a playlist under the source's own name, written to <library>/playlists as
+  m3u8 with the source URL in it, so a rescan reads it back as the thing it is rather than demoting
+  it to local. The URLs asked for are remembered - the last five offered back, and playlist ones
+  kept and re-fetched on demand, taking only what is new.
+
+The library, the inbox and a playlist are now one table over three questions: same rows, same
+  selection, same inspector, same shortcuts. A playlist used to be its own seven columns with no way
+  to play anything or fix a tag from where you noticed it was wrong. Columns can be dragged to
+  reorder, dragged at the edge to resize, and are remembered per page; headings sort; paging says
+  where you are and lets you jump. Every cell is one line, because a row that grows because a track
+  carries an extra tag makes the whole table jump.
+
+The inbox empties itself. A file leaves when it has settled - identified, skipped, rejected, or
+  looked up and not found - or when it is a day old, so a library with no network still drains. What
+  stays is what is waiting on you, which is what an inbox is for.
+
+Also: play any track from the row or the inspector, to hear whether a download is what it claims to
+  be; a sync list that can be built with nothing plugged in and applied to a card later; a decade
+  facet; filters that belong to the page rather than following you between them; marks on playlists
+  that have gained something since you last looked, cleared by looking; and work that survives a
+  reload - the page asks what is running rather than remembering what it started, so a second tab
+  shows the download the first one began.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+### Testing
+
+- **download**: Stop asserting a state the queue is still changing
+  ([`d087161`](https://github.com/WillNHT/lemon-zest/commit/d0871617d9b7acbdd7009c97b093556050ddcfba))
+
+The batch goes on changing after a download returns: the files it queued are still being identified,
+  on the queue's own thread, and the summary carries the live batch rather than a copy of it.
+  Asserting that an item reads "done" was therefore a coin toss - it passed on the machine it was
+  written on and failed on CI, and asserting "queued" instead only moves which machine loses.
+
+The end state is the one worth having, so the test waits for the queue and then asks. The gate
+  test's bound goes from five seconds to nine for the same reason - room for a slow machine, still
+  nowhere near the thirty a batched run would take to time three gates out - and each test in the
+  class now starts with a fresh queue rather than inheriting the last one's backlog.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.6.1 (2026-09-10)
 
 ### Bug Fixes
