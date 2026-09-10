@@ -18,6 +18,8 @@ whole arrangement exists to remove.
 import os
 import sys
 
+from .paths import norm
+
 # Where the staged tools live inside the bundle, and beside an unpacked
 # build. One name, used by the spec and by this module.
 TOOLS_DIRNAME = "tools"
@@ -87,10 +89,17 @@ def install():
 
 
 def status():
-    """What the bundle provides here - for the interface and the CLI."""
+    """What the bundle provides here - for the interface and the CLI.
+
+    The paths here are for reading: normalised - forward slashes, NFC -
+    so they match how every other path Lemon Zest shows is spelled. The
+    native spelling stays with ``tool()``, which is the one that gets
+    executed, and identity is decided by ``download._same_file`` rather
+    than by comparing these strings.
+    """
     names = ("ffmpeg", "ffprobe", "deno", "fpcalc")
     return {
         "frozen": frozen(),
-        "dirs": tools_dirs(),
-        "tools": {n: tool(n) for n in names},
+        "dirs": [norm(d) for d in tools_dirs()],
+        "tools": {n: norm(tool(n)) for n in names},
     }

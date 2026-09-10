@@ -1220,8 +1220,7 @@ function renderDownload() {
         ${js.found.length ? `<table class="tbl"><tbody>${js.found.map(r => `<tr>
           <td>${h(r.name)}${js.chosen && js.chosen.name === r.name
             ? ' <span class="tag ok">in use</span>' : ''}${
-            bundledTool(r.name) && r.path === norm(bundledTool(r.name))
-              ? ' <span class="tag">bundled</span>' : ''}</td>
+            r.bundled ? ' <span class="tag">bundled</span>' : ''}</td>
           <td class="mono clip pick" title="${h(r.path)}">${h(r.path)}</td>
         </tr>`).join('')}</tbody></table>`
         : `<div class="notice bad">${icon('i-warn')}<div>None installed.
