@@ -29,10 +29,19 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 # facets and the paged table all narrow together.
 VISIBLE = ("t.root NOT IN (SELECT root FROM library_root WHERE hidden = 1)")
 VISIBLE_BARE = VISIBLE.replace("t.root", "root")
-# When the inbox was last emptied. Everything indexed since is new.
+# What is still new. A file leaves the inbox when it has finished arriving
+# - identified, skipped or rejected, or simply old enough - which db's
+# promote_inbox decides and writes down. The watermark is still honoured
+# underneath it, so "clear the inbox" keeps meaning what it did.
 INBOX_MARK = ("COALESCE((SELECT CAST(value AS REAL) FROM meta "
               "WHERE key = 'inbox_seen_at'), 0)")
-NEW_SQL = f"(t.added_at IS NOT NULL AND t.added_at > {INBOX_MARK})"
+NEW_SQL = (f"(t.added_at IS NOT NULL AND t.added_at > {INBOX_MARK} "
+           "AND t.inbox_done_at IS NULL)")
+
+# The promotion is a write, and the stats endpoint is polled every couple of
+# seconds, so it runs on a timer rather than on every poll.
+PROMOTE_EVERY = 20.0
+_promoted_at = [0.0]
 
 # job id -> progress record. Small and bounded; finished jobs are kept so a
 # reloaded page can still show the outcome.
@@ -99,9 +108,25 @@ def create_app(db_path=None):
 
     # ---------------------------------------------------------- library
 
+    def _promote_due(c):
+        """Empty the inbox of whatever has settled, now and then.
+
+        Here because this is the endpoint the page keeps asking: a rule that
+        only ran after a scan would leave a file sitting in the inbox for
+        hours after the thing it was waiting for had happened.
+        """
+        if time.time() - _promoted_at[0] < PROMOTE_EVERY:
+            return
+        _promoted_at[0] = time.time()
+        try:
+            db_mod.promote_inbox(c)
+        except Exception:      # noqa: BLE001 - a badge is not worth a 500
+            traceback.print_exc()
+
     @app.get("/api/stats")
     def stats():
         c = con()
+        _promote_due(c)
         one = lambda q: c.execute(q).fetchone()[0]
         vis = f"WHERE {VISIBLE_BARE}"
         return jsonify({
@@ -121,6 +146,10 @@ def create_app(db_path=None):
             "unmatched": one("SELECT COUNT(*) FROM playlist_entry "
                              "WHERE track_id IS NULL"),
             "devices": one("SELECT COUNT(*) FROM device"),
+            "sync_list": one("SELECT COUNT(*) FROM sync_list"),
+            # The identification backlog, on every poll: it is the one piece
+            # of work that outlives the page that started it.
+            "enrich_queue": _queue().status(),
             "empty_files": one("SELECT COUNT(*) FROM track WHERE size = 0"),
             "attention": (
                 one("SELECT COUNT(*) FROM playlist_entry WHERE track_id IS NULL")
@@ -144,11 +173,25 @@ def create_app(db_path=None):
         from . import enrich as en
         return en.fingerprint_status(c)
 
+    # A decade off the year column. The year is a string - "2012",
+    # "2012-09", "2012-09-03" - so the decade is its first three characters
+    # with a nought on the end, which sorts and groups without a date parser.
+    DECADE_SQL = ("CASE WHEN t.year IS NULL OR t.year = '' THEN NULL "
+                  "ELSE SUBSTR(t.year, 1, 3) || '0s' END")
+
     def _library_where(args, with_state=True):
         """Build the WHERE clause shared by the track list and the facets."""
         from . import enrich as en
 
         clauses, params = [VISIBLE], []
+        # A playlist is a question about the library, not a different kind
+        # of thing: asked here, it comes back through the same table, the
+        # same facets and the same inspector as everything else.
+        pid = (args.get("playlist") or "").strip()
+        if pid.isdigit():
+            clauses.append("t.id IN (SELECT track_id FROM playlist_entry "
+                           "WHERE playlist_id = ?)")
+            params.append(int(pid))
         if str(args.get("new") or "") in ("1", "true", "yes"):
             clauses.append(NEW_SQL)
         state = (args.get("state") or "").strip()
@@ -159,6 +202,10 @@ def create_app(db_path=None):
         if q:
             clauses.append("(t.title LIKE ? OR t.artist LIKE ? OR t.album LIKE ?)")
             params += [f"%{q}%"] * 3
+        decade = (args.get("decade") or "").strip()
+        if decade:
+            clauses.append(DECADE_SQL + " = ?")
+            params.append(decade)
         for field, key in (("genre", "genre"), ("artist", "artist"),
                            ("album", "album")):
             val = args.get(key)
@@ -172,6 +219,61 @@ def create_app(db_path=None):
                     params.append(val)
         return (" AND ".join(clauses) or "1=1"), params
 
+    # What a column heading means in SQL. A whitelist rather than a column
+    # name off the query string: this is the one place a request gets to
+    # name part of a statement, and it names a key here or nothing at all.
+    def _sorts():
+        from . import enrich as en
+        return {
+            "track_no": ["t.disc_no", "t.track_no", "t.title"],
+            "title": ["t.title", "t.rel_path"],
+            "duration": ["t.duration"],
+            "artist": ["t.artist", "t.album", "t.disc_no", "t.track_no"],
+            "album": ["t.album", "t.disc_no", "t.track_no"],
+            "state": [en.STATE_SQL, "t.rel_path"],
+            "format": ["t.ext", "t.bitrate"],
+            "added": ["t.added_at", "t.id"],
+            "isrc": ["t.isrc"],
+            "on_device": ["t.rel_path"],
+        }
+
+    def _order_by(args, where_params):
+        """The ORDER BY the request asked for, and any parameters it needs.
+
+        Three defaults, because three questions: an inbox is newest first, a
+        playlist is in the order its source published, and the library is an
+        album shelf where the track order inside a release is the point.
+        Whatever the default, a click on a heading overrides it.
+
+        Empty values sort last in both directions. SQLite puts NULLs first,
+        which would otherwise fill the first screen of a sort by artist with
+        the rows that have no artist - the least useful thing it could show.
+        """
+        sorts = _sorts()
+        key = (args.get("sort") or "").strip()
+        pid = (args.get("playlist") or "").strip()
+        descending = (args.get("dir") or "asc").lower() == "desc"
+        if key in sorts:
+            direction = " DESC" if descending else " ASC"
+            terms = []
+            for expr in sorts[key]:
+                terms.append("(%s IS NULL OR %s = '')" % (expr, expr))
+                terms.append(expr + direction)
+            return "ORDER BY " + ", ".join(terms), []
+        if key == "pos" and pid.isdigit():
+            direction = " DESC" if descending else " ASC"
+            return ("ORDER BY (SELECT MIN(pos) FROM playlist_entry pe "
+                    "WHERE pe.track_id = t.id AND pe.playlist_id = ?)"
+                    + direction, [int(pid)])
+        if pid.isdigit():
+            return ("ORDER BY (SELECT MIN(pos) FROM playlist_entry pe "
+                    "WHERE pe.track_id = t.id AND pe.playlist_id = ?)",
+                    [int(pid)])
+        if args.get("order") == "added":
+            return "ORDER BY t.added_at DESC, t.id DESC", []
+        return ("ORDER BY (t.album_artist IS NULL), t.album_artist, t.album, "
+                "t.disc_no, t.track_no, t.title, t.rel_path"), []
+
     @app.get("/api/library")
     def library():
         from . import enrich as en
@@ -181,12 +283,17 @@ def create_app(db_path=None):
         limit = min(int(request.args.get("limit", 200)), 1000)
         offset = int(request.args.get("offset", 0))
         device_id = request.args.get("device")
-        # Newest first is what an inbox is; everything else reads as an
-        # album shelf, where the track order inside a release is the point.
-        order = ("ORDER BY t.added_at DESC, t.id DESC"
-                 if request.args.get("order") == "added" else
-                 "ORDER BY (t.album_artist IS NULL), t.album_artist, t.album, "
-                 "t.disc_no, t.track_no, t.title, t.rel_path")
+        order, order_params = _order_by(request.args, params)
+        # Where each track sits in the playlist being looked at, so the
+        # table can number the rows the way the playlist does.
+        pid = (request.args.get("playlist") or "").strip()
+        pos_col = ("(SELECT MIN(pos) FROM playlist_entry pe "
+                   " WHERE pe.track_id = t.id AND pe.playlist_id = %d) "
+                   "AS playlist_pos, "
+                   "(SELECT MAX(pe.added_at) FROM playlist_entry pe "
+                   " WHERE pe.track_id = t.id AND pe.playlist_id = %d) "
+                   "AS playlist_added_at, " % (int(pid), int(pid))
+                   ) if pid.isdigit() else ""
 
         # The enrichment join is on every library query rather than fetched
         # separately per page: the state is a column in the table and a filter
@@ -200,14 +307,14 @@ def create_app(db_path=None):
         # Untagged files sort last rather than first: SQLite puts NULLs at the
         # top, which would fill the first screen with the least useful rows.
         rows = c.execute(
-            f"SELECT t.*, {en.STATE_SQL} AS enrich_state, "
+            f"SELECT t.*, {pos_col}{en.STATE_SQL} AS enrich_state, "
             "e.status AS enrich_status, e.source AS enrich_source, "
             "e.confidence AS enrich_confidence, "
             "(SELECT COUNT(*) FROM track_override o "
             "   WHERE o.content_key = t.content_key) AS overrides "
             f"FROM track t {join} WHERE {where} "
             + order
-            + " LIMIT ? OFFSET ?", params + [limit, offset]
+            + " LIMIT ? OFFSET ?", params + order_params + [limit, offset]
         ).fetchall()
 
         # Which of these are already on the selected device?
@@ -231,6 +338,9 @@ def create_app(db_path=None):
                 "isrc": r["isrc"], "purl": r["purl"], "path": r["path"],
                 "rel_path": r["rel_path"],
                 "content_key": r["content_key"],
+                "playlist_pos": r["playlist_pos"] if pos_col else None,
+                "playlist_added_at": (r["playlist_added_at"] if pos_col
+                                      else None),
                 "state": r["enrich_state"],
                 "enrich_source": r["enrich_source"],
                 "confidence": r["enrich_confidence"],
@@ -267,14 +377,15 @@ def create_app(db_path=None):
 
     @app.post("/api/inbox/seen")
     def inbox_seen():
-        """Empty the inbox: everything indexed up to now stops being new.
+        """Empty the inbox by hand, ahead of the rule that would anyway.
 
-        The files are untouched and stay in the library - this moves a
-        watermark, which is the only thing "mark as seen" can honestly mean.
+        Files that have settled leave on their own; this is for the rest -
+        the ones still waiting on a decision or on a network that is not
+        there. The files are untouched and stay in the library.
         """
         c = con()
-        db_mod.meta_set(c, "inbox_seen_at", time.time())
-        return jsonify({"ok": True, "at": time.time()})
+        return jsonify({"ok": True, "at": time.time(),
+                        "promoted": db_mod.clear_inbox(c)})
 
     # ---------------------------------------------------- library folders
 
@@ -335,6 +446,46 @@ def create_app(db_path=None):
         return app.response_class(data, mimetype=mime, headers={
             "Cache-Control": "public, max-age=86400"})
 
+    # The types a browser can decode without help. Anything else is offered
+    # as a download rather than played: telling somebody a file is broken
+    # when the truth is their browser cannot read FLAC would be worse than
+    # saying nothing.
+    AUDIO_MIME = {
+        ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".m4b": "audio/mp4",
+        ".mp4": "audio/mp4", ".aac": "audio/aac", ".oga": "audio/ogg",
+        ".ogg": "audio/ogg", ".opus": "audio/ogg", ".flac": "audio/flac",
+        ".wav": "audio/wav", ".webm": "audio/webm",
+    }
+
+    @app.get("/api/audio/<int:track_id>")
+    def track_audio(track_id):
+        """The audio itself, for a listen.
+
+        The point is to hear whether a file is what it claims to be - a
+        download that produced four seconds of silence, or a video whose
+        audio never arrived, looks perfectly healthy in every column of the
+        table. Flask serves it with Range support, so seeking works and a
+        listen costs the first few seconds rather than the whole file.
+
+        The path comes from the catalog and never from the request: this is
+        a local server, but a URL is still an outside thing.
+        """
+        from flask import send_file
+
+        c = con()
+        row = c.execute("SELECT path FROM track WHERE id = ?",
+                        (track_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "no such track"}), 404
+        path = row["path"]
+        if not os.path.isfile(path):
+            return jsonify({"error": "the file is not where the catalog "
+                                     "thinks: " + path}), 404
+        mime = AUDIO_MIME.get(os.path.splitext(path)[1].lower(),
+                              "application/octet-stream")
+        return send_file(path, mimetype=mime, conditional=True,
+                         download_name=os.path.basename(path))
+
     @app.get("/api/problems")
     def problems():
         """Everything worth a second look, in one place."""
@@ -351,7 +502,16 @@ def create_app(db_path=None):
             "FROM playlist_entry e JOIN playlist p ON p.id = e.playlist_id "
             "WHERE e.track_id IS NULL ORDER BY p.name, e.pos LIMIT 500"
         ).fetchall()
+        # The fourth thing the badge counts. It lives in the review queue
+        # rather than in a list of broken files, but a count that names a
+        # page has to be answered by that page: a badge saying 1 over a
+        # page saying "nothing needs attention" is the interface calling
+        # itself a liar.
+        awaiting = c.execute(
+            "SELECT COUNT(*) FROM enrichment WHERE status = 'candidate'"
+        ).fetchone()[0]
         return jsonify({
+            "awaiting": awaiting,
             "empty": [dict(r) for r in empty],
             "empty_total": c.execute(
                 "SELECT COUNT(*) FROM track WHERE size = 0").fetchone()[0],
@@ -412,9 +572,23 @@ def create_app(db_path=None):
     def enrich_track_detail(content_key):
         """Current values, the stored proposal and any hand-typed override."""
         from . import enrich as en
-        out = en.proposal_for(con(), content_key)
+        c = con()
+        out = en.proposal_for(c, content_key)
         if not out:
             return jsonify({"error": "no such track"}), 404
+        # Where else this track turns up. A track is not only a row in the
+        # library: it is in playlists, and those are what reach a player -
+        # so "is this one already on the card" is answered here rather than
+        # by opening each playlist in turn.
+        out["playlists"] = [dict(r) for r in c.execute(
+            "SELECT p.id, p.name, p.origin, e.pos, "
+            "(SELECT COUNT(*) FROM playlist_entry x "
+            " WHERE x.playlist_id = p.id) AS entries "
+            "FROM playlist_entry e "
+            "JOIN playlist p ON p.id = e.playlist_id "
+            "JOIN track t ON t.id = e.track_id "
+            "WHERE t.content_key = ? GROUP BY p.id ORDER BY p.name",
+            (content_key,))]
         return jsonify(out)
 
     @app.post("/api/enrich/<action>")
@@ -533,9 +707,14 @@ def create_app(db_path=None):
                     _update(job_id, done=done, total=total,
                             detail="%d of %d - %s" % (done, total, status))
 
-                counts = en.run_tracks(
-                    c, keys, write_tags=write_tags, artwork=artwork,
-                    use_fingerprint=use_fp, progress=cb, query=query)
+                # Through the queue's own client, with the queue held
+                # back: a person is waiting, and two clients asking at once
+                # is what gets the whole program refused.
+                with _queue().exclusive() as client:
+                    counts = en.run_tracks(
+                        c, keys, write_tags=write_tags, artwork=artwork,
+                        use_fingerprint=use_fp, progress=cb, query=query,
+                        client=client)
                 bits = ["%d enriched" % counts["applied"],
                         "%d to review" % counts["candidates"]]
                 if counts["unmatched"]:
@@ -644,12 +823,13 @@ def create_app(db_path=None):
         """Counts for the three-pane column browser."""
         c = con()
         out = {}
-        for field in ("genre", "artist", "album"):
+        for field in ("decade", "genre", "artist", "album"):
             args = dict(request.args)
             # A pane does not filter itself, so its own options stay visible.
             args.pop(field, None)
             where, params = _library_where(args)
             col = ("COALESCE(t.album_artist, t.artist)" if field == "artist"
+                   else DECADE_SQL if field == "decade"
                    else f"t.{field}")
             rows = c.execute(
                 f"SELECT {col} AS v, COUNT(*) n FROM track t "
@@ -673,7 +853,13 @@ def create_app(db_path=None):
             "SELECT p.*, "
             "(SELECT COUNT(*) FROM playlist_entry e WHERE e.playlist_id=p.id) n, "
             "(SELECT COUNT(*) FROM playlist_entry e WHERE e.playlist_id=p.id "
-            " AND e.track_id IS NULL) unmatched "
+            " AND e.track_id IS NULL) unmatched, "
+            # What has joined since this playlist was last looked at. The
+            # mark in the sidebar is this number being greater than nought,
+            # and looking at the playlist is what clears it.
+            "(SELECT COUNT(*) FROM playlist_entry e WHERE e.playlist_id=p.id "
+            " AND e.added_at IS NOT NULL "
+            " AND e.added_at > COALESCE(p.seen_at, 0)) fresh "
             "FROM playlist p ORDER BY n DESC"
         ).fetchall()
         return jsonify([dict(r) for r in rows])
@@ -686,6 +872,7 @@ def create_app(db_path=None):
             return jsonify({"error": "no such playlist"}), 404
         entries = c.execute(
             "SELECT e.pos, e.title_hint, e.duration, e.source_uri, e.raw_path, "
+            "e.added_at, "
             "t.id track_id, t.title, t.artist, t.album, t.ext, t.size, t.bitrate "
             "FROM playlist_entry e LEFT JOIN track t ON t.id=e.track_id "
             "WHERE e.playlist_id=? ORDER BY e.pos", (pid,)
@@ -695,9 +882,54 @@ def create_app(db_path=None):
             "JOIN device_set s ON s.device_id=d.id "
             "WHERE s.kind='playlist' AND s.ref=?", (pl["name"],)
         ).fetchall()
+        # The watermark this view was opened against, handed back before it
+        # moves: the rows that are new are new *to you*, and they have to go
+        # on looking new for as long as you are looking at them. Marking
+        # seen here rather than on a later click is the honest reading of
+        # "once the user has seen it".
+        since = pl["seen_at"] or 0
+        if request.args.get("peek") != "1":
+            c.execute("UPDATE playlist SET seen_at = ? WHERE id = ?",
+                      (time.time(), pid))
+            c.commit()
         return jsonify({"playlist": dict(pl),
                         "entries": [dict(e) for e in entries],
+                        "since": since,
+                        "fresh": sum(1 for e in entries
+                                     if (e["added_at"] or 0) > since),
                         "devices": [dict(d) for d in devices]})
+
+    @app.post("/api/playlists/<int:pid>/refresh")
+    def playlist_refresh(pid):
+        """Fetch a playlist's source again: the entries, and the audio.
+
+        The same run as any other download, on the same queue and reported
+        the same way - the archive skips what is already here, so what
+        comes down is only what has been added since. The playlist is then
+        rebuilt from the source's own listing, so a track added in the
+        middle lands in the middle rather than at the end.
+        """
+        c = con()
+        pl = c.execute("SELECT * FROM playlist WHERE id = ?", (pid,)).fetchone()
+        if not pl:
+            return jsonify({"error": "no such playlist"}), 404
+        url = pl["source_uri"]
+        if not url or playlists.origin_of(url) != "youtube":
+            return jsonify({"error": "this playlist does not come from a "
+                                     "YouTube URL, so there is nothing to "
+                                     "fetch it from"}), 400
+        if not dl_mod.ytdlp_command():
+            return jsonify({"error": "yt-dlp is not installed. Install it "
+                                     "with: pip install yt-dlp"}), 400
+        # Written down as a URL that has been asked for, so it turns up in
+        # the recent list beside the ones typed by hand.
+        row = c.execute("SELECT root, kept FROM download_url WHERE url = ?",
+                        (url,)).fetchone()
+        return jsonify({"job": _run_download(
+            [url], root=(row["root"] if row else None) or None,
+            playlist_name=pl["name"], archive=True,
+            kept_url=url if row and row["kept"] else None,
+            label=pl["name"])})
 
     @app.post("/api/playlists/import")
     def playlist_import():
@@ -711,50 +943,31 @@ def create_app(db_path=None):
 
     # ----------------------------------------------------------- scan
 
-    def _start_auto_enrich(root=None, content_keys=None, label=None):
-        """Kick off the automatic pass that follows a scan or a download.
+    def _queue():
+        from . import enrichq
+        return enrichq.get_queue(app.config["DB_PATH"])
 
-        Its own job rather than a tail on the caller's: a scan of a folder
-        finishes in seconds and an identification pass over it is
-        rate-limited to one request a second, so tying them together would
-        leave the scan looking like it was still running for half an hour.
-        Two jobs, two progress bars, and the scan reports what it did when it
-        did it.
+    def _start_auto_enrich(root=None, content_keys=None, label=None,
+                           priority="sweep"):
+        """Hand what just arrived to the identification queue.
+
+        Not a job of its own any more. A job is a thing with a beginning and
+        an end that somebody watches; identification is a backlog the
+        program works through at one request a second whatever else is
+        going on, and pretending that each scan owned its own pass is what
+        let two of them run at once and get the whole program throttled.
+
+        Returns how many files were queued.
         """
         from . import enrich as en
         if not en.auto_enabled():
-            return None
-        job_id = _new_job("enrich", label or root or "new files")
-        _update(job_id, detail="looking for anything new to identify")
-
-        def work():
-            try:
-                c = db_mod.connect(app.config["DB_PATH"])
-
-                def cb(done, total, status):
-                    _update(job_id, done=done, total=total,
-                            detail="%d of %d - %s" % (done, total, status))
-
-                counts = en.auto_after_ingest(
-                    c, root=root, content_keys=content_keys, progress=cb)
-                bits = ["%d enriched" % counts["applied"],
-                        "%d to review" % counts["candidates"]]
-                if counts["written"]:
-                    bits.append("%d file%s tagged" % (
-                        counts["written"], "" if counts["written"] == 1 else "s"))
-                if counts["unmatched"]:
-                    bits.append("%d not found" % counts["unmatched"])
-                if counts["failed"]:
-                    bits.append("%d failed" % counts["failed"])
-                _update(job_id, state="done", result=counts,
-                        finished=time.time(), detail=", ".join(bits))
-            except Exception as exc:
-                _update(job_id, state="failed", error=str(exc),
-                        finished=time.time())
-                traceback.print_exc()
-
-        threading.Thread(target=work, daemon=True).start()
-        return job_id
+            return 0
+        c = con()
+        if content_keys is None:
+            keys = [r["content_key"] for r in en.pending(c, root=root)]
+        else:
+            keys = list(content_keys)
+        return _queue().submit(keys, priority=priority, label=label)
 
     @app.post("/api/scan")
     def start_scan():
@@ -770,9 +983,17 @@ def create_app(db_path=None):
                     _update(job_id, done=done, total=total,
                             detail=f"{done:,} of {total:,} files")
                 counts = scan.scan(c, root, progress=cb)
-                # Whatever the scan found that has never been looked at is
-                # looked at now, without being asked.
-                counts["enrich_job"] = _start_auto_enrich(root=root)
+                # A library folder holds its playlists as well as its music,
+                # so a scan of it reads both. Recursive and after the audio:
+                # an entry can only be matched to a track the scan has
+                # already catalogued.
+                _update(job_id, detail="reading playlists")
+                found = playlists.import_dir(c, root, recursive=True)
+                counts["playlists"] = len(found)
+                counts["playlist_entries"] = sum(f["total"] for f in found)
+                # Whatever the scan found that has never been looked at
+                # joins the identification queue, without being asked.
+                counts["queued"] = _start_auto_enrich(root=root)
                 _update(job_id, state="done", result=counts,
                         finished=time.time())
             except Exception as exc:
@@ -808,6 +1029,10 @@ def create_app(db_path=None):
                              for p in status["profiles"]],
             },
             "roots": db_mod.roots(c),
+            # The last few URLs asked for, and the playlists being kept an
+            # eye on. Both come off the same table.
+            "recent": dl_mod.recent_urls(c, 5),
+            "kept": dl_mod.kept_urls(c),
         }
 
     @app.get("/api/download/config")
@@ -833,36 +1058,16 @@ def create_app(db_path=None):
         except dl_mod.DownloadError as exc:
             return jsonify({"error": str(exc)}), 400
 
-    def _keys_for_paths(c, paths):
-        """Content keys for files named by path, in the order given."""
-        out, seen = [], set()
-        for path in paths:
-            row = c.execute("SELECT content_key FROM track WHERE path = ?",
-                            (path,)).fetchone()
-            if row and row["content_key"] not in seen:
-                seen.add(row["content_key"])
-                out.append(row["content_key"])
-        return out
+    def _run_download(urls, root=None, playlist_name=None, single=False,
+                      archive=True, label=None, kept_url=None):
+        """Start a download on a worker and return its job id.
 
-    @app.post("/api/download")
-    def download_start():
-        body = request.json or {}
-        urls = body.get("urls")
-        if isinstance(urls, str):
-            urls = urls.split()
-        urls = [u.strip() for u in (urls or []) if u and u.strip()]
-        if not urls:
-            return jsonify({"error": "no URL given"}), 400
-        if not dl_mod.ytdlp_command():
-            return jsonify({"error": "yt-dlp is not installed. Install it "
-                                     "with: pip install yt-dlp"}), 400
-
-        root = (body.get("root") or "").strip() or None
-        playlist_name = (body.get("playlist") or "").strip() or None
-        single = bool(body.get("no_playlist"))
-        archive = body.get("archive") is not False
-        job_id = _new_job("download", urls[0] if len(urls) == 1
-                          else f"{len(urls)} URLs")
+        Shared by the URL box and by the kept playlists, which are the same
+        run with the URL and the playlist name filled in from a row rather
+        than from a form.
+        """
+        job_id = _new_job("download", label or (urls[0] if len(urls) == 1
+                                                else f"{len(urls)} URLs"))
 
         def work():
             try:
@@ -888,18 +1093,31 @@ def create_app(db_path=None):
                     c, urls, root=root, playlist=playlist_name,
                     on_event=on_event, on_batch=on_batch,
                     no_playlist=single, archive=archive)
-                # Scoped to the files this run actually fetched, not to the
-                # whole folder: a download into a library of two thousand
-                # would otherwise start an hours-long pass over all of them.
-                keys = _keys_for_paths(c, summary.get("files") or [])
-                summary["enrich_job"] = _start_auto_enrich(
-                    content_keys=keys,
-                    label="%d new file%s" % (len(keys),
-                                             "" if len(keys) == 1 else "s")
-                ) if keys else None
+                # The files this run fetched were identified as they
+                # landed, one by one, so there is nothing left to start for
+                # them. Two exceptions, both scoped to the folder rather
+                # than the library: a run that fell back to a full rescan
+                # turns up files an interrupted earlier run left
+                # uncatalogued, and a run whose pipeline could not start
+                # leaves its own arrivals unidentified.
+                owed = (summary.get("rescanned")
+                        or (summary["downloaded"] and not summary.get("queued")))
+                summary["queued_extra"] = _start_auto_enrich(
+                    root=summary.get("root")) if owed else 0
+                if kept_url:
+                    # What the kept row shows next time: when it was last
+                    # looked at, and what that look turned up.
+                    added = sum(p["added"] for p in summary["playlists"])
+                    c.execute("UPDATE download_url SET last_checked = ?, "
+                              "last_added = ? WHERE url = ?",
+                              (time.time(), added, kept_url))
+                    c.commit()
+                queued = summary.get("queued") or 0
                 _update(job_id, state="done", result=summary,
                         finished=time.time(),
-                        detail=f"{summary['downloaded']} downloaded")
+                        detail=f"{summary['downloaded']} downloaded"
+                               + (f", {queued} being identified"
+                                  if queued else ""))
             except dl_mod.DownloadError as exc:
                 # The log is the point of a failed download: it is what gets
                 # copied into a bug report, so it outlives the job's event
@@ -914,7 +1132,206 @@ def create_app(db_path=None):
                 traceback.print_exc()
 
         threading.Thread(target=work, daemon=True).start()
-        return jsonify({"job": job_id})
+        return job_id
+
+    def _urls_from(body):
+        urls = body.get("urls")
+        if isinstance(urls, str):
+            urls = urls.split()
+        return [u.strip() for u in (urls or []) if u and u.strip()]
+
+    @app.post("/api/download")
+    def download_start():
+        body = request.json or {}
+        urls = _urls_from(body)
+        if not urls:
+            return jsonify({"error": "no URL given"}), 400
+        if not dl_mod.ytdlp_command():
+            return jsonify({"error": "yt-dlp is not installed. Install it "
+                                     "with: pip install yt-dlp"}), 400
+        return jsonify({"job": _run_download(
+            urls,
+            root=(body.get("root") or "").strip() or None,
+            playlist_name=(body.get("playlist") or "").strip() or None,
+            single=bool(body.get("no_playlist")),
+            archive=body.get("archive") is not False)})
+
+    @app.post("/api/download/keep")
+    def download_keep():
+        """Keep a playlist URL on the page, or stop keeping it.
+
+        Listed here rather than when it is fetched: a URL is kept before it
+        has ever been downloaded as often as after, and the name to show it
+        under is the source's, which only a listing knows.
+        """
+        body = request.json or {}
+        url = (body.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "no URL given"}), 400
+        c = con()
+        if body.get("kept") is False:
+            dl_mod.keep_url(c, url, kept=False)
+            return jsonify(_download_state(c))
+        try:
+            info = dl_mod.probe(url, dl_mod.get_config(c))
+        except dl_mod.DownloadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not info["is_playlist"]:
+            return jsonify({"error": "that URL is a single video, not a "
+                                     "playlist"}), 400
+        dl_mod.keep_url(c, url, kept=True, info=info,
+                        playlist_name=playlists.norm_name(info["title"] or url),
+                        root=(body.get("root") or "").strip() or None)
+        return jsonify(_download_state(c))
+
+    @app.post("/api/download/keep/run")
+    def download_keep_run():
+        """Fetch a kept playlist again: whatever is new, and nothing else.
+
+        The download archive is what makes this cheap - every item already
+        fetched is skipped - and the playlist is rebuilt from the source's
+        own listing, so a track added in the middle lands in the middle.
+        """
+        body = request.json or {}
+        url = (body.get("url") or "").strip()
+        c = con()
+        row = c.execute("SELECT * FROM download_url WHERE url = ? AND kept = 1",
+                        (url,)).fetchone()
+        if row is None:
+            return jsonify({"error": "that URL is not one of the kept ones"}), 404
+        if not dl_mod.ytdlp_command():
+            return jsonify({"error": "yt-dlp is not installed. Install it "
+                                     "with: pip install yt-dlp"}), 400
+        return jsonify({"job": _run_download(
+            [url], root=row["root"] or None,
+            playlist_name=row["playlist_name"] or None,
+            archive=True, kept_url=url,
+            label=row["title"] or url)})
+
+    @app.get("/api/enrich/queue")
+    def enrich_queue():
+        """What is waiting to be identified, and how it is going."""
+        return jsonify(_queue().status())
+
+    @app.post("/api/enrich/queue")
+    def enrich_queue_edit():
+        """Pause, resume, or drop the backlog.
+
+        Pausing is worth having: identification is the one thing here that
+        leans on somebody else's service, and a person who wants their
+        network to themselves for ten minutes should not have to close the
+        program to get it.
+        """
+        body = request.json or {}
+        q = _queue()
+        if body.get("pause"):
+            q.pause()
+        if body.get("resume"):
+            q.resume()
+        dropped = q.clear() if body.get("clear") else 0
+        return jsonify(dict(q.status(), dropped=dropped))
+
+    # ------------------------------------------------------- the sync list
+
+    def _sync_list(c):
+        """What has been prepared, and what it comes to.
+
+        Resolved every time it is asked for rather than stored: the rules
+        name a playlist or an artist, and what those hold changes as the
+        library does. A list prepared last week should describe this week's
+        library when the card finally goes in.
+        """
+        rules = [dict(r) for r in c.execute(
+            "SELECT kind, ref, added_at FROM sync_list ORDER BY kind, ref")]
+        tracks, playlist_names = planner.tracks_for_rules(c, rules)
+        # Per rule as well as in total: "this playlist is 400 MB of it" is
+        # the number somebody dropping a rule is looking for.
+        for rule in rules:
+            got, _ = planner.tracks_for_rules(c, [rule])
+            rule["tracks"] = len(got)
+            rule["bytes"] = sum(t["size"] or 0 for t in got)
+        return {
+            "rules": rules,
+            "tracks": len(tracks),
+            "bytes": sum(t["size"] or 0 for t in tracks),
+            "playlists": playlist_names,
+            "devices": [{"id": d["id"], "name": d["name"],
+                         "mounted_at": dev_mod.locate(c, d)}
+                        for d in c.execute("SELECT * FROM device ORDER BY name")],
+        }
+
+    @app.get("/api/sync-list")
+    def sync_list_get():
+        return jsonify(_sync_list(con()))
+
+    @app.post("/api/sync-list")
+    def sync_list_edit():
+        """Add or drop rules. Body: {add: [[kind, ref]], remove: [...]}."""
+        c = con()
+        body = request.json or {}
+        for kind, ref in body.get("add", []):
+            if kind not in ("playlist", "artist", "album", "track") or not ref:
+                return jsonify({"error": "unknown rule: %s" % kind}), 400
+            c.execute("INSERT OR IGNORE INTO sync_list(kind, ref, added_at) "
+                      "VALUES (?,?,?)", (kind, ref, time.time()))
+        for kind, ref in body.get("remove", []):
+            c.execute("DELETE FROM sync_list WHERE kind=? AND ref=?",
+                      (kind, ref))
+        if body.get("clear"):
+            c.execute("DELETE FROM sync_list")
+        c.commit()
+        return jsonify(_sync_list(c))
+
+    @app.post("/api/sync-list/keys")
+    def sync_list_add_keys():
+        """Add tracks by content key - what a selection in the table is.
+
+        Stored by path, because that is what a device rule names, and one
+        content key can be two files.
+        """
+        c = con()
+        keys = _keys(request.json or {})
+        if not keys:
+            return jsonify({"error": "content_key required"}), 400
+        added = 0
+        for key in keys:
+            for row in c.execute("SELECT path FROM track WHERE content_key = ?",
+                                 (key,)):
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO sync_list(kind, ref, added_at) "
+                    "VALUES ('track', ?, ?)", (row["path"], time.time()))
+                added += cur.rowcount
+        c.commit()
+        out = _sync_list(c)
+        out["added"] = added
+        return jsonify(out)
+
+    @app.post("/api/sync-list/apply")
+    def sync_list_apply():
+        """Copy the prepared rules onto a device.
+
+        Only the rules move. The list stays as it is, because the same set
+        usually goes onto more than one card, and because a list that
+        emptied itself when applied would be impossible to check afterwards.
+        """
+        c = con()
+        did = (request.json or {}).get("device")
+        d = c.execute("SELECT * FROM device WHERE id = ?", (did,)).fetchone()
+        if not d:
+            return jsonify({"error": "no such device"}), 404
+        rules = c.execute("SELECT kind, ref FROM sync_list").fetchall()
+        if not rules:
+            return jsonify({"error": "the sync list is empty"}), 400
+        for r in rules:
+            c.execute("INSERT OR IGNORE INTO device_set(device_id, kind, ref, "
+                      "added_at) VALUES (?,?,?,?)",
+                      (did, r["kind"], r["ref"], time.time()))
+        c.commit()
+        tracks, _ = planner.desired_tracks(c, did)
+        return jsonify({"ok": True, "device": did, "applied": len(rules),
+                        "tracks": len(tracks),
+                        "bytes": sum(t["size"] or 0 for t in tracks),
+                        "mounted": bool(dev_mod.locate(c, d))})
 
     # --------------------------------------------------------- devices
 
@@ -1140,9 +1557,36 @@ def _warm(app):
             dl_mod.warm_cache()
         except Exception:      # noqa: BLE001 - a warm cache is an optimisation
             pass
+        try:
+            _resume_backlog(app)
+        except Exception:      # noqa: BLE001 - as above
+            traceback.print_exc()
 
     threading.Thread(target=work, daemon=True).start()
     return app
+
+
+def _resume_backlog(app):
+    """Put back on the queue whatever was never looked at.
+
+    The queue is in memory, and a program that is closed halfway through a
+    hundred files would otherwise forget them. It does not need to be
+    written down, though: a file that has never been identified is `raw` in
+    the catalog, so the backlog can be rebuilt by asking the catalog what it
+    still does not know.
+    """
+    from . import enrich as en
+    from . import enrichq
+
+    if not en.auto_enabled():
+        return
+    con = db_mod.connect(app.config["DB_PATH"])
+    try:
+        keys = [r["content_key"] for r in en.pending(con)]
+    finally:
+        con.close()
+    if keys:
+        enrichq.get_queue(app.config["DB_PATH"]).submit(keys, priority="sweep")
 
 
 def serve(db_path=None, host="127.0.0.1", port=7777, open_browser=True):

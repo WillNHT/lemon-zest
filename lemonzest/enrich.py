@@ -35,6 +35,7 @@ one in ``tags.py``, because those have very different blast radii.
 import difflib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -56,6 +57,14 @@ CAA_ROOT = "https://coverartarchive.org"
 USER_AGENT = (f"lemon-zest/{__version__} "
               "( https://github.com/WillNHT/lemon-zest )")
 MB_INTERVAL = 1.05          # seconds between requests, with a little slack
+# What a refusal costs. MusicBrainz answers 503 both when you have gone too
+# fast and when it is simply busy, and it does not distinguish; either way
+# the answer is to ask less often for a while. The interval doubles on a
+# refusal up to the ceiling and eases back after a run of answers, so a busy
+# hour slows the queue down instead of filling it with failures.
+MB_MAX_INTERVAL = 8.0
+MB_EASE_AFTER = 10          # consecutive answers before easing back off
+MB_ATTEMPTS = 4
 HTTP_TIMEOUT = 30.0
 # One request timing out is weather; three in a row is the service being
 # down, and grinding through two thousand files to collect two thousand
@@ -303,42 +312,92 @@ class MusicBrainz:
     a packaging problem for one GET per second.
     """
 
-    def __init__(self, contact=None, interval=MB_INTERVAL, opener=None):
+    def __init__(self, contact=None, interval=MB_INTERVAL, opener=None,
+                 sleep=None):
+        self.base_interval = interval
         self.interval = interval
         self._last = 0.0
+        self._good = 0
         self._opener = opener or urllib.request.urlopen
+        # Injectable so a test can watch the pacing without living through
+        # it. Everything else about the timing is real.
+        self._sleep = sleep or time.sleep
         self.user_agent = (f"lemon-zest/{__version__} ( {contact} )"
                            if contact else USER_AGENT)
+        # One release answers the same question for every track on it, and
+        # an album is a dozen tracks. Asked once per process instead.
+        self._genre_cache = {}
 
     def _wait(self):
         gap = time.monotonic() - self._last
         if gap < self.interval:
-            time.sleep(self.interval - gap)
+            self._sleep(self.interval - gap)
         self._last = time.monotonic()
+
+    def _refused(self):
+        """Told to slow down: ask less often until it stops happening."""
+        self.interval = min(MB_MAX_INTERVAL, max(self.interval, 0.5) * 2)
+        self._good = 0
+
+    def _answered(self):
+        self._good += 1
+        if self._good >= MB_EASE_AFTER and self.interval > self.base_interval:
+            self.interval = max(self.base_interval, self.interval / 2)
+            self._good = 0
+
+    def _retry_after(self, exc, attempt):
+        """How long to wait, asked of the service before it is guessed.
+
+        A Retry-After header is the service saying exactly when it will
+        listen again; ignoring it and guessing is how a client turns a
+        busy minute into a failed run. The guess is a backoff with jitter,
+        so a restart does not put every request back on the same second.
+        """
+        header = None
+        try:
+            header = exc.headers.get("Retry-After")
+        except Exception:      # noqa: BLE001 - a header is never worth a crash
+            header = None
+        if header:
+            try:
+                return max(0.5, min(60.0, float(str(header).strip())))
+            except ValueError:
+                pass
+        return min(30.0, 2.0 * (2 ** attempt)) * (0.75 + random.random() / 2)
 
     def get(self, path, **params):
         params["fmt"] = "json"
         url = f"{MB_ROOT}/{path}?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={
             "User-Agent": self.user_agent, "Accept": "application/json"})
-        for attempt in range(3):
+        last = None
+        for attempt in range(MB_ATTEMPTS):
             self._wait()
             try:
                 with self._opener(req, timeout=HTTP_TIMEOUT) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                    out = json.loads(resp.read().decode("utf-8"))
+                self._answered()
+                return out
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
+                    self._answered()
                     return None
                 # 503 is MusicBrainz saying "slow down", not "go away".
-                if exc.code in (429, 503) and attempt < 2:
-                    time.sleep(2.0 * (attempt + 1))
-                    continue
+                if exc.code in (429, 503):
+                    self._refused()
+                    last = LookupError_(f"MusicBrainz returned {exc.code}")
+                    if attempt < MB_ATTEMPTS - 1:
+                        self._sleep(self._retry_after(exc, attempt))
+                        continue
                 raise LookupError_(f"MusicBrainz returned {exc.code}") from exc
             except (urllib.error.URLError, OSError, ValueError) as exc:
-                if attempt < 2:
-                    time.sleep(1.0 * (attempt + 1))
+                last = LookupError_(str(exc))
+                if attempt < MB_ATTEMPTS - 1:
+                    self._sleep(1.0 * (attempt + 1))
                     continue
-                raise LookupError_(str(exc)) from exc
+                raise last from exc
+        if last:
+            raise last
         return None
 
     def by_isrc(self, isrc):
@@ -348,6 +407,13 @@ class MusicBrainz:
         return (data or {}).get("recordings") or []
 
     def release_genres(self, release_id):
+        if release_id in self._genre_cache:
+            return self._genre_cache[release_id]
+        got = self._release_genres(release_id)
+        self._genre_cache[release_id] = got
+        return got
+
+    def _release_genres(self, release_id):
         """The genres MusicBrainz records for a release, best first.
 
         Genre is community-voted rather than editorial, and it hangs off the
@@ -1613,6 +1679,145 @@ def auto_after_ingest(con, root=None, content_keys=None, progress=None,
         counts["stopped"] = "%s: %s" % (type(exc).__name__, exc)
         _note_error(counts, exc)
     return counts
+
+
+class IngestStream:
+    """Automatic enrichment of arrivals, one file at a time.
+
+    ``auto_after_ingest`` is the batch form of this: hand it everything that
+    landed and it works through the list. A download hands its files over as
+    yt-dlp finishes each one, and calling the batch form per file would be
+    wrong twice over. A fresh :class:`MusicBrainz` per call has no memory of
+    when the last request went out - that memory is the whole of how the
+    one-request-a-second rule is kept - and ``backfill_isrc`` walks the
+    entire catalog, which is a once-per-run cost and not a once-per-file
+    one. So the client is built once and kept, the backfill runs once on the
+    first arrival, and the counts accumulate across the run.
+
+    The same promises as the batch form: a skipped file is never touched,
+    only an ``applied`` match is written into the audio, and nothing raises -
+    this runs behind somebody else's download, and MusicBrainz being down is
+    not a reason for the download to look like it failed.
+    """
+
+    def __init__(self, con, contact=None, client=None, acoustid=None):
+        self.con = con
+        self.counts = _new_counts()
+        self.counts["auto"] = True
+        self.enabled = auto_enabled()
+        if not self.enabled:
+            self.counts["stopped"] = ("automatic enrichment is off in this "
+                                      "environment")
+        self._contact = contact
+        self._client = client
+        self._acoustid = acoustid
+        self._started = False
+
+    def _start(self):
+        """Build the client and pay the once-per-run costs, on first use.
+
+        Deferred rather than done in ``__init__`` so a run where nothing
+        arrives - every URL already in the archive - costs nothing at all.
+        """
+        cfg = get_config(self.con)
+        if self._client is None:
+            self._client = MusicBrainz(
+                contact=self._contact or cfg["contact"] or None)
+        if self._acoustid is None and fingerprint_status(self.con)["ready"]:
+            # Taken when available rather than asked about, as in the batch
+            # form: a download whose artist is a channel name gives a text
+            # search nothing to work with.
+            self._acoustid = AcoustID(cfg["acoustid_key"])
+        self.counts["backfilled"] = backfill_isrc(self.con)["matched"]
+        self._started = True
+
+    def client(self):
+        """The one MusicBrainz client, built if it has not been yet.
+
+        Lent out so that a hand-picked run - which wants options this does
+        not offer - still goes out through the same client, and therefore
+        the same one request a second, as everything else.
+        """
+        if not self._started:
+            self._start()
+        return self._client
+
+    def add(self, content_key):
+        """Identify one arrival. Returns what became of it.
+
+        The result is ``{"state": ..., "detail": ...}``, meant to be shown
+        beside the file in a progress view: ``state`` is one of ``applied``,
+        ``candidate``, ``none``, ``skipped``, ``failed`` or ``off``, and
+        ``detail`` is the sentence a person reads.
+        """
+        if not self.enabled:
+            return {"state": "off", "detail": "identification is off"}
+        try:
+            if not self._started:
+                self._start()
+            rows = tracks_for_keys(self.con, [content_key])
+            if not rows:
+                return {"state": "failed", "detail": "not in the catalog"}
+            before = dict(self.counts)
+            # The error list is shared and folds repeats into a count, so a
+            # copy of it is the only way to tell afterwards which complaint
+            # this file made.
+            before["errors"] = [dict(e) for e in self.counts["errors"]]
+            rows = _drop_skipped(self.con, rows, self.counts)
+            if not rows:
+                return {"state": "skipped", "detail": "left alone on purpose"}
+            _process(self.con, rows, self._client, self._acoustid,
+                     self.counts,
+                     True,   # write_tags: the point of the mode
+                     True,   # artwork: a download's cover is a video frame
+                     None)
+            return self._outcome(content_key, before)
+        except Exception as exc:      # noqa: BLE001 - reported, never raised
+            self.counts["failed"] += 1
+            _note_error(self.counts, exc)
+            return {"state": "failed", "detail": str(exc)}
+
+    def _outcome(self, content_key, before):
+        """What ``_process`` did to this one file, as a state and a sentence.
+
+        Read off the counts rather than returned by ``_process``, which
+        reports a list. One row went in, so exactly one counter moved.
+        """
+        for counter, state in (("applied", "applied"),
+                               ("candidates", "candidate"),
+                               ("unmatched", "none"),
+                               ("failed", "failed")):
+            if self.counts[counter] > before[counter]:
+                return {"state": state,
+                        "detail": self._detail(content_key, state, before)}
+        return {"state": "none", "detail": "nothing to change"}
+
+    def _latest_error(self, before):
+        """The complaint this file made, out of the run's folded list."""
+        was = {e["message"]: e["count"] for e in before["errors"]}
+        for e in self.counts["errors"]:
+            if e["count"] > was.get(e["message"], 0):
+                return e["message"]
+        return "lookup failed"
+
+    def _detail(self, content_key, state, before):
+        if state == "failed":
+            return self._latest_error(before)
+        if state == "none":
+            return "no match found"
+        row = self.con.execute(
+            "SELECT fields, source, confidence FROM enrichment "
+            "WHERE content_key = ?", (content_key,)).fetchone()
+        if not row:
+            return "identified" if state == "applied" else "needs review"
+        try:
+            fields = json.loads(row["fields"])
+        except (TypeError, ValueError):
+            fields = {}
+        name = " - ".join(x for x in (fields.get("artist"),
+                                      fields.get("title")) if x)
+        verb = "identified" if state == "applied" else "possible match"
+        return "%s: %s" % (verb, name) if name else verb
 
 
 def _count_skipped(con, root=None):

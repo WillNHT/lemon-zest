@@ -12,6 +12,7 @@ os.environ["LEMONZEST_AUTO_ENRICH"] = "0"
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,6 +60,8 @@ class ServerTests(unittest.TestCase):
         self.c = self.app.test_client()
 
     def tearDown(self):
+        from lemonzest import enrichq
+        enrichq.reset_queues()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_index_and_assets_are_served(self):
@@ -194,6 +197,295 @@ class ServerTests(unittest.TestCase):
                         json={"content_keys": [key],
                               "query": {"artist": "Alpha", "title": "  "}})
         self.assertEqual(r.status_code, 400)
+
+    # ------------------------------------------------------------ sorting
+
+    def test_a_column_sorts_both_ways(self):
+        up = self.c.get("/api/library?sort=title&dir=asc").get_json()["tracks"]
+        down = self.c.get("/api/library?sort=title&dir=desc").get_json()["tracks"]
+        titles = [t["title"] for t in up if t["title"]]
+        self.assertEqual(titles, sorted(titles))
+        self.assertEqual([t["title"] for t in down if t["title"]],
+                         list(reversed(titles)))
+
+    def test_untagged_rows_sort_last_whichever_way_it_is_asked(self):
+        """SQLite puts NULLs first; a screen of blanks is not a sort."""
+        for direction in ("asc", "desc"):
+            tracks = self.c.get(
+                "/api/library?sort=artist&dir=" + direction).get_json()["tracks"]
+            self.assertIsNotNone(tracks[0]["artist"], direction)
+            self.assertIsNone(tracks[-1]["artist"], direction)
+
+    def test_a_column_nobody_defined_is_ignored_rather_than_run(self):
+        r = self.c.get("/api/library?sort=t.rel_path);DROP+TABLE+track;--")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["total"], 4)
+        self.assertEqual(self.c.get("/api/stats").get_json()["tracks"], 4)
+
+    # ----------------------------------------------------------- playlists
+
+    def test_a_playlist_narrows_the_same_library_query(self):
+        pid = self.c.get("/api/playlists").get_json()[0]["id"]
+        d = self.c.get("/api/library?playlist=%d" % pid).get_json()
+        self.assertEqual(d["total"], 2)
+        # In the playlist's own order, and numbered by it.
+        self.assertEqual([t["playlist_pos"] for t in d["tracks"]], [0, 1])
+        titles = [t["title"] for t in d["tracks"]]
+        self.assertEqual(titles, ["One", "Two"])
+
+    def test_a_playlist_can_be_sorted_against_its_own_order(self):
+        pid = self.c.get("/api/playlists").get_json()[0]["id"]
+        d = self.c.get("/api/library?playlist=%d&sort=pos&dir=desc"
+                       % pid).get_json()
+        self.assertEqual([t["playlist_pos"] for t in d["tracks"]], [1, 0])
+
+    def test_the_facets_narrow_with_the_playlist(self):
+        pid = self.c.get("/api/playlists").get_json()[0]["id"]
+        d = self.c.get("/api/facets?playlist=%d" % pid).get_json()
+        self.assertEqual([a["value"] for a in d["artist"]], ["Alpha"])
+
+    # ------------------------------------------------------------ decades
+
+    def test_the_decade_facet_groups_by_the_first_three_digits(self):
+        c = db.connect(self.db_path)
+        for year, title in (("2012-09-03", "One"), ("2019", "Two"),
+                            ("2001-11", "Three")):
+            c.execute("UPDATE track SET year = ? WHERE title = ?", (year, title))
+        c.commit()
+        c.close()
+        got = {f["value"]: f["count"]
+               for f in self.c.get("/api/facets").get_json()["decade"]}
+        self.assertEqual(got, {"2000s": 1, "2010s": 2})
+
+    def test_a_decade_narrows_the_table(self):
+        c = db.connect(self.db_path)
+        c.execute("UPDATE track SET year = '1999-05-01' WHERE title = 'One'")
+        c.commit()
+        c.close()
+        d = self.c.get("/api/library?decade=1990s").get_json()
+        self.assertEqual([t["title"] for t in d["tracks"]], ["One"])
+
+    # -------------------------------------------------- what is new to you
+
+    def add_to_playlist(self):
+        """Put a track into the playlist as a download would."""
+        c = db.connect(self.db_path)
+        tid = c.execute("SELECT id FROM track WHERE title = 'Three'"
+                        ).fetchone()["id"]
+        playlists.append_tracks(c, "mix", [tid], origin="download")
+        c.close()
+
+    def playlist_id(self):
+        return self.c.get("/api/playlists").get_json()[0]["id"]
+
+    def fresh(self):
+        return self.c.get("/api/playlists").get_json()[0]["fresh"]
+
+    def test_a_playlist_nobody_has_opened_is_all_new(self):
+        """It has just appeared in the library; none of it has been seen."""
+        self.assertEqual(self.fresh(), 2)
+
+    def test_looking_at_it_clears_the_mark(self):
+        pid = self.playlist_id()
+        d = self.c.get("/api/playlists/%d" % pid).get_json()
+        self.assertEqual(d["fresh"], 2)
+        self.assertEqual(self.fresh(), 0)
+
+    def test_what_arrives_afterwards_is_marked_again(self):
+        pid = self.playlist_id()
+        self.c.get("/api/playlists/%d" % pid)          # seen
+        self.add_to_playlist()
+        self.assertEqual(self.fresh(), 1)
+        d = self.c.get("/api/playlists/%d" % pid).get_json()
+        # Named while you are looking at it...
+        self.assertEqual(d["fresh"], 1)
+        arrived = [e["title"] for e in d["entries"]
+                   if (e["added_at"] or 0) > d["since"]]
+        self.assertEqual(arrived, ["Three"])
+        # ...and ordinary by the time you come back.
+        self.assertEqual(self.fresh(), 0)
+
+    def test_a_peek_does_not_count_as_looking(self):
+        """A reload under a page you are already on must not read the marks."""
+        pid = self.playlist_id()
+        self.c.get("/api/playlists/%d?peek=1" % pid)
+        self.assertEqual(self.fresh(), 2)
+
+    def test_the_table_says_when_each_track_joined(self):
+        pid = self.playlist_id()
+        self.c.get("/api/playlists/%d" % pid)
+        self.add_to_playlist()
+        rows = self.c.get("/api/library?playlist=%d" % pid).get_json()["tracks"]
+        joined = {t["title"]: t["playlist_added_at"] for t in rows}
+        self.assertEqual(len(joined), 3)
+        self.assertGreater(joined["Three"], joined["One"])
+
+    def test_re_importing_does_not_make_everything_new_again(self):
+        """A scan re-reads the folder's playlists; that is not a change."""
+        pid = self.playlist_id()
+        self.c.get("/api/playlists/%d" % pid)
+        c = db.connect(self.db_path)
+        playlists.import_dir(c, os.path.join(self.tmp, "playlists"))
+        c.close()
+        self.assertEqual(self.fresh(), 0)
+
+    # ---------------------------------------------------- the enrich queue
+
+    def test_the_queue_says_what_it_is_doing(self):
+        d = self.c.get("/api/enrich/queue").get_json()
+        for key in ("waiting", "current", "paused", "done", "applied",
+                    "failed", "recent"):
+            self.assertIn(key, d)
+
+    def test_the_queue_can_be_paused_and_resumed(self):
+        d = self.c.post("/api/enrich/queue", json={"pause": True}).get_json()
+        self.assertTrue(d["paused"])
+        d = self.c.post("/api/enrich/queue", json={"resume": True}).get_json()
+        self.assertFalse(d["paused"])
+
+    def test_the_backlog_can_be_dropped_from_the_page(self):
+        from lemonzest import enrichq
+        q = enrichq.get_queue(self.db_path)
+        q.pause()
+        q.submit(["nothing-real"], priority="sweep")
+        d = self.c.post("/api/enrich/queue", json={"clear": True}).get_json()
+        self.assertEqual(d["dropped"], 1)
+        self.assertEqual(d["waiting"], 0)
+        self.c.post("/api/enrich/queue", json={"resume": True})
+
+    def test_the_stats_carry_the_backlog(self):
+        d = self.c.get("/api/stats").get_json()
+        self.assertIn("enrich_queue", d)
+        self.assertIn("waiting", d["enrich_queue"])
+
+    # -------------------------------------------------------- the sync list
+
+    def test_a_set_can_be_prepared_with_no_device_in_sight(self):
+        r = self.c.post("/api/sync-list", json={"add": [["playlist", "mix"]]})
+        d = r.get_json()
+        self.assertEqual(d["tracks"], 2)
+        self.assertGreater(d["bytes"], 0)
+        self.assertEqual(d["rules"][0]["tracks"], 2)
+
+    def test_tracks_go_on_the_list_by_content_key(self):
+        keys = [t["content_key"] for t in
+                self.c.get("/api/library").get_json()["tracks"][:2]]
+        d = self.c.post("/api/sync-list/keys",
+                        json={"content_keys": keys}).get_json()
+        self.assertEqual(d["added"], 2)
+        self.assertEqual({r["kind"] for r in d["rules"]}, {"track"})
+
+    def test_the_same_rule_twice_is_still_one_rule(self):
+        for _ in range(2):
+            d = self.c.post("/api/sync-list",
+                            json={"add": [["playlist", "mix"]]}).get_json()
+        self.assertEqual(len(d["rules"]), 1)
+
+    def test_a_rule_can_be_dropped_and_the_list_emptied(self):
+        self.c.post("/api/sync-list", json={"add": [["playlist", "mix"],
+                                                    ["artist", "Beta"]]})
+        d = self.c.post("/api/sync-list",
+                        json={"remove": [["artist", "Beta"]]}).get_json()
+        self.assertEqual([r["ref"] for r in d["rules"]], ["mix"])
+        d = self.c.post("/api/sync-list", json={"clear": True}).get_json()
+        self.assertEqual(d["rules"], [])
+
+    def test_applying_copies_the_rules_and_keeps_the_list(self):
+        did = self.c.get("/api/devices").get_json()[0]["id"]
+        self.c.post("/api/sync-list", json={"add": [["playlist", "mix"]]})
+        out = self.c.post("/api/sync-list/apply", json={"device": did}).get_json()
+        self.assertEqual(out["applied"], 1)
+        self.assertEqual(out["tracks"], 2)
+        rules = self.c.get("/api/devices").get_json()[0]["rules"]
+        self.assertIn({"kind": "playlist", "ref": "mix"}, rules)
+        # The list is not consumed: the same set usually goes on two cards.
+        self.assertEqual(len(self.c.get("/api/sync-list").get_json()["rules"]), 1)
+
+    def test_an_unknown_rule_kind_is_refused(self):
+        r = self.c.post("/api/sync-list", json={"add": [["everything", "x"]]})
+        self.assertEqual(r.status_code, 400)
+
+    def test_applying_an_empty_list_says_so(self):
+        did = self.c.get("/api/devices").get_json()[0]["id"]
+        r = self.c.post("/api/sync-list/apply", json={"device": did})
+        self.assertEqual(r.status_code, 400)
+
+    # ------------------------------------------------------ playlist refresh
+
+    def test_a_playlist_with_no_source_cannot_be_fetched(self):
+        pid = self.c.get("/api/playlists").get_json()[0]["id"]
+        r = self.c.post("/api/playlists/%d/refresh" % pid)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("YouTube", r.get_json()["error"])
+
+    def test_a_playlist_that_is_not_there_is_a_404(self):
+        r = self.c.post("/api/playlists/9999/refresh")
+        self.assertEqual(r.status_code, 404)
+
+    # --------------------------------------------------------- the inbox
+
+    def test_a_settled_file_leaves_the_inbox_on_its_own(self):
+        c = db.connect(self.db_path)
+        keys = [r["content_key"] for r in
+                c.execute("SELECT content_key FROM track WHERE size > 0")]
+        for key in keys[:2]:
+            c.execute("INSERT INTO enrichment(content_key, status, source, "
+                      "confidence, fields, fetched_at) "
+                      "VALUES (?,'applied','isrc',1.0,'{}',0)", (key,))
+        c.commit()
+        self.assertEqual(db.promote_inbox(c), 2)
+        c.close()
+        self.assertEqual(self.c.get("/api/stats").get_json()["inbox"], 2)
+
+    def test_a_lookup_that_found_nothing_is_settled_too(self):
+        """Nothing further will happen on its own, so it is not still new."""
+        c = db.connect(self.db_path)
+        key = c.execute("SELECT content_key FROM track WHERE size > 0"
+                        ).fetchone()["content_key"]
+        c.execute("INSERT INTO enrichment(content_key, status, source, "
+                  "confidence, fields, fetched_at) "
+                  "VALUES (?,'none','musicbrainz',0.0,'{}',0)", (key,))
+        c.commit()
+        self.assertEqual(db.promote_inbox(c), 1)
+        c.close()
+
+    def test_a_file_waiting_on_a_decision_stays(self):
+        c = db.connect(self.db_path)
+        key = c.execute("SELECT content_key FROM track WHERE size > 0"
+                        ).fetchone()["content_key"]
+        c.execute("INSERT INTO enrichment(content_key, status, source, "
+                  "confidence, fields, fetched_at) "
+                  "VALUES (?,'candidate','musicbrainz',0.7,'{}',0)", (key,))
+        c.commit()
+        self.assertEqual(db.promote_inbox(c), 0)
+        c.close()
+
+    def test_an_old_file_leaves_however_it_ended_up(self):
+        """No network, no key, no match - it still must not sit there."""
+        c = db.connect(self.db_path)
+        c.execute("UPDATE track SET added_at = ?", (time.time() - 48 * 3600,))
+        c.commit()
+        self.assertEqual(db.promote_inbox(c), 4)
+        c.close()
+        self.assertEqual(self.c.get("/api/stats").get_json()["inbox"], 0)
+
+    def test_an_empty_file_is_not_promoted_for_being_identified(self):
+        c = db.connect(self.db_path)
+        key = c.execute("SELECT content_key FROM track WHERE size = 0"
+                        ).fetchone()["content_key"]
+        c.execute("INSERT INTO enrichment(content_key, status, source, "
+                  "confidence, fields, fetched_at) "
+                  "VALUES (?,'applied','isrc',1.0,'{}',0)", (key,))
+        c.commit()
+        self.assertEqual(db.promote_inbox(c), 0)
+        c.close()
+
+    def test_clearing_by_hand_empties_the_rest(self):
+        before = self.c.get("/api/stats").get_json()["inbox"]
+        self.assertEqual(before, 4)
+        got = self.c.post("/api/inbox/seen").get_json()
+        self.assertEqual(got["promoted"], 4)
+        self.assertEqual(self.c.get("/api/stats").get_json()["inbox"], 0)
 
     def test_problems_lists_the_empty_file(self):
         d = self.c.get("/api/problems").get_json()

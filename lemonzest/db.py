@@ -1,6 +1,7 @@
 """SQLite catalog. Single writer, WAL, schema created on demand."""
 import os
 import sqlite3
+import time
 
 SCHEMA_VERSION = 4
 
@@ -38,7 +39,10 @@ CREATE TABLE IF NOT EXISTS track (
     -- When the catalog first saw this file. Distinct from seen_at, which
     -- every rescan moves forward: the inbox is "what arrived since I last
     -- looked", and that question needs a timestamp that does not change.
-    added_at     REAL
+    added_at     REAL,
+    -- When this file stopped being new. Written by the promotion rule
+    -- below rather than by a person: see promote_inbox.
+    inbox_done_at REAL
 );
 CREATE INDEX IF NOT EXISTS ix_track_isrc   ON track(isrc);
 CREATE INDEX IF NOT EXISTS ix_track_artist ON track(artist);
@@ -65,7 +69,12 @@ CREATE TABLE IF NOT EXISTS playlist (
     origin      TEXT,          -- 'local' | provider name
     source_uri  TEXT,          -- #Collection URI, when the file carried one
     imported_from TEXT,
-    imported_at REAL
+    imported_at REAL,
+    -- When entries last changed, and when somebody last looked. A playlist
+    -- that has gained tracks since it was last opened is worth a mark in
+    -- the sidebar; one that has not is not.
+    updated_at  REAL,
+    seen_at     REAL
 );
 
 CREATE TABLE IF NOT EXISTS playlist_entry (
@@ -75,10 +84,55 @@ CREATE TABLE IF NOT EXISTS playlist_entry (
     raw_path    TEXT NOT NULL,     -- as written in the source file
     title_hint  TEXT,              -- from #EXTINF
     duration    REAL,
+    -- When this entry joined the playlist. Carried across a re-import, so a
+    -- rescan of a folder does not make every track look new again.
+    added_at    REAL,
     source_uri  TEXT,              -- per-track provider URI, e.g. apple_music:track:N
     PRIMARY KEY (playlist_id, pos)
 );
 CREATE INDEX IF NOT EXISTS ix_pe_track ON playlist_entry(track_id);
+
+-- Every URL a download was asked for, and what was at it. Two jobs in one
+-- table: the recent list, which is only the last few rows by time, and the
+-- kept ones - a playlist URL somebody asked to keep an eye on, which is
+-- shown by name and fetched again on demand.
+CREATE TABLE IF NOT EXISTS download_url (
+    url           TEXT PRIMARY KEY,
+    title         TEXT,
+    uploader      TEXT,
+    is_playlist   INTEGER NOT NULL DEFAULT 0,
+    item_count    INTEGER,
+    -- The catalog playlist this URL feeds, when it is a playlist. Named
+    -- rather than referenced by id: a playlist that is deleted and made
+    -- again under the same name is the same playlist to a person.
+    playlist_name TEXT,
+    root          TEXT,          -- the library folder it was fetched into
+    first_used    REAL,
+    last_used     REAL,
+    uses          INTEGER NOT NULL DEFAULT 0,
+    -- Kept on the page and fetched again on demand.
+    -- Strictly increasing, one per asking. Time alone cannot order these:
+    -- two downloads started inside the same clock tick - which on Windows
+    -- is fifteen milliseconds wide - carry the same timestamp, and the
+    -- recent list would then show them in whatever order the query felt
+    -- like.
+    seq           INTEGER NOT NULL DEFAULT 0,
+    kept          INTEGER NOT NULL DEFAULT 0,
+    last_checked  REAL,
+    last_added    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_dlurl_used ON download_url(last_used);
+
+-- A set of music prepared before there is anywhere to put it. The same
+-- (kind, ref) rules a device carries, held against no device at all, so a
+-- card can be planned on the train and written when you get home. Applying
+-- one copies its rules onto a device; the list itself is not consumed.
+CREATE TABLE IF NOT EXISTS sync_list (
+    kind     TEXT NOT NULL,        -- playlist | artist | album | track
+    ref      TEXT NOT NULL,
+    added_at REAL NOT NULL,
+    PRIMARY KEY (kind, ref)
+);
 
 CREATE TABLE IF NOT EXISTS device (
     id            INTEGER PRIMARY KEY,
@@ -235,13 +289,142 @@ def migrate(con):
         if "playlist_template" not in cols:
             con.execute("ALTER TABLE device ADD COLUMN playlist_template "
                         "TEXT NOT NULL DEFAULT '{name}.m3u8'")
+    if track_cols and "inbox_done_at" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN inbox_done_at REAL")
+        # Everything already in the catalog has been lived with; only what
+        # arrives from here on gets to be new.
+        con.execute("UPDATE track SET inbox_done_at = ? WHERE added_at IS NULL "
+                    "OR added_at <= COALESCE((SELECT CAST(value AS REAL) "
+                    "FROM meta WHERE key = 'inbox_seen_at'), 0)",
+                    (time.time(),))
+    # A playlist made by an early download knows nothing about where it came
+    # from - the URL was written down beside it but never on it. Joined up
+    # once, here, so those playlists stop reading as local.
+    pl_cols = _columns(con, "playlist")
+    if pl_cols and "updated_at" not in pl_cols:
+        con.execute("ALTER TABLE playlist ADD COLUMN updated_at REAL")
+        con.execute("ALTER TABLE playlist ADD COLUMN seen_at REAL")
+        # Everything already here has been lived with: marking a library's
+        # worth of playlists as new the first time this runs would be a
+        # notification about nothing.
+        con.execute("UPDATE playlist SET updated_at = imported_at, "
+                    "seen_at = ?", (time.time(),))
+    pe_cols = _columns(con, "playlist_entry")
+    if pe_cols and "added_at" not in pe_cols:
+        con.execute("ALTER TABLE playlist_entry ADD COLUMN added_at REAL")
+        con.execute("UPDATE playlist_entry SET added_at = "
+                    "(SELECT imported_at FROM playlist p "
+                    " WHERE p.id = playlist_entry.playlist_id)")
+    dl_cols = _columns(con, "download_url")
+    if dl_cols and _columns(con, "playlist"):
+        con.execute(
+            "UPDATE playlist SET source_uri = (SELECT d.url FROM download_url d "
+            "  WHERE d.playlist_name = playlist.name AND d.url IS NOT NULL "
+            "  ORDER BY d.seq DESC LIMIT 1) "
+            "WHERE source_uri IS NULL AND name IN "
+            "  (SELECT playlist_name FROM download_url "
+            "   WHERE playlist_name IS NOT NULL)")
+        con.execute(
+            "UPDATE playlist SET origin = 'youtube' "
+            "WHERE origin IN ('local', 'download') AND ("
+            "  source_uri LIKE '%youtube.com%' OR source_uri LIKE '%youtu.be%')")
+
+    if dl_cols and "seq" not in dl_cols:
+        con.execute("ALTER TABLE download_url ADD COLUMN seq INTEGER NOT NULL "
+                    "DEFAULT 0")
+        # Existing rows keep the order their timestamps imply.
+        con.execute("UPDATE download_url SET seq = rowid")
     con.commit()
 
 
-def connect(path=None):
+# How long a file stays new when nothing ever happens to it. A track that
+# is never identified - no network, no key, an unknown recording - must
+# still leave the inbox eventually, or the inbox becomes a list of things
+# that will be there forever.
+INBOX_SETTLE_AGE = 24 * 3600
+
+# The enrichment states that count as settled. Applied, skipped and
+# rejected are decisions; "none" is one too - the lookup ran and found
+# nothing, and nothing further will happen on its own. A file that wants
+# tags it cannot get belongs on the problems page, not in the inbox
+# forever. Raw and candidate are the unsettled ones: raw has not been
+# looked at yet, and a candidate is waiting on a decision, which is exactly
+# what an inbox is for.
+INBOX_SETTLED = ("applied", "skipped", "rejected", "none")
+
+
+def promote_inbox(con, now=None, settle_age=INBOX_SETTLE_AGE):
+    """Take out of the inbox everything that has finished arriving.
+
+    The inbox used to empty only when somebody pressed a button, which made
+    it a chore rather than a view: the files had been identified and tagged
+    minutes after they landed, and the badge went on saying 40 until it was
+    dismissed by hand.
+
+    A file leaves when there is nothing left to happen to it:
+
+      * its identification has settled - identified, skipped or rejected -
+        and it has content. A candidate waiting on a decision stays, because
+        that decision is exactly what an inbox is for;
+      * or it is older than ``settle_age`` whatever its state, so a library
+        with no network behind it still drains.
+
+    Empty files never promote on the first rule: zero bytes on disk is the
+    one thing that always wants looking at. The age rule takes them in the
+    end, by which time they are on the problems page instead.
+
+    Returns how many files were promoted.
+    """
+    now = time.time() if now is None else now
+    placeholders = ",".join("?" * len(INBOX_SETTLED))
+    cur = con.execute(
+        "UPDATE track SET inbox_done_at = ? "
+        "WHERE inbox_done_at IS NULL AND ("
+        "  (size > 0 AND content_key IN ("
+        f"     SELECT content_key FROM enrichment WHERE status IN ({placeholders})))"
+        "  OR (added_at IS NOT NULL AND added_at < ?))",
+        [now] + list(INBOX_SETTLED) + [now - settle_age])
+    con.commit()
+    return cur.rowcount
+
+
+def clear_inbox(con, now=None):
+    """Empty the inbox by hand: everything indexed so far stops being new."""
+    now = time.time() if now is None else now
+    cur = con.execute("UPDATE track SET inbox_done_at = ? "
+                      "WHERE inbox_done_at IS NULL", (now,))
+    meta_set(con, "inbox_seen_at", now)
+    con.commit()
+    return cur.rowcount
+
+
+def path_of(con):
+    """The database file a connection is open on.
+
+    A worker thread cannot share a connection - sqlite3 refuses one used
+    from the thread it was not made on - so a thread that needs its own asks
+    the connection it was handed where to open it. Returns None for an
+    in-memory database, which nothing can reopen.
+    """
+    for row in con.execute("PRAGMA database_list"):
+        if row[1] == "main":
+            return row[2] or None
+    return None
+
+
+def connect(path=None, same_thread=True):
+    """Open the catalog.
+
+    ``same_thread=False`` is for the identification queue, whose connection
+    is built on whichever thread first asks for it and then used by the
+    worker. sqlite3's check is a guard against two threads using one
+    connection at once, and the queue already guarantees that on its own -
+    there is one worker, and the one caller that borrows the queue's client
+    does so with the worker held back.
+    """
     path = path or default_db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    con = sqlite3.connect(path, timeout=30.0)
+    con = sqlite3.connect(path, timeout=30.0, check_same_thread=same_thread)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
