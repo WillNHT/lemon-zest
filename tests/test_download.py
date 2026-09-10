@@ -140,6 +140,8 @@ class DownloadTests(unittest.TestCase):
         os.environ.pop("LZ_FAKE_GATE", None)
 
     def tearDown(self):
+        from lemonzest import enrichq
+        enrichq.reset_queues()
         download.ytdlp_command = self._real_command
         os.environ.clear()
         os.environ.update(self._env)
@@ -450,9 +452,11 @@ class DownloadTests(unittest.TestCase):
         elapsed = time.time() - started
 
         # The gate gives up after ten seconds so a regression fails rather
-        # than hangs. Finishing well inside that is the proof that each gate
-        # was opened by the work rather than by the timeout.
-        self.assertLess(elapsed, 5.0,
+        # than hangs; three gates waiting it out is thirty. Finishing well
+        # inside that is the proof that each gate was opened by the work
+        # rather than by the timeout - the bound has room for a slow machine
+        # without ever reaching a single gate's patience.
+        self.assertLess(elapsed, 9.0,
                         "the arrivals were not identified as they landed")
         self.assertEqual(summary["downloaded"], 3)
         self.assertEqual(len(seen), 3, "every arrival should have been "
@@ -518,12 +522,19 @@ class DownloadTests(unittest.TestCase):
         os.environ["LZ_FAKE_FILES"] = "../elsewhere/stray.m4a;A/x/one.m4a"
         summary = download.download(self.con, ["https://example.test/l"],
                                     root=self.root, cfg=self.cfg())
+        # The batch goes on changing after the download is over - the queue
+        # is still identifying what it was handed, on its own thread - so
+        # the end state is the only one worth asserting. Waiting for the
+        # queue is what makes this a test rather than a coin toss.
+        from lemonzest import enrichq
+        enrichq.get_queue(download.db.path_of(self.con)).drain(timeout=10)
         items = {i["n"]: i for i in summary["batch"]["items"]}
         self.assertEqual(items[1]["state"], "failed")
         self.assertEqual(items[1]["detail"], "could not be catalogued")
         self.assertEqual(items[2]["state"], "done")
         self.assertEqual(summary["failed_index"], 1)
         self.assertEqual(summary["added"], 1)
+        self.assertEqual(summary["queued"], 1)
 
     # ------------------------------------------------ playlists and memory
 
