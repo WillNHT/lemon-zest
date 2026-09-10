@@ -262,18 +262,42 @@ def supports_option(flag):
     return ok
 
 
+def _same_file(a, b):
+    """Whether two paths name the same file on disk.
+
+    String equality is not enough on Windows: ``shutil.which`` returns the
+    extension in the case PATHEXT carries it - ``deno.EXE`` - while the
+    bundle spells it ``deno.exe``, and a page comparing the two decided a
+    bundled runtime was somebody else's. ``samefile`` where it works,
+    normcase where it does not.
+    """
+    if not a or not b:
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return (os.path.normcase(os.path.abspath(a))
+                == os.path.normcase(os.path.abspath(b)))
+
+
 def js_runtime_status(cfg=None):
     """Which JavaScript runtime a download would use, and what is installed.
 
     Reported next to the cookie source, for the same reason: without one,
     every YouTube video fails, and the failure says nothing about why.
     """
+    from . import bundled
+
     enabled = {"deno"}   # yt-dlp's own default, whatever Lemon Zest passes
     for name in ((cfg or {}).get("js_runtimes") or "").replace(" ", ",").split(","):
         if name.strip():
             enabled.add(name.strip().lower())
-    found = [{"name": n, "path": norm(shutil.which(n))}
-             for n in JS_RUNTIMES if shutil.which(n)]
+    found = []
+    for n in JS_RUNTIMES:
+        path = shutil.which(n)
+        if path:
+            found.append({"name": n, "path": norm(path),
+                          "bundled": _same_file(path, bundled.tool(n))})
     usable = [f for f in found if f["name"] in enabled]
     chosen = usable[0] if usable else None
     if chosen:
