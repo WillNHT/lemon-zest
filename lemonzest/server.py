@@ -416,6 +416,47 @@ def create_app(db_path=None):
         out["roots"] = db_mod.roots_detail(c)
         return jsonify(out)
 
+    # ------------------------------------------------------- utilities
+
+    @app.get("/api/reset")
+    def reset_summary():
+        from . import reset
+        return jsonify(reset.summary(con()))
+
+    @app.post("/api/reset")
+    def reset_run():
+        """Wipe the library, playlists and download history.
+
+        Asks for the confirmation word in the body as well as in the page:
+        a stray request should not be able to empty a library.
+        """
+        from . import reset
+        body = request.json or {}
+        if body.get("confirm") != reset.CONFIRM_WORD:
+            return jsonify({"error": "type " + reset.CONFIRM_WORD
+                                     + " to confirm"}), 400
+        with JOBS_LOCK:
+            busy = [j for j in JOBS.values() if j["state"] == "running"]
+        if busy:
+            return jsonify({"error": "wait for the running "
+                                     + busy[0]["kind"] + " to finish"}), 409
+        # The identification backlog names files about to disappear: drop it,
+        # and let the item in hand finish before the rows go.
+        q = _queue()
+        was_paused = q.status()["paused"]
+        q.pause()
+        try:
+            q.clear()
+            end = time.time() + 30
+            while q.current is not None and time.time() < end:
+                time.sleep(0.05)
+            out = reset.reset_library(
+                con(), delete_files=bool(body.get("delete_files")))
+        finally:
+            if not was_paused:
+                q.resume()
+        return jsonify(out)
+
     @app.get("/api/art/<path:content_key>")
     def track_art(content_key):
         """The artwork embedded in the file itself.
