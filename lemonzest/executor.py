@@ -207,11 +207,16 @@ def execute(con, plan, prune=False, on_event=None, dry_run=False):
             summary["errors"].append(f"refused playlist outside device: {fname}")
             continue
         # Track paths are relative to the music folder; the playlist may sit
-        # elsewhere, so re-base them against the playlist's own folder.
+        # elsewhere, so re-base them against the playlist's own folder - or,
+        # for a player that wants them, write them from the card's root.
         rows = []
         for rel, title, duration, uri in p["entries"]:
-            target = os.path.join(music_root, rel.replace("/", os.sep))
-            rebased = norm(os.path.relpath(target, pl_root))
+            if profile.get("absolute_playlist_paths"):
+                rebased = "/" + "/".join(
+                    x for x in (norm(music_dir).strip("/"), norm(rel)) if x)
+            else:
+                target = os.path.join(music_root, rel.replace("/", os.sep))
+                rebased = norm(os.path.relpath(target, pl_root))
             rows.append((rebased, title, duration, uri))
         try:
             n = pl_mod.write(dst, p["name"], rows, source_uri=p["source_uri"],

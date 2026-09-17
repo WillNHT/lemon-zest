@@ -56,8 +56,11 @@ PROFILES = {
         "playlist_dir": "Playlists",
         "music_dir": "Music",
         "encode_playlist_paths": False,
+        # Rockbox resolves "/Music/..." from the root of the card, which
+        # keeps working wherever the playlist file sits.
+        "absolute_playlist_paths": True,
         "playlist_template": "{name}.m3u8",
-        "notes": "Plain relative paths; playlists in their own folder.",
+        "notes": "Absolute /Music/... paths; playlists in their own folder.",
     },
 }
 

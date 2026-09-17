@@ -14,6 +14,8 @@ from . import download as dl_mod
 from . import executor, planner, playlists, scan
 from . import organise as org_mod
 from .db import connect, default_db_path
+from .paths import norm
+
 
 def _utf8_console():
     """Print Vietnamese on a Windows console without dying.
@@ -916,6 +918,51 @@ def doctor_cmd(ctx, directory):
             "appended instead of replacing. Lemon Zest rewrites playlists in "
             "place, so syncing with it once will collapse them back."
         )
+
+
+@cli.command("fix-tags")
+@click.option("--root", default=None, help="Only files under this library root.")
+@click.option("--dry-run", is_flag=True, help="Report, change nothing.")
+@click.pass_context
+def fix_tags_cmd(ctx, root, dry_run):
+    """Trim dates to the year and square covers, for players like Rockbox.
+
+    Files downloaded before this fix carry the upload date as the year and a
+    letterboxed video frame as the cover. Run once, then sync: the rewritten
+    files are recopied to the card.
+    """
+    from . import artwork
+    from . import tags as tags_mod
+
+    con = _con(ctx)
+    sql, args = "SELECT path, content_key, year FROM track", ()
+    if root:
+        sql += " WHERE root=?"
+        args = (norm(os.path.abspath(root)),)
+    rows = con.execute(sql, args).fetchall()
+    fixed = failed = 0
+    for row in rows:
+        try:
+            if dry_run:
+                cover = tags_mod.read_cover(row["path"])
+                todo = [w for w, bad in (
+                    ("year", row["year"]
+                     and artwork.year_only(row["year"]) != row["year"]),
+                    ("cover", cover and not artwork.is_player_safe(cover[0])),
+                ) if bad]
+            else:
+                todo = tags_mod.fix_for_players(con, row)
+        except Exception as exc:
+            failed += 1
+            console.print(f"[red]failed[/] {row['path']}: {exc}")
+            continue
+        if todo:
+            fixed += 1
+            console.print(f"{'would fix' if dry_run else 'fixed'} "
+                          f"{', '.join(todo)}: [dim]{row['path']}[/]")
+    console.print(f"\n[green]{fixed:,}[/] of {len(rows):,} files "
+                  f"{'need fixing' if dry_run else 'fixed'}"
+                  + (f", [red]{failed:,} failed[/]" if failed else ""))
 
 
 # ------------------------------------------------------------- enrichment

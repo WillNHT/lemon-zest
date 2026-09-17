@@ -141,6 +141,28 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(p["deletes"], [])
         self.assertEqual(len(p["unchanged"]), 3)
 
+    def test_rockbox_playlists_use_absolute_music_paths(self):
+        # Rockbox wants playlists in their own folder and entries written
+        # from the card's root, not relative to the playlist.
+        self.con.execute("UPDATE device SET profile='rockbox', "
+                         "playlist_dir='Playlists' WHERE id=?",
+                         (self.device["id"],))
+        self.con.commit()
+        self.device = devices.find(self.con, "Card")
+        summary = self._sync()
+        self.assertEqual(summary["errors"], [])
+        written = os.path.join(self.card, "Playlists", "mix.m3u8")
+        self.assertTrue(os.path.isfile(written))
+        with open(written, encoding="utf-8") as fh:
+            paths = [ln for ln in fh.read().splitlines()
+                     if ln and not ln.startswith("#")]
+        self.assertEqual(len(paths), 3)
+        for p in paths:
+            self.assertTrue(p.startswith("/Music/"), p)
+            self.assertNotIn("..", p)
+            self.assertTrue(os.path.isfile(
+                os.path.join(self.card, p.lstrip("/"))), p)
+
     def test_playlist_is_rewritten_not_appended(self):
         """AC3: the bug found on the real card cannot recur."""
         for _ in range(5):
