@@ -433,7 +433,10 @@ function renderSidebar() {
                title: 'Scan a folder, import playlists, or fetch from YouTube' }) +
       navRow({ act: 'view', arg: 'normalize', label: 'Normalize volume',
                icon: 'i-level', on: S.view === 'normalize',
-               title: 'Even out loudness across the library - not built yet' }));
+               title: 'Even out loudness across the library - not built yet' }) +
+      navRow({ act: 'view', arg: 'utilities', label: 'Utilities',
+               icon: 'i-warn', on: S.view === 'utilities',
+               title: 'Maintenance: start the library over' }));
 }
 
 // --------------------------------------------------------------- library
@@ -2235,6 +2238,104 @@ function removeRootModal(root) {
        >Remove from library</button>`);
 }
 
+// ------------------------------------------------------------- utilities
+
+async function loadResetInfo() {
+  S.resetInfo = { loading: true };
+  try {
+    S.resetInfo = await api('/reset');
+  } catch (e) {
+    S.resetInfo = { error: e.message };
+  }
+  if (S.view === 'utilities') render();
+}
+
+function renderUtilities() {
+  const r = S.resetInfo;
+  const ready = r && !r.loading && !r.error;
+  const last = S.resetResult;
+  return `<div class="pad stack">
+    <div class="card">
+      <header><h3>Start the library over</h3></header>
+      <div class="in stack">
+        <p class="muted">Forgets every track, playlist and identification in
+          this catalog, and removes the download history
+          (<span class="mono">.lemon-zest-downloads.txt</span>) so the same
+          videos can be downloaded again.</p>
+        <p class="muted"><b>Kept:</b> library folders, paired devices,
+          download settings, and the URLs on the Add music page - so
+          fetching everything again is a click away.</p>
+        ${!ready ? `<p class="muted">${h((r && r.error) || 'Counting...')}</p>`
+          : `<div class="hstack">
+              <span class="tag">${num(r.tracks)} tracks</span>
+              <span class="tag">${num(r.playlists)} playlists</span>
+              <span class="tag">${num(r.archives.length)} download archive${
+                r.archives.length === 1 ? '' : 's'}</span>
+              <span class="tag">${num(r.urls)} URLs kept</span></div>`}
+        <label class="hstack"><input type="checkbox" id="reset-files" ${
+          S.resetFiles ? 'checked' : ''}>
+          <span>Also delete the audio files and playlist files from disk</span></label>
+        <div><button class="btn danger" data-reset-open="1"
+          ${ready ? '' : 'disabled'}>Reset library...</button></div>
+        ${last ? `<div class="notice ${last.error_count ? 'warn' : 'ok'}">${
+          icon(last.error_count ? 'i-warn' : 'i-check')}<div>
+          <b>Library reset.</b> ${num(last.tracks_forgotten)} tracks and
+          ${num(last.playlists_forgotten)} playlists forgotten,
+          ${num(last.files_deleted)} files and ${num(last.archives_deleted)}
+          download archive${last.archives_deleted === 1 ? '' : 's'} deleted.
+          ${last.error_count ? `${num(last.error_count)} could not be removed:
+            <div class="mono">${last.errors.map(h).join('<br>')}</div>` : ''}
+          </div></div>` : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
+function resetModal() {
+  const r = S.resetInfo || {};
+  const box = $('#reset-files');
+  S.resetFiles = !!(box && box.checked);
+  const files = S.resetFiles;
+  showModal('Reset the whole library?', `
+    <div class="notice warn" style="margin-bottom:10px">${icon('i-warn')}
+      <div><b>This cannot be undone.</b> ${num(r.tracks || 0)} tracks and
+      ${num(r.playlists || 0)} playlists will be forgotten and the download
+      history removed.${files
+        ? ` <b>${num(r.tracks || 0)} audio files (${h(bytes(r.bytes || 0))})
+          will be permanently deleted from disk</b>, along with the playlist
+          files beside them.`
+        : ' Your audio files stay on disk; a rescan brings them back.'}
+      </div></div>
+    ${(r.roots || []).length ? `<p class="muted">Library folders:</p>
+      <p class="mono" style="margin-bottom:10px">${
+        r.roots.map(h).join('<br>')}</p>` : ''}
+    <p>Type <b class="mono">RESET</b> to confirm.</p>
+    <input id="reset-word" autocomplete="off" spellcheck="false"
+      style="width:100%;margin-top:6px">`,
+    `<button class="btn" data-close="1">Cancel</button>
+     <button class="btn danger" id="reset-go" data-reset-go="1" disabled
+       >${files ? 'Delete files and reset' : 'Reset library'}</button>`);
+  const input = $('#reset-word');
+  if (input) input.focus();
+}
+
+function runReset() {
+  const word = ($('#reset-word') || {}).value || '';
+  if (word.trim() !== 'RESET') return;
+  const files = S.resetFiles;
+  closeModal();
+  return guard(async () => {
+    S.resetResult = await api('/reset', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: 'RESET', delete_files: files }),
+    });
+    S.resetInfo = null;
+    S.sel.clear(); S.anchor = null;
+    S.playlistDetail = null;
+    await loadCore();
+  });
+}
+
 // ---------------------------------------------------------------- render
 
 const TITLES = {
@@ -2250,6 +2351,7 @@ const TITLES = {
   download: () => 'ADD MUSIC',
   syncList: () => `SYNC LIST — ${num((S.syncList || {}).tracks || 0)} TRACKS`,
   normalize: () => 'NORMALIZE VOLUME',
+  utilities: () => 'UTILITIES',
   problems: () => 'NEEDS ATTENTION',
 };
 
@@ -2376,12 +2478,14 @@ function render() {
     library: renderLibrary, inbox: renderInbox,
     device: renderDevice, playlist: renderPlaylist,
     addDevice: renderAddDevice, normalize: renderNormalize,
+    utilities: renderUtilities,
     syncList: renderSyncList, problems: renderProblems,
     download: renderDownload,
   }[S.view];
   $('#pane').innerHTML = body ? body() : '';
   renderStatus();
   if (S.view === 'addDevice') loadVolumes();
+  if (S.view === 'utilities' && !S.resetInfo) loadResetInfo();
   // Follow a running download; leave a finished one where the reader put it,
   // so scrolling back through a failure is not undone by the next poll.
   if (S.view === 'download' && S.job && S.job.kind === 'download'
@@ -2982,7 +3086,7 @@ document.addEventListener('click', (ev) => {
     + '[data-probe],[data-copylog],[data-inbox-seen],[data-clear-urls],'
     + '[data-play],[data-play-close],[data-useurl],[data-keep],[data-unkeep],'
     + '[data-keeprun],[data-pl-refresh],[data-sl-remove],[data-sl-clear],'
-    + '[data-queue],'
+    + '[data-queue],[data-reset-open],[data-reset-go],'
     + '[data-sl-apply],[data-pl-tolist],'
     + '[data-close-inspector],[data-dismiss-outcome],'
     + '[data-root-hide],[data-root-remove],[data-root-forget],'
@@ -3055,6 +3159,10 @@ document.addEventListener('click', (ev) => {
       S.offset = 0; S.sel.clear(); S.anchor = null;
       S.sort = { col: null, dir: 'asc' };
       return guard(loadLibrary);
+    }
+    if (d.arg === 'utilities') {
+      S.resetInfo = null;
+      S.resetResult = null;
     }
     if (d.arg === 'syncList') {
       S.syncList = null;
@@ -3314,6 +3422,8 @@ document.addEventListener('click', (ev) => {
     });
   }
   if (d.rootRemove) return removeRootModal(d.rootRemove);
+  if (d.resetOpen) return resetModal();
+  if (d.resetGo) return runReset();
   if (d.rootForget) {
     const root = d.rootForget;
     closeModal();
@@ -3473,6 +3583,15 @@ document.addEventListener('input', (ev) => {
     // exactly when the download failed and has to be tried again.
     return setDownloadUrls(el.value);
   }
+  if (el.id === 'reset-files') {
+    S.resetFiles = el.checked;
+    return;
+  }
+  if (el.id === 'reset-word') {
+    const go = $('#reset-go');
+    if (go) go.disabled = el.value.trim() !== 'RESET';
+    return;
+  }
   if (el.dataset.filter) {
     S.navFilter[el.dataset.filter] = el.value;
     renderSidebar();
@@ -3603,6 +3722,7 @@ function readUiState() {
       S.playlistId = was.playlistId;
       await loadPlaylist(was.playlistId);
     } else if (['inbox', 'download', 'problems', 'syncList', 'normalize',
+                'utilities',
                 'device'].includes(was.view)) {
       S.view = was.view;
       if (was.view === 'device' && S.devices.some(d => d.id === was.deviceId)) {
