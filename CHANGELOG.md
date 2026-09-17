@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v0.8.0 (2026-09-17)
+
+### Features
+
+- **ui**: Utilities page with library reset
+  ([`c5c1265`](https://github.com/WillNHT/lemon-zest/commit/c5c1265005a0c66138197500878d5ad0520a2bd4))
+
+Adds a Tools > Utilities page whose "Reset library" action forgets every track, playlist,
+  identification and the sync list, and removes the yt-dlp download archive so the same videos can
+  be fetched again. Deleting the audio files from disk is an opt-in checkbox. Library folders,
+  devices, download settings and the saved URL list are kept.
+
+Guarded by a typed RESET confirmation in the page and in the API, and refused while a job is
+  running.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.7.1 (2026-09-17)
 
 ### Bug Fixes
