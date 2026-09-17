@@ -118,6 +118,22 @@ lemon-zest sync "HiBy R1"
 Other commands: `lemon-zest stats`, `lemon-zest device list`, `lemon-zest playlist list`,
 `lemon-zest playlist unmatched`, `lemon-zest log`, `lemon-zest doctor <folder>`.
 
+### Rockbox
+
+Pair with `--profile rockbox`. Music goes to `/Music`, playlists to their own
+`/Playlists` folder, and playlist entries are written from the card's root
+(`/Music/blink-182/…/Stay Together For The Kids.m4a`) rather than relative.
+
+Rockbox also shows a full date tag as the year and draws letterboxed or
+non-4:2:0 JPEG covers badly (padded, or in greyscale). New downloads are
+written with the year only and a square, baseline 4:2:0 cover. For files
+downloaded earlier, fix them once and sync again:
+
+```
+lemon-zest fix-tags --dry-run
+lemon-zest fix-tags
+```
+
 ## Downloading from YouTube
 
 ```bash

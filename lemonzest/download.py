@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 
+from . import artwork
 from . import db
 from . import playlists as pl_mod
 from . import scan as scan_mod
@@ -467,6 +468,13 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         # is a 16:9 video frame. Replacing that with the release's own front
         # cover needs the recording identified first - see enrich.py.
         "--convert-thumbnails", "jpg",
+        # ...and while converting, crop to the centre square and write a
+        # baseline 4:2:0 JPEG: Rockbox shows a 16:9 frame letterboxed and
+        # draws any other JPEG in greyscale. See artwork.py.
+        "--postprocessor-args", artwork.YTDLP_PPA,
+        # yt-dlp writes upload_date (20180201) into the date tag, which
+        # Rockbox shows as the year verbatim. Keep only the year.
+        "--parse-metadata", "%(release_year,upload_date>%Y)s:%(meta_date)s",
         # Long titles become path components; keep them inside what the
         # card's filesystem will accept later.
         "--trim-filenames", "120",

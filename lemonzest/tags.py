@@ -35,7 +35,8 @@ from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
-from .meta import content_key
+from . import artwork
+from .meta import content_key, read_tags
 from .paths import resolve_existing
 
 # One field, three spellings. MP4 uses four-character atoms, ID3 uses frame
@@ -124,6 +125,12 @@ def write(path, fields, cover=None):
     fields = {k: v for k, v in (fields or {}).items() if v not in (None, "")}
     if not fields and not cover:
         return None
+    # A full date reads as the year on Rockbox ("20180201"), and a padded or
+    # 4:4:4 cover draws letterboxed and grey there. Fix both on the way in.
+    if "year" in fields:
+        fields["year"] = artwork.year_only(fields["year"])
+    if cover:
+        cover = artwork.normalise(*cover)
     # The catalog stores NFC; NTFS stores whatever bytes wrote the file, and
     # a yt-dlp download can be NFD. Same name on screen, different bytes to
     # open(), so the stored path opens nothing and the write fails with "no
@@ -213,3 +220,54 @@ def rekey(con, old_key, path, new_key):
         (new_key, old_key))
     con.execute("UPDATE device_manifest SET content_key=? WHERE content_key=?",
                 (new_key, old_key))
+
+
+def read_cover(path):
+    """The first embedded picture as ``(bytes, mime)``, or None."""
+    audio = MutagenFile(path)
+    if audio is None or audio.tags is None:
+        return None
+    if isinstance(audio, MP4):
+        pics = audio.tags.get("covr") or []
+        if not pics:
+            return None
+        pic = pics[0]
+        png = getattr(pic, "imageformat", None) == MP4Cover.FORMAT_PNG
+        return bytes(pic), "image/png" if png else "image/jpeg"
+    if isinstance(audio, FLAC):
+        return ((audio.pictures[0].data, audio.pictures[0].mime)
+                if audio.pictures else None)
+    apic = audio.tags.getall("APIC") if hasattr(audio.tags, "getall") else []
+    return (apic[0].data, apic[0].mime) if apic else None
+
+
+def fix_for_players(con, row):
+    """Trim the year and square the cover of one catalogued file.
+
+    ``row`` needs ``path``, ``content_key`` and ``year``. Returns what was
+    changed, as a list of words; an empty list means nothing needed doing.
+    """
+    real = resolve_existing(row["path"])
+    if not real:
+        raise TagWriteError(f"no such file: {row['path']}")
+    fields, changed = {}, []
+    current = read_tags(real).get("year")
+    if current and artwork.year_only(current) != current:
+        fields["year"] = current
+        changed.append("year")
+    cover = read_cover(real)
+    if cover and not artwork.is_player_safe(cover[0]):
+        changed.append("cover")
+    else:
+        cover = None
+    if not changed:
+        return []
+    new_key = write(real, fields, cover=cover)
+    if new_key:
+        rekey(con, row["content_key"], row["path"], new_key)
+        if "year" in fields:
+            con.execute("UPDATE track SET year=? WHERE path=?",
+                        (artwork.year_only(current), row["path"]))
+        con.commit()
+    return changed
+

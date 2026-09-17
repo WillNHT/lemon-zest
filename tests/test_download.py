@@ -704,6 +704,15 @@ class DownloadTests(unittest.TestCase):
 
     # -------------------------------------------------------------- cookies
 
+    def test_downloads_keep_only_the_year_and_a_square_cover(self):
+        args = download.build_args(self.cfg(), ["u"], self.root)
+        meta = args[args.index("--parse-metadata") + 1]
+        self.assertTrue(meta.endswith(":%(meta_date)s"), meta)
+        self.assertIn("upload_date>%Y", meta)
+        ppa = args[args.index("--postprocessor-args") + 1]
+        self.assertTrue(ppa.startswith("ThumbnailsConvertor+ffmpeg_o:"), ppa)
+        self.assertIn("yuvj420p", ppa)
+
     def test_cookies_off_passes_no_cookie_arguments(self):
         args = download.build_args(self.cfg(), ["u"], self.root)
         self.assertNotIn("--cookies-from-browser", args)
