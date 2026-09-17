@@ -1,6 +1,35 @@
 # CHANGELOG
 
 
+## v0.7.1 (2026-09-17)
+
+### Bug Fixes
+
+- **sync**: Write Rockbox playlist entries from the card root
+  ([`75146f7`](https://github.com/WillNHT/lemon-zest/commit/75146f7a17715bc2baa11c7f4116f22766f589cc))
+
+Rockbox playlists now list tracks as /Music/<artist>/<album>/<file> instead of paths relative to the
+  playlist folder, and keep living in their own /Playlists folder.
+
+Closes #11
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+- **tags**: Year-only dates and square colour covers for Rockbox
+  ([`e08d62f`](https://github.com/WillNHT/lemon-zest/commit/e08d62f032685300a5e1d6062a51a518edeb9329))
+
+Rockbox showed the upload date (20180201) as the year, and drew YouTube thumbnails letterboxed and
+  in greyscale: its JPEG decoder only renders colour for baseline 4:2:0/4:2:2 files.
+
+- downloads keep only the year and convert the thumbnail to a centre square, baseline 4:2:0 JPEG -
+  every tag write trims the year and normalises the cover the same way - new fix-tags command
+  repairs files downloaded before this change
+
+Closes #10
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
 ## v0.7.0 (2026-09-10)
 
 ### Features
