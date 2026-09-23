@@ -57,6 +57,8 @@ _promoted_at = [0.0]
 # reloaded page can still show the outcome.
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+# How a running download is paused or stopped: job id -> DownloadControl.
+CONTROLS = {}
 MAX_JOBS = 50
 # Per job. A download reports every line yt-dlp writes, and the whole run is
 # what someone pastes into a bug report, so the ring has to be long enough
@@ -1152,6 +1154,12 @@ def create_app(db_path=None):
             # eye on. Both come off the same table.
             "recent": dl_mod.recent_urls(c, 5),
             "kept": dl_mod.kept_urls(c),
+            # Paused, stopped, or cut off by the program closing - a record
+            # still marked running with no job behind it is the last kind.
+            "paused": [dict(r, state="interrupted")
+                       if r["state"] == "running" and r["id"] not in CONTROLS
+                       else r for r in dl_mod.paused(c)
+                       if r["id"] not in CONTROLS],
         }
 
     @app.get("/api/download/config")
@@ -1187,10 +1195,19 @@ def create_app(db_path=None):
         """
         job_id = _new_job("download", label or (urls[0] if len(urls) == 1
                                                 else f"{len(urls)} URLs"))
+        control = CONTROLS[job_id] = dl_mod.DownloadControl()
+        # Written down before anything is fetched: if the program is closed
+        # half way through, this is what lets the run be resumed.
+        record = {"id": job_id, "label": label or urls[0], "urls": urls,
+                  "remaining": urls, "root": root,
+                  "playlist": playlist_name, "single": single,
+                  "state": "running", "at": time.time()}
 
         def work():
+            c = None
             try:
                 c = db_mod.connect(app.config["DB_PATH"])
+                dl_mod.save_paused(c, record)
 
                 def on_event(kind, detail, done, total):
                     # Progress moves the bar but is not written down: it is
@@ -1211,7 +1228,13 @@ def create_app(db_path=None):
                 summary = dl_mod.download(
                     c, urls, root=root, playlist=playlist_name,
                     on_event=on_event, on_batch=on_batch,
-                    no_playlist=single, archive=archive)
+                    no_playlist=single, archive=archive, control=control)
+                if summary.get("stopped"):
+                    dl_mod.save_paused(c, dict(
+                        record, remaining=summary["remaining"],
+                        state=summary["stopped"], at=time.time()))
+                else:
+                    dl_mod.save_paused(c, drop=job_id)
                 # The files this run fetched were identified as they
                 # landed, one by one, so there is nothing left to start for
                 # them. Two exceptions, both scoped to the folder rather
@@ -1238,6 +1261,8 @@ def create_app(db_path=None):
                                + (f", {queued} being identified"
                                   if queued else ""))
             except dl_mod.DownloadError as exc:
+                if c is not None:
+                    dl_mod.save_paused(c, drop=job_id)
                 # The log is the point of a failed download: it is what gets
                 # copied into a bug report, so it outlives the job's event
                 # ring rather than only having been streamed past.
@@ -1249,6 +1274,8 @@ def create_app(db_path=None):
                 _update(job_id, state="failed", error=str(exc),
                         finished=time.time())
                 traceback.print_exc()
+            finally:
+                CONTROLS.pop(job_id, None)
 
         threading.Thread(target=work, daemon=True).start()
         return job_id
@@ -1643,6 +1670,39 @@ def create_app(db_path=None):
         return jsonify([dict(r) for r in rows])
 
     # ------------------------------------------------------------ jobs
+
+    @app.post("/api/jobs/<job_id>/<how>")
+    def job_halt(job_id, how):
+        """Pause a download (finish what is in hand) or stop it (now)."""
+        control = CONTROLS.get(job_id)
+        if control is None or how not in ("pause", "stop"):
+            return jsonify({"error": "nothing to pause there"}), 404
+        control.pause() if how == "pause" else control.stop()
+        _update(job_id, detail="pausing - finishing what is in hand"
+                if how == "pause" else "stopping")
+        return jsonify({"ok": True, "mode": control.mode})
+
+    @app.post("/api/download/paused/<rid>/resume")
+    def download_resume(rid):
+        """Run a paused download again: the same URLs, taking only what
+        it had not reached - the archive and the catalog skip the rest, and
+        the playlist is rebuilt whole from the source."""
+        c = con()
+        rec = next((r for r in dl_mod.paused(c) if r["id"] == rid), None)
+        if rec is None:
+            return jsonify({"error": "no such paused download"}), 404
+        if not dl_mod.ytdlp_command():
+            return jsonify({"error": "yt-dlp is not installed"}), 400
+        dl_mod.save_paused(c, drop=rid)
+        return jsonify({"job": _run_download(
+            rec["urls"], root=rec.get("root"),
+            playlist_name=rec.get("playlist"), single=rec.get("single"),
+            archive=True, label=rec.get("label"))})
+
+    @app.delete("/api/download/paused/<rid>")
+    def download_forget(rid):
+        dl_mod.save_paused(con(), drop=rid)
+        return jsonify({"ok": True})
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):

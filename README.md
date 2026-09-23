@@ -182,6 +182,25 @@ An album or EP is not a playlist. YouTube Music serves one as a playlist URL
 filed under the album, and no playlist is made for it. Album playlists made
 by earlier versions are dropped from the catalog and from beside the library.
 
+### Big libraries: several at once, pause and resume
+
+A playlist is split into its videos and fetched **three at a time** (one to
+four, under *Where files land*), each yt-dlp on its own with its own
+progress bar. One process at a time spent most of each item waiting - on
+the page, the signature challenge, ffmpeg - with the network idle.
+Identification was already off the download's path (its own queue, one
+MusicBrainz request a second), so it never held a download back; it simply
+finishes later.
+
+Before anything is fetched, every video the library already has is taken
+off the list - by the download archive and by the catalog, so a file
+renamed or re-tagged since is still recognised as that video.
+
+**Pause** lets the videos in hand finish and starts no more; **Stop now**
+kills them. Either way the run is kept under **Paused downloads** and
+**Resume** runs it again, taking only what it had not reached - and a run
+cut off by closing the program is kept the same way, as *interrupted*.
+
 Two things stop a second run re-fetching what you already have. yt-dlp keeps
 a download archive at `.lemon-zest-downloads.txt` in the folder (pass
 `--no-archive` to ignore it), and adding a track to a playlist it is already

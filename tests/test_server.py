@@ -248,6 +248,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.c.get("/api/unlisted").get_json()["ignore"],
                          ["mix"])
 
+    def test_a_download_cut_off_by_closing_is_offered_back(self):
+        from lemonzest import download
+        con = db.connect(self.db_path)
+        download.save_paused(con, {"id": "gone", "label": "big list",
+                                   "urls": ["https://example.test/list"],
+                                   "remaining": ["https://example.test/list"],
+                                   "state": "running", "at": time.time()})
+        con.close()
+        rows = self.c.get("/api/download/config").get_json()["paused"]
+        # Marked running, but no job is: the program was closed mid-run.
+        self.assertEqual([(r["id"], r["state"]) for r in rows],
+                         [("gone", "interrupted")])
+        self.c.delete("/api/download/paused/gone")
+        self.assertEqual(
+            self.c.get("/api/download/config").get_json()["paused"], [])
+        self.assertEqual(self.c.post("/api/jobs/nojob/pause").status_code, 404)
+
     def test_a_playlist_narrows_the_same_library_query(self):
         pid = self.c.get("/api/playlists").get_json()[0]["id"]
         d = self.c.get("/api/library?playlist=%d" % pid).get_json()

@@ -24,6 +24,7 @@ optional: plenty of videos need no cookies at all, so the default mode tries
 Firefox, falls back to the file, and then proceeds without cookies rather
 than refusing to start.
 """
+import bisect
 import os
 import queue
 import re
@@ -105,9 +106,20 @@ CONFIG_DEFAULTS = {
     "audio_format": "m4a",
     "audio_quality": "0",       # 0 is yt-dlp's best
     "js_runtimes": EXTRA_JS_RUNTIMES,   # blank leaves yt-dlp's deno-only default
+    "workers": "3",             # videos fetched at once; see MAX_WORKERS
 }
 _PREFIX = "download."
 
+
+# How many videos are fetched at once, at most. One yt-dlp at a time spent
+# most of each item waiting - on the page, on the signature challenge, on
+# ffmpeg - with the network idle. A few side by side fill that time; more
+# than this and YouTube starts refusing, which costs more than it saves.
+MAX_WORKERS = 4
+# How many arrivals a progress report carries. A run of three thousand
+# files is three thousand rows, and the page polls several times a second.
+# ponytail: newest-by-position only; page the list if older rows matter.
+REPORT_ITEMS = 300
 
 # How much of a run is kept for the log. A playlist of a few hundred videos
 # is chatty; this is enough to see the whole of a normal run and the end of
@@ -612,7 +624,7 @@ def probe(url, cfg, timeout=120):
                          ).get("url"),
         "entries": [{"title": e.get("title"), "duration": e.get("duration"),
                      "url": e.get("url") or e.get("id")}
-                    for e in entries[:200]],
+                    for e in entries],
     }
 
 
@@ -762,6 +774,12 @@ def _new_batch(urls):
             "failed": 0, "urls": len(urls), "listed": False,
             "started": time.time(), "finished": None,
             "current": None,
+            # What each worker is fetching right now, one slot per worker.
+            # `current` is the first of them, for callers that show one.
+            "active": [], "workers": 1,
+            # Set when the run was paused or stopped, with how many items
+            # it did not get to. Those are what a resume fetches.
+            "stopped": None, "remaining": 0,
             # One entry per file that arrives, carrying what has happened to
             # it since. A download used to be a single bar and a log; the
             # thing a person actually wants to know is which of their forty
@@ -795,6 +813,105 @@ def _count_items(urls, cfg, log):
 
 
 _ERROR_LINE = re.compile(r"^\s*ERROR:", re.I)
+
+
+class DownloadControl:
+    """How a running download is paused or stopped from outside it.
+
+    ``pause`` lets what is being fetched finish and starts nothing more;
+    ``stop`` kills what is being fetched as well. Either way the items not
+    reached are reported back, so the same run can be started again later
+    and take only those - the archive skips what did arrive.
+    """
+
+    def __init__(self):
+        self.mode = None
+        self._procs = set()
+        self._lock = threading.Lock()
+
+    def halted(self):
+        return self.mode is not None
+
+    def pause(self):
+        self.mode = self.mode or "paused"
+
+    def stop(self):
+        self.mode = "stopped"
+        with self._lock:
+            procs = list(self._procs)
+        for proc in procs:
+            _kill_tree(proc)
+
+    def started(self, proc):
+        with self._lock:
+            self._procs.add(proc)
+        if self.mode == "stopped":
+            _kill_tree(proc)
+
+    def finished(self, proc):
+        with self._lock:
+            self._procs.discard(proc)
+
+
+def _kill_tree(proc):
+    """yt-dlp and the ffmpeg it started: killing only the first on Windows
+    leaves the second writing into the library."""
+    try:
+        import psutil
+        for child in psutil.Process(proc.pid).children(recursive=True):
+            child.kill()
+    except Exception:      # noqa: BLE001 - already gone is fine
+        pass
+    try:
+        proc.kill()
+    except Exception:      # noqa: BLE001
+        pass
+
+
+def _units(urls, probes, no_playlist):
+    """One unit of work per video, in the order the sources list them.
+
+    A playlist that listed is split into its entries, so several can be
+    fetched at once and a pause can stop between them. Anything that did
+    not list - or a URL fetched as a single video - goes to yt-dlp whole.
+    """
+    units = []
+    for url in urls:
+        info = (probes or {}).get(url)
+        entries = (info or {}).get("entries") or []
+        if no_playlist or not entries:
+            units.append({"url": url, "source": url, "entry": False,
+                          "title": (info or {}).get("title") or url,
+                          "vid": video_id(url) if not entries else None})
+            continue
+        for e in entries:
+            if e.get("url"):
+                units.append({"url": e["url"], "source": url, "entry": True,
+                              "title": e.get("title") or e["url"],
+                              "vid": video_id(e["url"])})
+    for n, unit in enumerate(units, 1):
+        unit["n"] = n
+    return units
+
+
+def _already_have(con, root):
+    """Video ids this library already holds: the archive's, and the
+    catalog's - a file renamed, re-tagged or moved since is still that
+    video, and fetching it again would put a second copy in the library."""
+    have = set()
+    try:
+        with open(os.path.join(root, ARCHIVE_NAME), encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "youtube":
+                    have.add(parts[1])
+    except OSError:
+        pass
+    for row in con.execute("SELECT purl FROM track WHERE purl IS NOT NULL"):
+        vid = video_id(row["purl"])
+        if vid:
+            have.add(vid)
+    return have
 
 
 def _write_date(path, released, log):
@@ -849,6 +966,31 @@ def remember_url(con, url, info=None, playlist_name=None, root=None,
         con.execute("UPDATE download_url SET " + ", ".join(sets)
                     + " WHERE url = ?", params + [url])
     con.commit()
+
+
+# Downloads paused, stopped or cut off by the program closing, kept so they
+# can be resumed. In the catalog rather than in memory: a run of thousands
+# outlives the process that started it.
+PAUSED_KEY = "paused_downloads"
+
+
+def paused(con):
+    import json
+    try:
+        return json.loads(db.meta_get(con, PAUSED_KEY) or "[]")
+    except ValueError:
+        return []
+
+
+def save_paused(con, record=None, drop=None):
+    """Add or replace ``record`` (by id), or drop the one with id ``drop``."""
+    import json
+    rows = [r for r in paused(con)
+            if r["id"] not in (drop, (record or {}).get("id"))]
+    if record:
+        rows.insert(0, record)
+    db.meta_set(con, PAUSED_KEY, json.dumps(rows, ensure_ascii=False))
+    return rows
 
 
 def recent_urls(con, limit=5):
@@ -932,7 +1074,8 @@ def _auto_playlists(con, urls, cfg, probes, downloaded, log):
 
 def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
              on_batch=None, no_playlist=False, archive=True, output=None,
-             audio_format=None, audio_quality=None, pipeline=True):
+             audio_format=None, audio_quality=None, pipeline=True,
+             control=None):
     """Download ``urls`` into a library folder and index what arrives.
 
     Returns a summary dict. The files that arrive are indexed one by one
@@ -948,6 +1091,10 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     fetched, and only then begin a rate-limited pass that took as long
     again. Pass ``pipeline=False`` to index at the end instead and leave
     identification to the caller.
+
+    Several videos are fetched at once - ``workers`` in the config - and
+    ``control``, a :class:`DownloadControl`, pauses or stops the run from
+    outside it. What it did not reach is in the summary's ``remaining``.
     """
     cfg = cfg or get_config(con)
     urls = [u.strip() for u in ([urls] if isinstance(urls, str) else urls)
@@ -971,15 +1118,19 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     # needs.
     lock = threading.Lock()
 
+    def snapshot():
+        """A copy: this dict keeps changing under whoever holds it."""
+        with lock:
+            out = dict(batch)
+            out["current"] = (dict(batch["current"])
+                              if batch["current"] else None)
+            out["active"] = [dict(a) if a else None for a in batch["active"]]
+            out["items"] = [dict(i) for i in batch["items"][-REPORT_ITEMS:]]
+        return out
+
     def report():
-        """Hand the caller a copy: this dict keeps changing under them."""
         if on_batch:
-            with lock:
-                snapshot = dict(batch)
-                snapshot["current"] = (dict(batch["current"])
-                                       if batch["current"] else None)
-                snapshot["items"] = [dict(i) for i in batch["items"]]
-            on_batch(snapshot)
+            on_batch(snapshot())
 
     emit("start", "%d URL%s" % (len(urls), "" if len(urls) == 1 else "s"))
     report()
@@ -996,9 +1147,32 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     batch["listed"] = True
     report()
 
-    args = build_args(cfg, urls, root, no_playlist=no_playlist,
-                      archive=archive, output=output,
-                      audio_format=audio_format, audio_quality=audio_quality)
+    units = _units(urls, probes, no_playlist)
+    have = _already_have(con, root) if archive else set()
+    todo, seen_vids = [], set()
+    for unit in units:
+        if unit["vid"] and (unit["vid"] in have or unit["vid"] in seen_vids):
+            # Already here, or already asked for by another URL in this run.
+            batch["skipped"] += 1
+            batch["done"] += 1
+            continue
+        if unit["vid"]:
+            seen_vids.add(unit["vid"])
+        todo.append(unit)
+    workers = max(1, min(MAX_WORKERS, _number(cfg.get("workers")) or 1,
+                         len(todo) or 1))
+    batch["workers"] = workers
+    batch["active"] = [None] * workers
+    control = control or DownloadControl()
+
+    def args_for(unit):
+        return build_args(cfg, [unit["url"]], root,
+                          no_playlist=no_playlist or unit["entry"],
+                          archive=archive, output=output,
+                          audio_format=audio_format,
+                          audio_quality=audio_quality)
+
+    args = args_for(todo[0] if todo else units[0])
 
     # The whole run, kept for the person reading it afterwards: the command
     # first, because "what did it actually run" is the first question asked
@@ -1007,15 +1181,22 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     log = ["$ " + _printable(args)]
     emit("command", log[0])
     log.extend(listing_log)
-    if batch["total"]:
-        line = "batch: %d item%s to fetch" % (batch["total"],
-                                              "" if batch["total"] == 1 else "s")
-        log.append(line)
-        emit("output", line)
+    for line, show in (
+            ("batch: %d item%s to fetch" % (
+                batch["total"], "" if batch["total"] == 1 else "s"),
+             batch["total"]),
+            ("%d already in the library - not fetched again"
+             % batch["skipped"], batch["skipped"]),
+            ("fetching %d at a time" % workers, workers > 1)):
+        if show:
+            log.append(line)
+            emit("output", line)
+    report()
 
     files = []
     tail = []
-    skipped = 0      # already in the download archive
+    codes = []
+    remaining = []
 
     # Everything each finished file still needs doing to it, on a thread of
     # its own: catalogued here, and handed to the identification queue,
@@ -1091,85 +1272,163 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         worker = threading.Thread(target=pipeline_worker, daemon=True)
         worker.start()
 
-    released = None
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True,
-                            encoding="utf-8", errors="replace", bufsize=1,
-                            env=_child_env())
-    try:
-        for line in proc.stdout:
-            line = line.rstrip("\r\n")
-            if not line:
-                continue
-            if line.startswith(PROGRESS_PREFIX):
-                p = _parse_progress(line)
-                batch["current"] = {
-                    "title": p["title"] or "downloading",
-                    "index": p["index"], "count": p["count"],
-                    "bytes": p["bytes"] or 0,
-                    "bytes_total": p["bytes_total"] or 0,
-                    "speed": p["speed"], "eta": p["eta"],
-                }
-                # A playlist yt-dlp is further into than our own counters
-                # believe - the archive skips it printed before we started
-                # counting, say - moves the batch forward rather than
-                # letting it sit still while the numbers disagree.
-                if p["index"] and len(urls) == 1:
-                    batch["done"] = max(batch["done"], p["index"] - 1)
-                emit("progress", p["title"] or "downloading",
-                     batch["done"], batch["total"])
-                report()
-                continue
-            if line.startswith(DATE_PREFIX):
-                released = line[len(DATE_PREFIX):].strip()
-                continue
-            if line.startswith(FILE_PREFIX):
-                path = line[len(FILE_PREFIX):].strip()
-                if path:
+    last_report = [0.0]
+    arrived = [sum(1 for u in units if u["entry"])]
+
+    def count(outcome):
+        with lock:
+            batch[outcome] += 1
+            batch["done"] += 1
+            batch["total"] = max(batch["total"], batch["done"])
+
+    def note(line, keep_tail=True):
+        with lock:
+            if keep_tail:
+                tail.append(line)
+                del tail[:-60]
+            log.append(line)
+            del log[:-MAX_LOG]
+
+    def slot_is(slot, now):
+        with lock:
+            batch["active"][slot] = now
+            batch["current"] = next((a for a in batch["active"] if a), None)
+
+    def fetch(unit, slot):
+        """One unit through yt-dlp. False when it was cut off unfinished."""
+        released = None
+        ended = 0
+        proc = subprocess.Popen(args_for(unit), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1,
+                                env=_child_env())
+        control.started(proc)
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith(PROGRESS_PREFIX):
+                    p = _parse_progress(line)
+                    slot_is(slot, {
+                        "title": p["title"] or unit["title"],
+                        "index": unit["n"] if unit["entry"] else p["index"],
+                        "count": len(units) if unit["entry"] else p["count"],
+                        "bytes": p["bytes"] or 0,
+                        "bytes_total": p["bytes_total"] or 0,
+                        "speed": p["speed"], "eta": p["eta"], "slot": slot,
+                    })
+                    # One URL handed to yt-dlp whole: its own position in
+                    # the list is the best count there is.
+                    if not unit["entry"] and p["index"] and len(units) == 1:
+                        with lock:
+                            batch["done"] = max(batch["done"], p["index"] - 1)
+                    emit("progress", p["title"] or unit["title"],
+                         batch["done"], batch["total"])
+                    # Several workers talk at once; the page needs a picture
+                    # a few times a second, not one per chunk.
+                    if (time.time() - last_report[0] > 0.25
+                            or p["bytes"] == p["bytes_total"]):
+                        last_report[0] = time.time()
+                        report()
+                    continue
+                if line.startswith(DATE_PREFIX):
+                    released = line[len(DATE_PREFIX):].strip()
+                    continue
+                if line.startswith(FILE_PREFIX):
+                    path = line[len(FILE_PREFIX):].strip()
+                    if not path:
+                        continue
                     _write_date(path, released, log)
                     released = None
-                    files.append(path)
-                    log.append("wrote " + path)
-                    del log[:-MAX_LOG]
-                    batch["downloaded"] += 1
-                    batch["done"] += 1
-                    batch["total"] = max(batch["total"], batch["done"])
-                    batch["current"] = None
-                    item = {"n": len(batch["items"]) + 1,
-                            "title": os.path.splitext(
+                    ended += 1
+                    with lock:
+                        files.append(path)
+                        if unit["entry"]:
+                            n = unit["n"]
+                        else:
+                            arrived[0] += 1
+                            n = arrived[0]
+                    note("wrote " + path, keep_tail=False)
+                    count("downloaded")
+                    item = {"n": n, "title": os.path.splitext(
                                 os.path.basename(path))[0],
                             "path": norm(path), "state": "queued",
                             "detail": "waiting to be identified",
-                            "enrich": None}
+                            "enrich": None, "source": unit["source"],
+                            "url": unit["url"]}
+                    slot_is(slot, None)
                     with lock:
-                        batch["items"].append(item)
+                        bisect.insort(batch["items"], item,
+                                      key=lambda i: i["n"])
                     if worker:
                         arrivals.put(item)
                     emit("file", path, batch["done"], batch["total"])
                     report()
-                continue
-            if _ARCHIVED.search(line):
-                skipped += 1
-                batch["skipped"] += 1
-                batch["done"] += 1
-                batch["total"] = max(batch["total"], batch["done"])
-                report()
-            elif _ERROR_LINE.search(line):
-                # One item, one failure: yt-dlp prints its ERROR line once
-                # per item it gives up on, and the continuation lines that
-                # sometimes follow do not start with ERROR.
-                batch["failed"] += 1
-                batch["done"] += 1
-                batch["total"] = max(batch["total"], batch["done"])
-                report()
-            tail.append(line)
-            del tail[:-60]
-            log.append(line)
-            del log[:-MAX_LOG]
-            emit("error" if "ERROR" in line else "output", line)
-    finally:
-        proc.stdout.close()
-        code = proc.wait()
+                    continue
+                if _ARCHIVED.search(line):
+                    ended += 1
+                    count("skipped")
+                    report()
+                elif _ERROR_LINE.search(line):
+                    # One item, one failure: yt-dlp prints its ERROR line
+                    # once per item it gives up on.
+                    ended += 1
+                    count("failed")
+                    report()
+                note(line)
+                emit("error" if "ERROR" in line else "output", line)
+        finally:
+            proc.stdout.close()
+            code = proc.wait()
+            control.finished(proc)
+            slot_is(slot, None)
+            with lock:
+                codes.append(code)
+        if not ended and control.mode == "stopped":
+            return False
+        if not ended and unit["entry"]:
+            # An item has to end somehow for the numbers to add up: a
+            # non-zero exit that printed no ERROR is still a failure, and a
+            # clean one that printed nothing had nothing to do.
+            count("failed" if code else "skipped")
+        return True
+
+    pending = queue.Queue()
+    for unit in todo:
+        pending.put(unit)
+
+    def work(slot):
+        while not control.halted():
+            try:
+                unit = pending.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if not fetch(unit, slot):
+                    with lock:
+                        remaining.append(unit)
+            except Exception as exc:      # noqa: BLE001 - one unit, not the run
+                note("could not run yt-dlp for %s: %s" % (unit["url"], exc))
+                count("failed")
+
+    threads = [threading.Thread(target=work, args=(slot,), daemon=True)
+               for slot in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    while not pending.empty():
+        remaining.append(pending.get_nowait())
+    remaining.sort(key=lambda u: u["n"])
+    code = next((c for c in codes if c), 0)
+    if control.halted():
+        batch["stopped"] = control.mode
+        batch["remaining"] = len(remaining)
+        line = "%s with %d item%s not fetched - resume to fetch them" % (
+            control.mode, len(remaining), "" if len(remaining) == 1 else "s")
+        note(line, keep_tail=False)
+        emit("output", line)
 
     # yt-dlp is done; the worker may not be. The last file to arrive is
     # still being looked up, and the run is not finished until it is - the
@@ -1188,7 +1447,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
 
     # A partial success is the normal outcome for a playlist with one dead
     # video in it, so a non-zero exit only aborts when nothing was fetched.
-    if code != 0 and not files:
+    if code != 0 and not files and not control.halted():
         text = "\n".join(tail)
         last = next((l for l in reversed(tail) if l.strip()), "")
         log.append("yt-dlp exited with status %d, having written nothing"
@@ -1227,6 +1486,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     # permanently invisible. A rescan of the root is stat-only for the
     # thousands of files that have not changed, so it costs little and is
     # the one thing that cannot miss them.
+    skipped = batch["skipped"]
     if skipped:
         log.append("%d already in the download archive; rescanning %s to "
                    "catalog anything an earlier run left behind"
@@ -1241,9 +1501,10 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         # Everything the request asked for, not merely what this run
         # fetched: the skipped ones belong in the playlist too, and asking
         # the source for its own order beats the order they downloaded in.
+        # In the source's order, which several workers do not keep.
         wanted = _requested_track_ids(con, urls, cfg, track_ids, log,
                                       probes=probes) \
-            if skipped else track_ids
+            if probes else track_ids
         if wanted:
             made.append(pl_mod.append_tracks(con, playlist, wanted,
                                              origin="download"))
@@ -1312,7 +1573,13 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         # and what became of each one. The interface shows this while the
         # run is going and keeps it afterwards, which is the difference
         # between a log you have to read and a batch you can see.
+        # The live dict, not a copy: the queue goes on writing into it as
+        # it identifies what arrived, and the page is still watching.
         "batch": batch,
+        # Paused or stopped, and what it did not get to - the URLs a resume
+        # hands back to yt-dlp. None and empty for a run that finished.
+        "stopped": control.mode,
+        "remaining": [u["url"] for u in remaining],
     }
     emit("done", "%d downloaded" % len(arrived), len(arrived), len(arrived))
     return summary

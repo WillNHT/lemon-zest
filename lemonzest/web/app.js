@@ -1811,6 +1811,30 @@ function renderQueue() {
   </div>`;
 }
 
+/* Downloads paused or stopped part way, and what each has left.
+
+   A library of thousands takes hours; a run that was paused - or cut off by
+   closing the program - is kept here and resumed with one click, which
+   fetches only what it had not reached. */
+function renderPaused(d) {
+  const rows = d.paused || [];
+  if (!rows.length) return '';
+  const running = !!(S.job && S.job.kind === 'download'
+                     && S.job.state === 'running');
+  return `<div class="card">
+    <header><h3>Paused downloads</h3><span class="tag">${num(rows.length)}</span></header>
+    <div class="in scrollbox">${rows.map(r => `<div class="urlrow">
+      <span class="clip" style="flex:1" title="${h(r.urls.join(' '))}">
+        <b>${h(r.label)}</b>
+        <span class="tag">${num(r.remaining.length)} left</span>
+        <span class="u">${h(r.state)} ${h(ago(r.at))}</span></span>
+      <button class="btn sm primary" data-dl-resume="${h(r.id)}"
+        ${running ? 'disabled' : ''}>Resume</button>
+      <button class="btn sm" data-dl-forget="${h(r.id)}">Forget</button>
+    </div>`).join('')}</div>
+  </div>`;
+}
+
 /* The last few URLs asked for.
 
    The alternative is going back to the browser to find the link again,
@@ -1891,8 +1915,29 @@ function renderBatch(batch, running) {
   const left = done > 0 && total > done && running
     ? (elapsed / done) * (total - done) : null;
 
-  const c = batch.current;
-  const cpct = c && c.bytes_total ? (100 * c.bytes) / c.bytes_total : 0;
+  // One bar per worker: several videos are fetched at once, and each has
+  // its own bytes. Older reports carry only `current`.
+  const active = (batch.active && batch.active.length
+    ? batch.active : [batch.current]).filter(Boolean);
+  const nowBar = (c) => {
+    const cpct = c.bytes_total ? (100 * c.bytes) / c.bytes_total : 0;
+    return `<div class="now">
+        <div class="hstack">
+          <span class="tag">NOW</span>
+          <span class="clip" style="flex:1" title="${h(c.title)}">${h(c.title)}</span>
+          ${c.index && c.count ? `<span class="faint mono" style="font-size:10px"
+            >#${num(c.index)} of ${num(c.count)} in this list</span>` : ''}
+        </div>
+        <div class="bar" style="margin-top:5px"><i style="width:${cpct.toFixed(1)}%"></i></div>
+        <div class="hstack faint mono" style="font-size:10px;margin-top:4px">
+          <span>${h(bytes(c.bytes))}${c.bytes_total
+            ? ' of ' + h(bytes(c.bytes_total)) : ''}</span>
+          <span class="grow" style="flex:1"></span>
+          <span>${h([rate(c.speed), c.eta ? span(c.eta) + ' left' : '']
+            .filter(Boolean).join(' \u00b7 '))}</span>
+        </div>
+      </div>`;
+  };
   // Identified, not merely fetched: a track is only finished when its tags
   // are right, so that is the number worth putting beside the downloads.
   const named = (batch.items || []).filter(i => i.enrich === 'applied').length;
@@ -1935,22 +1980,19 @@ function renderBatch(batch, running) {
         <span class="grow" style="flex:1"></span>
         <span class="faint mono" style="font-size:10px">${pct.toFixed(0)}%</span>
       </div>
-      ${c ? `<div class="now">
-        <div class="hstack">
-          <span class="tag">NOW</span>
-          <span class="clip" style="flex:1" title="${h(c.title)}">${h(c.title)}</span>
-          ${c.index && c.count ? `<span class="faint mono" style="font-size:10px"
-            >#${num(c.index)} of ${num(c.count)} in this list</span>` : ''}
-        </div>
-        <div class="bar" style="margin-top:5px"><i style="width:${cpct.toFixed(1)}%"></i></div>
-        <div class="hstack faint mono" style="font-size:10px;margin-top:4px">
-          <span>${h(bytes(c.bytes))}${c.bytes_total
-            ? ' of ' + h(bytes(c.bytes_total)) : ''}</span>
-          <span class="grow" style="flex:1"></span>
-          <span>${h([rate(c.speed), c.eta ? span(c.eta) + ' left' : '']
-            .filter(Boolean).join(' \u00b7 '))}</span>
-        </div>
+      ${active.slice(0, 4).map(nowBar).join('')}
+      ${running ? `<div class="hstack" style="margin-top:8px">
+        <span class="faint" style="font-size:10px">${num(batch.workers || 1)}
+          at a time. Pause lets these finish; Stop cuts them off. Either way
+          the rest can be resumed later.</span>
+        <span class="grow" style="flex:1"></span>
+        <button class="btn sm" data-dl-halt="pause">Pause</button>
+        <button class="btn sm" data-dl-halt="stop">Stop now</button>
       </div>` : ''}
+      ${!running && batch.stopped ? `<div class="notice warn" style="margin-top:8px">
+        ${icon('i-warn')}<div>${h(batch.stopped === 'stopped' ? 'Stopped' : 'Paused')}
+        with ${num(batch.remaining)} item${batch.remaining === 1 ? '' : 's'}
+        not fetched. Resume them from <b>Paused downloads</b> below.</div></div>` : ''}
       ${renderItems(batch.items)}
     </div>
   </div>`;
@@ -2071,9 +2113,9 @@ function renderDownload() {
                 ? ', ' + num(pl.skipped) + ' were already in it' : ''} -
               ${num(pl.entries)} entries.</div>`).join('')}
           </div></div>
-          <table class="tbl"><tbody>${res.files.map(f => `<tr>
+          <div class="scrollbox"><table class="tbl"><tbody>${res.files.map(f => `<tr>
             <td class="mono clip pick" title="${h(f)}">${h(f.slice(res.root.length + 1))}</td>
-          </tr>`).join('')}</tbody></table>`
+          </tr>`).join('')}</tbody></table></div>`
         : `<div class="notice">${icon('i-warn')}<div>Nothing new - every URL
             was already in the download archive, or nothing could be fetched.
             The log below says which.</div></div>`) : ''}
@@ -2082,6 +2124,7 @@ function renderDownload() {
       </div>
     </div>
 
+    ${renderPaused(d)}
     ${renderQueue()}
     ${renderKept(d)}
     ${renderRecent(d)}
@@ -2175,6 +2218,11 @@ function renderDownload() {
         <form id="dl-output-form" class="hstack">
           <input name="output" value="${h(cfg.output)}"
             style="${field};flex:1;font-family:var(--mono)">
+          <label class="muted" title="Videos fetched at once">At a time</label>
+          <select name="workers" style="${field}">
+            ${['1', '2', '3', '4'].map(n =>
+              `<option ${String(cfg.workers) === n ? 'selected' : ''}>${n}</option>`).join('')}
+          </select>
           <select name="audio_format" style="${field}">
             ${['m4a', 'mp3', 'opus', 'flac'].map(f =>
               `<option ${cfg.audio_format === f ? 'selected' : ''}>${f}</option>`).join('')}
@@ -3192,6 +3240,7 @@ document.addEventListener('click', (ev) => {
     + '[data-play],[data-play-close],[data-useurl],[data-keep],[data-unkeep],'
     + '[data-keeprun],[data-pl-refresh],[data-sl-remove],[data-sl-clear],'
     + '[data-queue],[data-reset-open],[data-reset-go],[data-maint],'
+    + '[data-dl-halt],[data-dl-resume],[data-dl-forget],'
     + '[data-sl-apply],[data-pl-tolist],'
     + '[data-close-inspector],[data-dismiss-outcome],'
     + '[data-root-hide],[data-root-remove],[data-root-forget],'
@@ -3249,6 +3298,25 @@ document.addEventListener('click', (ev) => {
     });
   }
 
+  if (d.dlHalt) {
+    if (!S.job) return;
+    return guard(async () => {
+      await api('/jobs/' + S.job.id + '/' + d.dlHalt, { method: 'POST' });
+    });
+  }
+  if (d.dlResume || d.dlForget) {
+    return guard(async () => {
+      const res = await api('/download/paused/' + (d.dlResume || d.dlForget)
+        + (d.dlResume ? '/resume' : ''), { method: d.dlResume ? 'POST' : 'DELETE' });
+      if (res.job) {
+        S.dlResult = null;
+        S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
+                  total: 0, label: 'resume' };
+        watchJob(res.job, (job) => jobFinished(job));
+      }
+      await loadDownload();
+    });
+  }
   if (d.maint) {
     return guard(async () => {
       const res = await api('/maintenance/' + d.maint, { method: 'POST' });

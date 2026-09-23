@@ -49,6 +49,14 @@ if "-J" in args:
                                   "entries": entries}))
     sys.exit(0)
 
+# One entry of the listing, as the parallel workers ask for it: write only
+# that entry's file. Anything else is the whole URL, and writes them all.
+every = names
+import re
+entry = re.search(r"example\\.test/(\\d+)$", args[-1])
+if entry:
+    names = [every[int(entry.group(1))]]
+
 out = args[args.index("-o") + 1]
 paths = [args[i + 1] for i, a in enumerate(args) if a == "-P"]
 home = next((p[len("home:"):] for p in paths if p.startswith("home:")), "")
@@ -69,12 +77,14 @@ for name in names:
     path = os.path.join(root, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
-        fh.write(b"\\0" * 2048)
-    idx = names.index(name) + 1
+        # Different bytes per file, as real downloads have: identical ones
+        # share a content key, and the queue rightly looks that up once.
+        fh.write(name.encode("utf-8") + b"\\0" * 2048)
+    idx = every.index(name) + 1
     print("[lz-progress]1024|2048|%d|%d|512000|3|%s"
-          % (idx, len(names), os.path.basename(name)))
+          % (idx, len(every), os.path.basename(name)))
     print("[lz-progress]2048|2048|%d|%d|512000|0|%s"
-          % (idx, len(names), os.path.basename(name)))
+          % (idx, len(every), os.path.basename(name)))
     print("[lz-file]" + path)
     if archive:
         with open(archive, "a", encoding="utf-8") as fh:
@@ -406,6 +416,85 @@ class DownloadTests(unittest.TestCase):
         self.assertGreater(elapsed, 1.5, "the stub should have lingered")
         self.assertLess(first_output, 1.0,
                         "output was withheld until the process exited")
+
+    # ------------------------------------------------ workers, pause, stop
+
+    def test_a_playlist_is_fetched_several_at_a_time(self):
+        os.environ["LZ_FAKE_FILES"] = ";".join(
+            "A/x/%d.m4a" % i for i in range(6))
+        seen = []
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root,
+                                    cfg=self.cfg(workers="3"),
+                                    on_batch=seen.append)
+        self.assertEqual(summary["downloaded"], 6)
+        self.assertEqual(summary["batch"]["workers"], 3)
+        self.assertEqual([i["n"] for i in summary["batch"]["items"]],
+                         [1, 2, 3, 4, 5, 6])
+
+    def test_what_the_catalog_has_is_not_fetched_again(self):
+        """Renamed or re-tagged since, a video is still that video."""
+        self.con.execute(
+            "INSERT INTO track(path, rel_path, root, size, mtime, content_key,"
+            " ext, purl, seen_at) VALUES ('x', 'x', 'r', 1, 0, 'k', '.m4a', "
+            "'https://www.youtube.com/watch?v=aaaaaaaaaaa', 0)")
+        units = download._units(
+            ["L"], {"L": {"entries": [
+                {"url": "https://www.youtube.com/watch?v=aaaaaaaaaaa"},
+                {"url": "https://www.youtube.com/watch?v=bbbbbbbbbbb"}]}},
+            False)
+        have = download._already_have(self.con, self.root)
+        self.assertEqual([u["vid"] in have for u in units], [True, False])
+
+    def _run_with(self, control, **cfg):
+        out = {}
+
+        def go():
+            out["summary"] = download.download(
+                self.con_for_thread(), ["https://example.test/list"],
+                root=self.root, cfg=self.cfg(**cfg), control=control,
+                on_event=lambda k, d, done, tot: (
+                    out.setdefault("first", time.time()) if k == "file"
+                    else None))
+        import threading
+        t = threading.Thread(target=go)
+        t.start()
+        return t, out
+
+    def con_for_thread(self):
+        return db.connect(os.path.join(self.tmp, "catalog.db"))
+
+    def test_a_pause_finishes_the_item_in_hand_and_starts_no_more(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a;A/x/three.m4a"
+        os.environ["LZ_FAKE_LINGER"] = "0.5"
+        control = download.DownloadControl()
+        t, out = self._run_with(control, workers="1")
+        while "first" not in out and t.is_alive():
+            time.sleep(0.02)
+        control.pause()
+        t.join(timeout=20)
+        summary = out["summary"]
+        self.assertEqual(summary["stopped"], "paused")
+        self.assertEqual(summary["downloaded"], 1)
+        self.assertEqual(summary["remaining"], ["https://example.test/1",
+                                                "https://example.test/2"])
+
+    def test_a_stop_kills_what_is_being_fetched(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        os.environ["LZ_FAKE_LINGER"] = "30"
+        control = download.DownloadControl()
+        t, out = self._run_with(control, workers="2")
+        while "first" not in out and t.is_alive():
+            time.sleep(0.02)
+        started = time.time()
+        control.stop()
+        t.join(timeout=20)
+        self.assertLess(time.time() - started, 10, "yt-dlp was not killed")
+        summary = out["summary"]
+        self.assertEqual(summary["stopped"], "stopped")
+        # Both wrote their file before lingering; neither is owed again.
+        self.assertEqual(summary["downloaded"], 2)
+        self.assertEqual(summary["remaining"], [])
 
     def test_several_files_from_one_url(self):
         os.environ["LZ_FAKE_FILES"] = "A/Album/one.m4a;A/Album/two.m4a"
