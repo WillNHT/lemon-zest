@@ -976,7 +976,7 @@ function renderInspector() {
         ${line('album', value('album'))}
         ${line('album artist', value('album_artist'))}
         ${line('genre', value('genre') || '\u2014')}
-        ${line('released', releaseDate(value('year')))}
+        ${line('released', releaseDate(value('date') || value('year')))}
         ${line('track', [value('track_no'), value('disc_no')
           ? 'disc ' + value('disc_no') : ''].filter(Boolean).join(' \u00b7 '))}
         ${line('length', dur(d.duration))}
@@ -2815,7 +2815,8 @@ function startEnrich(keys) {
 const EDIT_FIELDS = [
   ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'],
   ['album_artist', 'Album artist'], ['track_no', 'Track no'],
-  ['disc_no', 'Disc no'], ['year', 'Year'], ['isrc', 'ISRC'],
+  ['disc_no', 'Disc no'], ['year', 'Year'], ['date', 'Release date'],
+  ['genre', 'Genre'], ['isrc', 'ISRC'],
 ];
 
 function editModal(keys) {
@@ -2932,7 +2933,7 @@ function writeTagsModal(keys) {
 const FIELD_LABEL = {
   title: 'Title', artist: 'Artist', album: 'Album',
   album_artist: 'Album artist', track_no: 'Track no', disc_no: 'Disc no',
-  year: 'Year', isrc: 'ISRC',
+  year: 'Year', date: 'Release date', genre: 'Genre', isrc: 'ISRC',
 };
 
 function showWriteModal(keys) {

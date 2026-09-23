@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS track (
     album_artist TEXT,
     track_no     INTEGER,
     disc_no      INTEGER,
-    year         TEXT,
+    year         TEXT,                   -- the year alone: Rockbox shows it verbatim
+    date         TEXT,                   -- the full release date, ISO, when known
     genre        TEXT,
     isrc         TEXT,
     purl         TEXT,                   -- yt-dlp source URL
@@ -60,7 +61,8 @@ WHEN OLD.path IS NOT NEW.path OR OLD.content_key IS NOT NEW.content_key
   OR OLD.title IS NOT NEW.title OR OLD.artist IS NOT NEW.artist
   OR OLD.album IS NOT NEW.album OR OLD.album_artist IS NOT NEW.album_artist
   OR OLD.track_no IS NOT NEW.track_no OR OLD.disc_no IS NOT NEW.disc_no
-  OR OLD.year IS NOT NEW.year OR OLD.genre IS NOT NEW.genre
+  OR OLD.year IS NOT NEW.year OR OLD.date IS NOT NEW.date
+  OR OLD.genre IS NOT NEW.genre
   OR OLD.isrc IS NOT NEW.isrc
 BEGIN
   UPDATE track SET updated_at = (julianday('now') - 2440587.5) * 86400.0
@@ -293,6 +295,9 @@ def migrate(con):
         # last seen. Backdating them all to now would put an existing
         # library in the inbox, which is exactly what the inbox is not for.
         con.execute("UPDATE track SET added_at = seen_at WHERE added_at IS NULL")
+
+    if track_cols and "date" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN date TEXT")
 
     if track_cols and "updated_at" not in track_cols:
         con.execute("ALTER TABLE track ADD COLUMN updated_at REAL")

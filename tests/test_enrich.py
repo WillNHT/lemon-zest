@@ -189,6 +189,15 @@ class ScoreTests(unittest.TestCase):
 
 
 class ReleasePickTests(unittest.TestCase):
+    def test_a_release_date_gives_the_year_and_the_date_apart(self):
+        got = enrich.recording_fields(recording(
+            "r1", "Song", ["Alpha"], album="First", date="1999-03-07"))
+        self.assertEqual(got["release_fields"]["year"], "1999")
+        self.assertEqual(got["release_fields"]["date"], "1999-03-07")
+        only_year = enrich.recording_fields(recording(
+            "r1", "Song", ["Alpha"], album="First", date="1999"))
+        self.assertNotIn("date", only_year["release_fields"])
+
     def test_the_album_wins_over_the_compilation(self):
         rec = recording("r1", "Blue", ["Alpha"], album="Real Album",
                         date="2001-01-01", length=200)

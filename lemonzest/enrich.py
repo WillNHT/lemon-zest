@@ -47,6 +47,7 @@ import urllib.parse
 import urllib.request
 
 from . import __version__
+from .artwork import iso_date
 
 # MusicBrainz asks for one request per second from a client that identifies
 # itself, and answers 503 to anything that does not. Both are honoured: the
@@ -87,7 +88,7 @@ MAX_DURATION_DELTA = 12.0
 # describing the file itself: a source knows about the recording, not about
 # where this copy came from.
 ENRICHABLE = ("title", "artist", "album", "album_artist",
-              "track_no", "disc_no", "year", "genre", "isrc")
+              "track_no", "disc_no", "year", "date", "genre", "isrc")
 
 
 # ------------------------------------------------------------------ states
@@ -729,7 +730,11 @@ def recording_fields(recording, prefer_album=None):
         release_fields["album"] = release.get("title")
         date = release.get("date")
         if date:
-            release_fields["year"] = str(date)[:10]
+            # The year alone, which is what a player shows, and the full
+            # date beside it, which is what "on this day" needs.
+            release_fields["year"] = str(date)[:4]
+            if iso_date(date):
+                release_fields["date"] = iso_date(date)
         credit = _release_credit(release)
         # "Various Artists" is a placeholder standing in for the fact that a
         # compilation has no single artist. Writing it into album_artist
@@ -824,7 +829,8 @@ def _best_candidate(records, row, album):
 
 # Fields that describe a release rather than the recording. They are filled
 # in where a file is silent and never used to overwrite what it already says.
-RELEASE_FIELDS = ("album", "album_artist", "year", "track_no", "disc_no")
+RELEASE_FIELDS = ("album", "album_artist", "year", "date", "track_no",
+                  "disc_no")
 
 
 # ------------------------------------------------------ the offline backfill

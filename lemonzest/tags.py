@@ -28,8 +28,8 @@ import tempfile
 
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import (APIC, TALB, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK,
-                         TSRC)
+from mutagen.id3 import (APIC, TALB, TCON, TDRC, TDRL, TIT2, TPE1, TPE2,
+                         TPOS, TRCK, TSRC)
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
@@ -45,14 +45,20 @@ _MP4 = {
     "title": "\xa9nam", "artist": "\xa9ART", "album": "\xa9alb",
     "album_artist": "aART", "year": "\xa9day", "genre": "\xa9gen",
 }
+# The full release date has a tag of its own in every format, because the
+# year tag is what Rockbox shows as the year and "2018-02-01" is not one.
+# The same names MusicBrainz Picard writes: TDRL, RELEASEDATE, and an iTunes
+# freeform atom.
+MP4_DATE = "----:com.apple.iTunes:RELEASEDATE"
 _ID3 = {
     "title": TIT2, "artist": TPE1, "album": TALB,
-    "album_artist": TPE2, "year": TDRC,
+    "album_artist": TPE2, "year": TDRC, "date": TDRL, "genre": TCON,
 }
 _VORBIS = {
     "title": "title", "artist": "artist", "album": "album",
     "album_artist": "albumartist", "year": "date", "genre": "genre",
     "isrc": "isrc", "track_no": "tracknumber", "disc_no": "discnumber",
+    "date": "releasedate",
 }
 
 
@@ -64,6 +70,8 @@ def _write_mp4(audio, fields, cover):
     for field, atom in _MP4.items():
         if fields.get(field) is not None:
             audio[atom] = [str(fields[field])]
+    if fields.get("date") is not None:
+        audio[MP4_DATE] = [str(fields["date"]).encode("utf-8")]
     if fields.get("isrc") is not None:
         # ISRC has no standard atom; iTunes stores it as a freeform one, and
         # meta.py already reads that spelling back.
@@ -127,6 +135,12 @@ def write(path, fields, cover=None):
         return None
     # A full date reads as the year on Rockbox ("20180201"), and a padded or
     # 4:4:4 cover draws letterboxed and grey there. Fix both on the way in.
+    if "date" in fields:
+        fields["date"] = artwork.iso_date(fields["date"])
+        if not fields["date"]:
+            del fields["date"]
+        elif "year" not in fields:
+            fields["year"] = fields["date"]
     if "year" in fields:
         fields["year"] = artwork.year_only(fields["year"])
     if cover:
@@ -241,6 +255,24 @@ def read_cover(path):
     return (apic[0].data, apic[0].mime) if apic else None
 
 
+def _raw_tag(audio, keys):
+    """The first of ``keys`` the file carries, as text, or None."""
+    tags = getattr(audio, "tags", None)
+    for key in keys:
+        try:
+            got = tags.get(key) if tags is not None else None
+        except Exception:      # noqa: BLE001 - a tag we cannot read is none
+            got = None
+        if got:
+            got = got[0] if isinstance(got, list) else got
+            if isinstance(got, bytes):
+                got = got.decode("utf-8", "replace")
+            if hasattr(got, "text"):      # an ID3 frame
+                got = got.text[0] if got.text else ""
+            return str(got)
+    return None
+
+
 def fix_for_players(con, row):
     """Trim the year and square the cover of one catalogued file.
 
@@ -251,9 +283,15 @@ def fix_for_players(con, row):
     if not real:
         raise TagWriteError(f"no such file: {row['path']}")
     fields, changed = {}, []
-    current = read_tags(real).get("year")
+    audio = MutagenFile(real)
+    # The tag as written, not as read_tags reports it: that one is already
+    # trimmed to the year, which is the very thing being checked for.
+    current = _raw_tag(audio, ("\xa9day", "TDRC", "date"))
     if current and artwork.year_only(current) != current:
         fields["year"] = current
+        # The date the year tag held is kept, in the tag meant for it.
+        if not _raw_tag(audio, (MP4_DATE, "TDRL", "releasedate")):
+            fields["date"] = current
         changed.append("year")
     cover = read_cover(real)
     if cover and not artwork.is_player_safe(cover[0]):
@@ -266,8 +304,10 @@ def fix_for_players(con, row):
     if new_key:
         rekey(con, row["content_key"], row["path"], new_key)
         if "year" in fields:
-            con.execute("UPDATE track SET year=? WHERE path=?",
-                        (artwork.year_only(current), row["path"]))
+            con.execute("UPDATE track SET year=?, date=COALESCE(?, date) "
+                        "WHERE path=?",
+                        (artwork.year_only(current),
+                         artwork.iso_date(current), row["path"]))
         con.commit()
     return changed
 

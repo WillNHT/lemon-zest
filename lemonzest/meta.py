@@ -82,7 +82,7 @@ def read_tags(path):
     out = {
         "duration": None, "title": None, "artist": None, "album": None,
         "album_artist": None, "track_no": None, "disc_no": None, "year": None,
-        "genre": None, "isrc": None, "purl": None, "codec": None,
+        "date": None, "genre": None, "isrc": None, "purl": None, "codec": None,
         "bitrate": None, "sample_rate": None,
     }
     try:
@@ -120,6 +120,10 @@ def read_tags(path):
     out["album"] = g("\xa9alb", "talb", "album")
     out["album_artist"] = g("aart", "tpe2", "albumartist", "album_artist", "album artist")
     out["year"] = g("\xa9day", "tdrc", "tyer", "date", "year")
+    # The full release date lives in a tag of its own, because Rockbox shows
+    # the year tag verbatim and "20180201" is not a year. See tags.py.
+    out["date"] = g("----:com.apple.itunes:releasedate", "tdrl",
+                    "releasedate")
     out["genre"] = g("\xa9gen", "tcon", "genre")
     out["isrc"] = g("tsrc", "isrc", "----:com.apple.itunes:isrc")
     # yt-dlp writes the source URL here; on MP3 it lands in a TXXX/WXXX frame.
@@ -140,8 +144,12 @@ def read_tags(path):
             if out[dest] is not None:
                 break
 
+    from .artwork import iso_date, year_only
+    # A file written before the split may still carry a full date in the
+    # year tag; that is the date, and the year is its first four digits.
+    out["date"] = iso_date(out["date"]) or iso_date(out["year"])
     if out["year"]:
-        out["year"] = str(out["year"])[:10]
+        out["year"] = year_only(str(out["year"]))
     return out
 
 

@@ -351,6 +351,7 @@ def create_app(db_path=None):
                 "size": r["size"], "ext": r["ext"], "genre": r["genre"],
                 "bitrate": r["bitrate"], "sample_rate": r["sample_rate"],
                 "isrc": r["isrc"], "purl": r["purl"], "path": r["path"],
+                "year": r["year"], "date": r["date"],
                 "rel_path": r["rel_path"],
                 "content_key": r["content_key"],
                 "playlist_pos": r["playlist_pos"] if pos_col else None,

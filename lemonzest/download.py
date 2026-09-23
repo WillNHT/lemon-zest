@@ -44,6 +44,9 @@ from .paths import norm
 # plausibly appear in a video title.
 PROGRESS_PREFIX = "[lz-progress]"
 FILE_PREFIX = "[lz-file]"
+# Printed just before the file line: the release date, which the year tag
+# can no longer carry (see tags.py), so it is written into its own tag here.
+DATE_PREFIX = "[lz-date]"
 
 # What each progress line carries. Bytes describe the file being fetched;
 # the playlist position describes where in the batch it sits, which is the
@@ -492,6 +495,8 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         # A WHEN prefix keeps --print from implying --simulate, so this
         # reports the file that was really written, after the audio
         # extraction and the rename.
+        "--print", "after_move:" + DATE_PREFIX
+        + "%(release_date,upload_date|)s",
         "--print", "after_move:" + FILE_PREFIX + "%(filepath)s",
         # --print also implies --quiet, and that one the WHEN prefix does
         # not undo: without this the only things yt-dlp says are warnings,
@@ -782,6 +787,22 @@ def _count_items(urls, cfg, log):
 _ERROR_LINE = re.compile(r"^\s*ERROR:", re.I)
 
 
+def _write_date(path, released, log):
+    """Put the release date yt-dlp knows into the file's own date tag.
+
+    Before the file is catalogued, so the catalog reads it back like any
+    other tag. A file that will not take it keeps its year and says so.
+    """
+    from . import tags
+    if not artwork.iso_date(released):
+        return
+    try:
+        tags.write(path, {"date": released})
+    except tags.TagWriteError as exc:
+        log.append("could not write the release date into %s: %s"
+                   % (path, exc))
+
+
 def remember_url(con, url, info=None, playlist_name=None, root=None,
                  used=True):
     """Write down that this URL was asked for, and what was at it.
@@ -1060,6 +1081,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         worker = threading.Thread(target=pipeline_worker, daemon=True)
         worker.start()
 
+    released = None
     proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
                             encoding="utf-8", errors="replace", bufsize=1,
@@ -1088,9 +1110,14 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                      batch["done"], batch["total"])
                 report()
                 continue
+            if line.startswith(DATE_PREFIX):
+                released = line[len(DATE_PREFIX):].strip()
+                continue
             if line.startswith(FILE_PREFIX):
                 path = line[len(FILE_PREFIX):].strip()
                 if path:
+                    _write_date(path, released, log)
+                    released = None
                     files.append(path)
                     log.append("wrote " + path)
                     del log[:-MAX_LOG]

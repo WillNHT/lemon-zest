@@ -126,8 +126,19 @@ Pair with `--profile rockbox`. Music goes to `/Music`, playlists to their own
 
 Rockbox also shows a full date tag as the year and draws letterboxed or
 non-4:2:0 JPEG covers badly (padded, or in greyscale). New downloads are
-written with the year only and a square, baseline 4:2:0 cover. For files
-downloaded earlier, fix them once and sync again:
+written with the year only and a square, baseline 4:2:0 cover.
+
+The full date is not thrown away: it goes in a tag of its own, the one
+MusicBrainz Picard uses for a release date - `TDRL` in ID3, `RELEASEDATE` in
+Vorbis comments, and a `----:com.apple.iTunes:RELEASEDATE` atom in MP4 - so
+the year tag stays a year and a player that wants "this day, years ago" can
+still find the day. A download takes it from the video's release or upload
+date; an identified track from its MusicBrainz release, filling a blank only.
+The catalog keeps it as `date` (ISO, `2018-02-01`), editable beside the year.
+
+For files downloaded earlier, fix them once and sync again - `fix-tags` moves
+a full date out of the year tag into the release-date tag rather than
+discarding it:
 
 ```
 lemon-zest fix-tags --dry-run
