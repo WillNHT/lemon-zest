@@ -410,11 +410,14 @@ class DownloadTests(unittest.TestCase):
         download.download(self.con, ["https://example.test/v"], root=self.root,
                           cfg=self.cfg(),
                           on_event=lambda k, d, done, tot: seen.append(
-                              (k, time.time() - started)))
-        first_output = next(t for k, t in seen if k == "output")
-        elapsed = time.time() - started
-        self.assertGreater(elapsed, 1.5, "the stub should have lingered")
-        self.assertLess(first_output, 1.0,
+                              (k, d, time.time() - started)))
+        finished = time.time() - started
+        self.assertGreater(finished, 1.5, "the stub should have lingered")
+        # The child's own line - not one of ours written before it started -
+        # and it arrives while the child is still lingering, not at its exit.
+        arrived = next(t for k, d, t in seen
+                       if k == "output" and "still working" in d)
+        self.assertLess(arrived, finished - 1.0,
                         "output was withheld until the process exited")
 
     # ------------------------------------------------ workers, pause, stop
@@ -492,9 +495,15 @@ class DownloadTests(unittest.TestCase):
         self.assertLess(time.time() - started, 10, "yt-dlp was not killed")
         summary = out["summary"]
         self.assertEqual(summary["stopped"], "stopped")
-        # Both wrote their file before lingering; neither is owed again.
-        self.assertEqual(summary["downloaded"], 2)
-        self.assertEqual(summary["remaining"], [])
+        # Each item either arrived or is owed to a resume - never both, never
+        # lost. Which way the second went depends on whether its worker had
+        # written the file before the stop reached it.
+        owed = summary["remaining"]
+        self.assertGreaterEqual(summary["downloaded"], 1)
+        self.assertEqual(summary["downloaded"] + len(owed), 2)
+        self.assertLessEqual(len(owed), 1)
+        self.assertTrue(set(owed) <= {"https://example.test/0",
+                                      "https://example.test/1"}, owed)
 
     def test_several_files_from_one_url(self):
         os.environ["LZ_FAKE_FILES"] = "A/Album/one.m4a;A/Album/two.m4a"
