@@ -488,6 +488,12 @@ six tracks that came in this morning are otherwise six rows in the middle
 of an alphabet. *Mark all as seen* moves a watermark; it deletes nothing
 and no row leaves the library.
 
+**Not in a playlist** lists every track no playlist holds - the ones nothing
+carries to a player, and so the ones that get lost. A playlist that holds
+everything (a *DAP-master*) would answer the question for every track at
+once, so any playlist can be set aside there and stop counting; the choice
+is remembered.
+
 Clicking a row opens an inspector beside the table: the artwork the file
 itself carries (a downloaded video frame included, which is the reason to
 look), every field including the ones the table has no room for, the full

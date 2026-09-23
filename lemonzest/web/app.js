@@ -97,7 +97,11 @@ const S = {
   // else and forgotten.
   filters: {
     library: BLANK_FILTER(), inbox: BLANK_FILTER(), playlist: BLANK_FILTER(),
+    unlisted: BLANK_FILTER(),
   },
+  // Playlists that do not count on the "Not in a playlist" page: the one
+  // that holds everything would otherwise make every track look placed.
+  unlistedIgnore: [],
   paneFilter: { decade: '', genre: '', artist: '', album: '' },
   navFilter: { device: '', playlist: '' },
   tracks: [], tracksTotal: 0, offset: 0, limit: 200,
@@ -170,6 +174,7 @@ function libraryParams() {
   }
   // A playlist narrows the same table rather than replacing it.
   if (S.view === 'playlist' && S.playlistId) p.set('playlist', S.playlistId);
+  if (S.view === 'unlisted') p.set('unlisted', '1');
   if (S.sort.col) { p.set('sort', S.sort.col); p.set('dir', S.sort.dir); }
   return p;
 }
@@ -178,7 +183,8 @@ function libraryParams() {
    They share the row model, the selection, the shortcuts and the inspector,
    because a track is the same track whichever way you arrived at it. */
 function isTrackView() {
-  return S.view === 'library' || S.view === 'inbox' || S.view === 'playlist';
+  return S.view === 'library' || S.view === 'inbox' || S.view === 'playlist'
+    || S.view === 'unlisted';
 }
 
 async function loadLibrary() {
@@ -389,6 +395,9 @@ function renderSidebar() {
       navRow({ act: 'view', arg: 'inbox', label: 'Inbox', icon: 'i-inbox',
                n: num(st.inbox), on: S.view === 'inbox',
                title: 'Everything indexed since you last emptied the inbox' }) +
+      navRow({ act: 'view', arg: 'unlisted', label: 'Not in a playlist',
+               icon: 'i-list', n: num(st.unlisted), on: S.view === 'unlisted',
+               title: 'Tracks no playlist carries to a player' }) +
       navRow({ act: 'view', arg: 'problems', label: 'Needs attention',
                icon: 'i-warn', n: num(st.attention), on: S.view === 'problems' })) +
 
@@ -592,6 +601,8 @@ const DEFAULT_COLS = {
   inbox: ['added', 'no', 'title', 'duration', 'artist', 'album', 'state',
           'format', 'updated', 'isrc'],
   playlist: ['on', 'no', 'title', 'duration', 'artist', 'album', 'state',
+             'format', 'added', 'updated', 'isrc'],
+  unlisted: ['on', 'no', 'title', 'duration', 'artist', 'album', 'state',
              'format', 'added', 'updated', 'isrc'],
 };
 
@@ -1076,6 +1087,48 @@ function renderInbox() {
     </div>
     ${filterNotice()}
     ${trackTable({ inbox: true })}`;
+}
+
+/* Tracks no playlist holds, so nothing carries them to a player.
+
+   Asked so they can be put somewhere rather than lost. A playlist that holds
+   the whole library - a "DAP-master" - answers the question for every track
+   at once, so any playlist can be set aside here and stop counting. */
+async function loadUnlisted() {
+  S.unlistedIgnore = (await api('/unlisted')).ignore;
+  await loadLibrary();
+}
+
+function renderUnlisted() {
+  const ignored = new Set(S.unlistedIgnore);
+  const others = S.playlists.filter(p => !ignored.has(p.name));
+  return `
+    <div class="hstack" style="padding:6px 10px;border-bottom:1px solid var(--line-2);flex-wrap:wrap">
+      <span class="faint mono" style="font-size:9px;letter-spacing:.1em">NOT COUNTING</span>
+      ${S.unlistedIgnore.map(n => `<button class="chip on" data-unl-drop="${h(n)}"
+          title="Count ${h(n)} again">${h(n)} &times;</button>`).join('')
+        || '<span class="faint">every playlist counts</span>'}
+      <select id="unl-add" style="border:1px solid var(--line-2);border-radius:3px;padding:1px 4px">
+        <option value="">+ ignore a playlist...</option>
+        ${others.map(p => `<option value="${h(p.name)}">${h(p.name)}</option>`).join('')}
+      </select>
+      <span class="grow" style="flex:1"></span>
+      <span class="faint" style="font-size:10px">Select tracks and add them to
+        the sync list, or open a playlist from the inspector.</span>
+    </div>
+    ${filterNotice()}
+    ${trackTable({})}`;
+}
+
+function setUnlistedIgnore(names) {
+  return guard(async () => {
+    S.unlistedIgnore = (await api('/unlisted', {
+      method: 'POST', body: JSON.stringify({ ignore: names }),
+    })).ignore;
+    S.offset = 0;
+    await loadCore();
+    await loadLibrary();
+  });
 }
 
 // A finished job, said out loud. Errors are the point: a run that failed
@@ -2353,6 +2406,7 @@ function runReset() {
 const TITLES = {
   library: () => `MUSIC \u2014 ${num(S.tracksTotal)} TRACKS`,
   inbox: () => `INBOX \u2014 ${num(S.tracksTotal)} NEW`,
+  unlisted: () => `NOT IN A PLAYLIST \u2014 ${num(S.tracksTotal)} TRACKS`,
   device: () => {
     const d = S.devices.find(x => x.id === S.deviceId);
     return d ? (d.name + ' \u2014 SYNC PLAN').toUpperCase() : 'DEVICE';
@@ -2487,7 +2541,7 @@ function render() {
     <span class="grow"></span>
     ${S.error ? `<span style="color:var(--bad);text-transform:none;font-family:var(--sans);font-size:11px">${h(S.error)}</span>` : ''}`;
   const body = {
-    library: renderLibrary, inbox: renderInbox,
+    library: renderLibrary, inbox: renderInbox, unlisted: renderUnlisted,
     device: renderDevice, playlist: renderPlaylist,
     addDevice: renderAddDevice, normalize: renderNormalize,
     utilities: renderUtilities,
@@ -3042,6 +3096,11 @@ document.addEventListener('click', (ev) => {
     S.offset = (+goto.dataset.goto - 1) * S.limit;
     return guard(loadLibrary);
   }
+  const unl = ev.target.closest('[data-unl-drop]');
+  if (unl) {
+    return setUnlistedIgnore(
+      S.unlistedIgnore.filter(n => n !== unl.dataset.unlDrop));
+  }
   if (ev.target.closest('[data-cols-reset]')) {
     resetColumnLayout(S.view);
     return render();
@@ -3165,6 +3224,11 @@ document.addEventListener('click', (ev) => {
   }
   if (d.act === 'view') {
     S.view = d.arg;
+    if (d.arg === 'unlisted') {
+      S.offset = 0; S.sel.clear(); S.anchor = null;
+      S.sort = { col: null, dir: 'asc' };
+      return guard(loadUnlisted);
+    }
     if (d.arg === 'library' || d.arg === 'inbox') {
       // The views share the table, and the offset, selection and sort
       // belong to the question that was asked, not to the one being left.
@@ -3582,6 +3646,9 @@ function setDownloadUrls(text) {
 // exist are known, so offering any other number would be offering a
 // mistake.
 document.addEventListener('change', (ev) => {
+  if (ev.target.id === 'unl-add' && ev.target.value) {
+    return setUnlistedIgnore(S.unlistedIgnore.concat([ev.target.value]));
+  }
   if (ev.target.id !== 'page-jump') return;
   S.offset = Math.max(0, (+ev.target.value - 1) * S.limit);
   guard(loadLibrary);
@@ -3734,7 +3801,7 @@ function readUiState() {
       S.view = 'playlist';
       S.playlistId = was.playlistId;
       await loadPlaylist(was.playlistId);
-    } else if (['inbox', 'download', 'problems', 'syncList', 'normalize',
+    } else if (['inbox', 'unlisted', 'download', 'problems', 'syncList', 'normalize',
                 'utilities',
                 'device'].includes(was.view)) {
       S.view = was.view;
@@ -3744,7 +3811,8 @@ function readUiState() {
         S.view = 'library';
       }
     }
-    if (isTrackView()) await loadLibrary();
+    if (S.view === 'unlisted') await loadUnlisted();
+    else if (isTrackView()) await loadLibrary();
     if (S.view === 'download') await loadDownload();
     if (S.view === 'problems') S.problems = await api('/problems');
     if (S.view === 'syncList') S.syncList = await api('/sync-list');

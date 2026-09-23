@@ -235,6 +235,19 @@ class ServerTests(unittest.TestCase):
 
     # ----------------------------------------------------------- playlists
 
+    def test_tracks_in_no_playlist_and_an_ignored_catch_all(self):
+        # "mix" holds two of the four: the other two are in no playlist.
+        d = self.c.get("/api/library?unlisted=1").get_json()
+        self.assertEqual(d["total"], 2)
+        self.assertEqual(self.c.get("/api/stats").get_json()["unlisted"], 2)
+        # A playlist set aside stops counting, as a DAP-master one would.
+        out = self.c.post("/api/unlisted", json={"ignore": ["mix"]}).get_json()
+        self.assertEqual(out["ignore"], ["mix"])
+        d = self.c.get("/api/library?unlisted=1").get_json()
+        self.assertEqual(d["total"], 4)
+        self.assertEqual(self.c.get("/api/unlisted").get_json()["ignore"],
+                         ["mix"])
+
     def test_a_playlist_narrows_the_same_library_query(self):
         pid = self.c.get("/api/playlists").get_json()[0]["id"]
         d = self.c.get("/api/library?playlist=%d" % pid).get_json()

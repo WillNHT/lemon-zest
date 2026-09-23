@@ -37,6 +37,16 @@ INBOX_MARK = ("COALESCE((SELECT CAST(value AS REAL) FROM meta "
               "WHERE key = 'inbox_seen_at'), 0)")
 NEW_SQL = (f"(t.added_at IS NOT NULL AND t.added_at > {INBOX_MARK} "
            "AND t.inbox_done_at IS NULL)")
+# In no playlist - so nothing carries it to a player. Playlists named in the
+# ignore list do not count: one that holds everything ("DAP-master") would
+# otherwise make every track look placed.
+UNLISTED_KEY = "unlisted.ignore"
+UNLISTED_SQL = (
+    "t.id NOT IN (SELECT pe.track_id FROM playlist_entry pe "
+    "JOIN playlist p ON p.id = pe.playlist_id "
+    "WHERE pe.track_id IS NOT NULL AND p.name NOT IN (SELECT value FROM "
+    f"json_each(COALESCE((SELECT value FROM meta WHERE key = '{UNLISTED_KEY}'),"
+    " '[]'))))")
 
 # The promotion is a write, and the stats endpoint is polled every couple of
 # seconds, so it runs on a timer rather than on every poll.
@@ -133,6 +143,8 @@ def create_app(db_path=None):
             "tracks": one(f"SELECT COUNT(*) FROM track {vis}"),
             "inbox": one("SELECT COUNT(*) FROM track t "
                          f"WHERE {VISIBLE} AND {NEW_SQL}"),
+            "unlisted": one("SELECT COUNT(*) FROM track t "
+                            f"WHERE {VISIBLE} AND {UNLISTED_SQL}"),
             "bytes": one("SELECT COALESCE(SUM(size),0) FROM track"),
             "artists": one("SELECT COUNT(DISTINCT artist) FROM track"),
             "albums": one("SELECT COUNT(DISTINCT album) FROM track"),
@@ -194,6 +206,8 @@ def create_app(db_path=None):
             params.append(int(pid))
         if str(args.get("new") or "") in ("1", "true", "yes"):
             clauses.append(NEW_SQL)
+        if str(args.get("unlisted") or "") in ("1", "true", "yes"):
+            clauses.append(UNLISTED_SQL)
         state = (args.get("state") or "").strip()
         if with_state and state in en.STATES:
             clauses.append(en.STATE_SQL + " = ?")
@@ -388,6 +402,23 @@ def create_app(db_path=None):
         c = con()
         return jsonify({"ok": True, "at": time.time(),
                         "promoted": db_mod.clear_inbox(c)})
+
+    @app.get("/api/unlisted")
+    def unlisted_get():
+        import json
+        return jsonify({"ignore": json.loads(
+            db_mod.meta_get(con(), UNLISTED_KEY) or "[]")})
+
+    @app.post("/api/unlisted")
+    def unlisted_set():
+        """Which playlists do not count when asking what is in none."""
+        import json
+        names = (request.json or {}).get("ignore") or []
+        names = sorted({playlists.norm_name(n) for n in names
+                        if isinstance(n, str) and n.strip()})
+        db_mod.meta_set(con(), UNLISTED_KEY,
+                        json.dumps(names, ensure_ascii=False))
+        return jsonify({"ignore": names})
 
     # ---------------------------------------------------- library folders
 
