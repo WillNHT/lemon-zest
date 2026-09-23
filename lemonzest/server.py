@@ -423,6 +423,98 @@ def create_app(db_path=None):
                         json.dumps(names, ensure_ascii=False))
         return jsonify({"ignore": names})
 
+    # --------------------------------------------- moving the library
+
+    def _pack_quietly(c):
+        """Refresh the catalog copy each library folder carries.
+
+        After every scan and download, so the folder copied to another
+        computer is never more than one job behind. A copy that cannot be
+        written - a read-only folder - is not a reason for the job to fail.
+        """
+        from . import portable
+        try:
+            portable.pack_all(c)
+        except Exception:      # noqa: BLE001
+            traceback.print_exc()
+
+    def _portable_state(c):
+        from . import portable
+        return {"roots": [{"root": r, "exists": os.path.isdir(r),
+                           "packed_at": portable.packed(r)}
+                          for r in db_mod.roots(c)],
+                "tracks": c.execute("SELECT COUNT(*) FROM track").fetchone()[0]}
+
+    @app.get("/api/portable")
+    def portable_get():
+        return jsonify(_portable_state(con()))
+
+    @app.post("/api/portable/pack")
+    def portable_pack():
+        from . import portable
+        c = con()
+        portable.pack_all(c)
+        return jsonify(_portable_state(c))
+
+    def _quiet_queue():
+        """Hold the identification queue while the catalog is swapped or
+        rewritten under it: it names files by content key and path."""
+        q = _queue()
+        q.pause()
+        q.clear()
+        end = time.time() + 30
+        while q.current is not None and time.time() < end:
+            time.sleep(0.05)
+        return q
+
+    def _busy():
+        with JOBS_LOCK:
+            return next((j["kind"] for j in JOBS.values()
+                         if j["state"] == "running"), None)
+
+    @app.post("/api/portable/unpack")
+    def portable_unpack():
+        """Take in a library folder copied from another computer."""
+        from . import portable
+        body = request.json or {}
+        folder = (body.get("folder") or "").strip()
+        if not folder or not os.path.isdir(folder):
+            return jsonify({"error": "not a folder: " + folder}), 400
+        busy = _busy()
+        if busy:
+            return jsonify({"error": "wait for the running %s to finish"
+                                     % busy}), 409
+        q = _quiet_queue()
+        try:
+            out = portable.unpack(con(), folder,
+                                  replace=bool(body.get("replace")))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            q.resume()
+        return jsonify(out)
+
+    @app.post("/api/roots/relocate")
+    def roots_relocate():
+        """A library folder moved: point the catalog at where it is now."""
+        from . import portable
+        body = request.json or {}
+        old = (body.get("old") or "").strip()
+        new = (body.get("new") or "").strip()
+        if not old or not new or not os.path.isdir(new):
+            return jsonify({"error": "not a folder: " + new}), 400
+        busy = _busy()
+        if busy:
+            return jsonify({"error": "wait for the running %s to finish"
+                                     % busy}), 409
+        q = _quiet_queue()
+        try:
+            c = con()
+            moved = portable.relocate(c, old, new)
+        finally:
+            q.resume()
+        return jsonify({"moved": moved, "roots": db_mod.roots_detail(c)})
+
     # ---------------------------------------------------- library folders
 
     @app.get("/api/roots")
@@ -1118,6 +1210,7 @@ def create_app(db_path=None):
                 # Whatever the scan found that has never been looked at
                 # joins the identification queue, without being asked.
                 counts["queued"] = _start_auto_enrich(root=root)
+                _pack_quietly(c)
                 _update(job_id, state="done", result=counts,
                         finished=time.time())
             except Exception as exc:
@@ -1249,6 +1342,7 @@ def create_app(db_path=None):
                         or (summary["downloaded"] and not summary.get("queued")))
                 summary["queued_extra"] = _start_auto_enrich(
                     root=summary.get("root")) if owed else 0
+                _pack_quietly(c)
                 if kept_url:
                     # What the kept row shows next time: when it was last
                     # looked at, and what that look turned up.

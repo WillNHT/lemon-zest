@@ -105,9 +105,20 @@ def scan_cmd(ctx, root, full, workers):
         console.print(f"[green]{len(found)}[/] playlists - "
                       f"{matched} of {total} entries matched")
     _auto_enrich(con, root=root)
+    _pack_quietly(con)
 
 
 cli.add_command(scan_cmd, name="scan")
+
+
+def _pack_quietly(con):
+    """Refresh the catalog copy each library folder carries, as the
+    interface does after a scan or a download. See portable.py."""
+    from . import portable
+    try:
+        portable.pack_all(con)
+    except Exception as exc:      # noqa: BLE001 - a read-only folder, say
+        console.print(f"[dim]catalog copy not refreshed: {exc}[/]")
 
 
 def _drain_queue(con, total):
@@ -355,6 +366,7 @@ def download_cmd(ctx, urls, root, playlist_name, audio_format, audio_quality,
         # uncatalogued, and a pipeline that could not start leaves its own
         # arrivals unidentified. Either way they are owed a look.
         _auto_enrich(con, root=summary["root"])
+    _pack_quietly(con)
     if summary["playlist"]:
         p = summary["playlist"]
         console.print(f"[cyan]playlist[/] {p['name']}: {p['added']} added"
@@ -1085,6 +1097,46 @@ def enrich_genres(ctx):
                   f"[green]{counts['filled']:,}[/] filled, "
                   f"{counts['none']:,} have none on record, "
                   f"{counts['failed']:,} failed")
+
+
+@cli.command("relocate")
+@click.argument("old")
+@click.argument("new", type=click.Path(exists=True, file_okay=False))
+@click.pass_context
+def relocate_cmd(ctx, old, new):
+    """A library folder moved from OLD to NEW: point the catalog there."""
+    from . import portable
+    moved = portable.relocate(_con(ctx), old, new)
+    console.print(f"[green]{moved.get('track.path', 0):,}[/] tracks now under "
+                  f"{norm(os.path.abspath(new))}")
+
+
+@cli.command("pack")
+@click.pass_context
+def pack_cmd(ctx):
+    """Write the catalog into each library folder, for another computer."""
+    from . import portable
+    for path in portable.pack_all(_con(ctx)):
+        console.print("wrote " + path)
+
+
+@cli.command("unpack")
+@click.argument("folder", type=click.Path(exists=True, file_okay=False))
+@click.option("--replace", is_flag=True,
+              help="Replace a catalog that already holds tracks.")
+@click.pass_context
+def unpack_cmd(ctx, folder, replace):
+    """Take in a library folder copied from another computer."""
+    from . import portable
+    try:
+        out = portable.unpack(_con(ctx), folder, replace=replace)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    console.print(f"[green]{out['tracks']:,}[/] tracks, moved from "
+                  f"{out['from']} to {out['to']}")
+    for root in out["missing_roots"]:
+        console.print(f"[yellow]not here:[/] {root} - "
+                      "lemon-zest relocate it to where it is")
 
 
 @cli.command("lyrics")

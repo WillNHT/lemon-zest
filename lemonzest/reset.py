@@ -130,6 +130,13 @@ def reset_library(con, delete_files=False):
     con.execute("DELETE FROM meta WHERE key = 'inbox_seen_at'")
     con.commit()
     db_mod.meta_set(con, "library_reset_at", time.time())
+    # The catalog copy inside each folder is of the library just forgotten;
+    # left as it was, opening the folder elsewhere would bring it all back.
+    from . import portable
+    try:
+        portable.pack_all(con)
+    except OSError as exc:
+        errors.append(f"catalog copy: {exc}")
 
     return {
         "tracks_forgotten": tracks,

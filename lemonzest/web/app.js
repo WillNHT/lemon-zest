@@ -1708,6 +1708,11 @@ function renderSources() {
             ? 'color:var(--fainter);text-decoration:line-through' : ''}"
             title="${h(r.root)}">${h(r.root)}</span>
           ${r.hidden ? '<span class="tag">hidden</span>' : ''}
+          ${r.exists === false ? `<span class="tag warn"
+            title="Moved, renamed, or brought from another computer">not found</span>
+            <input data-relocate-to="${h(r.root)}" placeholder="where is it now?"
+              style="width:180px;border:1px solid var(--line-2);border-radius:3px;padding:2px 6px">
+            <button class="btn sm" data-relocate="${h(r.root)}">Point here</button>` : ''}
           <span class="faint mono" style="font-size:10px">${num(r.tracks)} tracks
             \u00b7 ${bytes(r.bytes)}</span>
           <button class="btn sm" data-scan="${h(r.root)}"
@@ -2406,6 +2411,7 @@ function renderUtilities() {
   const last = S.resetResult;
   return `<div class="pad stack">
     ${renderMaintenance()}
+    ${renderPortable()}
     <div class="card">
       <header><h3>Start the library over</h3></header>
       <div class="in stack">
@@ -2470,6 +2476,49 @@ function renderMaintenance() {
           job.state === 'running' ? 'spin' : ''}"></span>
         <span class="muted">${h(job.label)}: ${h(job.error || job.detail
           || job.state)}</span></div>` : ''}
+    </div>
+  </div>`;
+}
+
+/* Taking the library to another computer.
+
+   The folder is the thing to copy. Each library folder carries a copy of
+   the catalog, refreshed after every scan and download, so the music, its
+   playlists, what was part-downloaded and the history of all of it travel
+   together. Credentials stay behind on purpose. */
+function renderPortable() {
+  const p = S.portable;
+  return `<div class="card">
+    <header><h3>Move to another computer</h3></header>
+    <div class="in stack">
+      <p class="muted">Copy each library folder whole - the hidden
+        <span class="mono">.lemon-zest</span> folder inside it is the catalog,
+        with the download history - and the <span class="mono">Playlists</span>
+        folder beside it. Cookies, the Firefox profile and the AcoustID key
+        stay on this computer; set them up again on the other one.</p>
+      ${p ? p.roots.map(r => `<div class="hstack">
+        <span class="mono clip" style="flex:1" title="${h(r.root)}">${h(r.root)}</span>
+        <span class="faint mono" style="font-size:10px">${r.packed_at
+          ? 'catalog copy ' + h(ago(r.packed_at)) : 'no catalog copy yet'}</span>
+      </div>`).join('') : '<span class="faint">Checking...</span>'}
+      <div><button class="btn" data-pack="1">Refresh the copies now</button></div>
+      <p class="muted"><b>Arriving here from another computer?</b> Point at the
+        library folder where you copied it. Its catalog replaces this one and
+        is moved to where the folder is now.</p>
+      <div class="hstack">
+        <input id="unpack-folder" placeholder="C:/Users/you/Music/library"
+          style="flex:1;border:1px solid var(--line-2);border-radius:3px;padding:4px 7px">
+        <label class="muted"><input type="checkbox" id="unpack-replace">
+          replace the ${num(p ? p.tracks : 0)} tracks here</label>
+        <button class="btn primary" data-unpack="1">Open it</button>
+      </div>
+      ${S.unpacked ? `<div class="notice ok">${icon('i-check')}<div>
+        ${num(S.unpacked.tracks)} tracks, moved from
+        <span class="mono">${h(S.unpacked.from || '?')}</span> to
+        <span class="mono">${h(S.unpacked.to)}</span>.
+        ${S.unpacked.missing_roots.length ? `Not found here:
+          ${S.unpacked.missing_roots.map(h).join(', ')} - point them at their
+          new place under <b>Add music</b>.` : ''}</div></div>` : ''}
     </div>
   </div>`;
 }
@@ -2670,6 +2719,11 @@ function render() {
   renderStatus();
   if (S.view === 'addDevice') loadVolumes();
   if (S.view === 'utilities' && !S.resetInfo) loadResetInfo();
+  if (S.view === 'utilities' && !S.portable && !S.portableLoading) {
+    S.portableLoading = true;
+    api('/portable').then((p) => { S.portable = p; render(); },
+      () => {}).finally(() => { S.portableLoading = false; });
+  }
   // Follow a running download; leave a finished one where the reader put it,
   // so scrolling back through a failure is not undone by the next poll.
   if (S.view === 'download' && S.job && S.job.kind === 'download'
@@ -3296,6 +3350,7 @@ document.addEventListener('click', (ev) => {
     + '[data-keeprun],[data-pl-refresh],[data-sl-remove],[data-sl-clear],'
     + '[data-queue],[data-reset-open],[data-reset-go],[data-maint],'
     + '[data-dl-halt],[data-dl-resume],[data-dl-forget],'
+    + '[data-pack],[data-unpack],[data-relocate],'
     + '[data-sl-apply],[data-pl-tolist],'
     + '[data-close-inspector],[data-dismiss-outcome],'
     + '[data-root-hide],[data-root-remove],[data-root-forget],'
@@ -3353,6 +3408,33 @@ document.addEventListener('click', (ev) => {
     });
   }
 
+  if (d.pack) {
+    return guard(async () => {
+      S.portable = await api('/portable/pack', { method: 'POST' });
+    });
+  }
+  if (d.unpack) {
+    const folder = ($('#unpack-folder') || {}).value || '';
+    const replace = !!($('#unpack-replace') || {}).checked;
+    return guard(async () => {
+      S.unpacked = await api('/portable/unpack', {
+        method: 'POST', body: JSON.stringify({ folder: folder.trim(), replace }),
+      });
+      S.portable = await api('/portable');
+      await loadCore();
+    });
+  }
+  if (d.relocate) {
+    const box = document.querySelector(
+      `[data-relocate-to="${CSS.escape(d.relocate)}"]`);
+    return guard(async () => {
+      await api('/roots/relocate', {
+        method: 'POST',
+        body: JSON.stringify({ old: d.relocate, new: (box ? box.value : '').trim() }),
+      });
+      await loadCore();
+    });
+  }
   if (d.dlHalt) {
     if (!S.job) return;
     return guard(async () => {
@@ -3402,6 +3484,8 @@ document.addEventListener('click', (ev) => {
       return guard(loadLibrary);
     }
     if (d.arg === 'utilities') {
+      S.portable = null;
+      S.unpacked = null;
       S.resetInfo = null;
       S.resetResult = null;
     }

@@ -614,6 +614,9 @@ def roots_detail(con):
             "hidden": bool(row["hidden"]) if row else False,
             "scanned_at": row["scanned_at"] if row else None,
             "registered": row is not None,
+            # Not there: moved, renamed, or a catalog brought from another
+            # computer. The interface offers to point it somewhere.
+            "exists": os.path.isdir(root),
         })
     return out
 

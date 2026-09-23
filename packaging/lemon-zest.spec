@@ -80,6 +80,7 @@ hiddenimports = [
     "lemonzest.organise",
     "lemonzest.tags",
     "lemonzest.lyrics",
+    "lemonzest.portable",
     "mutagen",
     "mutagen.easyid3",
     "mutagen.flac",

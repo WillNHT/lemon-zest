@@ -517,6 +517,33 @@ the device manifest still matches and a replug stays a no-op. A device whose
 template mirrors the library layout (`{rel_path}`) is named before anything
 moves, because its next sync will move the same files on the card.
 
+## Moving the library to another computer
+
+**Copy the library folder.** Each one carries a copy of the catalog in a
+hidden `.lemon-zest` folder, refreshed after every scan and download - the
+tracks, the playlists, what was identified and typed, where every download
+came from, and the downloads still paused - so the folder is all there is to
+take. Copy the `Playlists` folder beside it too. Part-downloaded files
+(`.lz-incomplete`) and the download archive are inside it already.
+
+On the other computer, **Utilities > Move to another computer**, point at
+where the folder landed, and **Open it**. The catalog comes in and every
+path in it is moved from where the folder was to where it is now - a library
+at `C:\Users\Bob\Music\lemon-zest` on one machine and
+`C:\Users\Remote\Music\library\master` on the other is the case it is for.
+
+```bash
+lemon-zest pack                       # refresh the copy now
+lemon-zest unpack "C:/Users/Remote/Music/library/master"
+lemon-zest relocate "D:/old/Music" "E:/Music"   # moved on this machine
+```
+
+What stays behind on purpose: cookies, the Firefox profile, the AcoustID key
+and the MusicBrainz contact are never written into the copy, and opening one
+keeps this machine's own. The program itself is not in the folder either -
+any release will open it. A folder that has moved on the same machine shows
+as **not found** under *Add music*, with a box to say where it is now.
+
 ## The interface
 
 ```bash
