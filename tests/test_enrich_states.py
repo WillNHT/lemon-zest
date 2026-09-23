@@ -215,6 +215,15 @@ class StateTests(unittest.TestCase):
         enrich.clear_overrides(self.con, self.keys["One"], ["album"])
         self.assertEqual(enrich.overrides_for(self.con, self.keys["One"]), {})
 
+    def test_a_change_to_the_tags_moves_updated_and_a_rescan_does_not(self):
+        self.assertIsNone(self.track("One")["updated_at"])
+        self.con.execute("UPDATE track SET seen_at = ? WHERE content_key = ?",
+                         (time.time(), self.keys["One"]))
+        self.assertIsNone(self.track("One")["updated_at"])
+        enrich.override(self.con, self.keys["One"], album="Mine")
+        self.assertAlmostEqual(self.track("One")["updated_at"], time.time(),
+                               delta=5)
+
     def test_a_lookup_never_overwrites_a_hand_typed_value(self):
         enrich.override(self.con, self.keys["One"], title="Mine")
         enrich._apply_fields(self.con, self.keys["One"],

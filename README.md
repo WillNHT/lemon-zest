@@ -479,7 +479,9 @@ Clicking a row opens an inspector beside the table: the artwork the file
 itself carries (a downloaded video frame included, which is the reason to
 look), every field including the ones the table has no room for, the full
 path, when it arrived and when the file was last modified, and where its
-values came from.
+values came from. The **Updated** column says when the catalog's view of a
+track last changed - a tag, the file's bytes, or where it lives - which a
+database trigger keeps, so every path that edits a track counts.
 
 **Scan & import** lists the library folders. Each one can be rescanned,
 **hidden** - still indexed, but out of the library, the facets and the

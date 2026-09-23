@@ -216,6 +216,17 @@ class ServerTests(unittest.TestCase):
             self.assertIsNotNone(tracks[0]["artist"], direction)
             self.assertIsNone(tracks[-1]["artist"], direction)
 
+    def test_the_last_edited_track_sorts_first_by_updated(self):
+        key = self.c.get("/api/library?q=Two").get_json()["tracks"][0][
+            "content_key"]
+        time.sleep(0.05)
+        self.c.post("/api/enrich/edit", json={"content_keys": [key],
+                                              "fields": {"album": "Other"}})
+        tracks = self.c.get(
+            "/api/library?sort=updated&dir=desc").get_json()["tracks"]
+        self.assertEqual(tracks[0]["content_key"], key)
+        self.assertGreater(tracks[0]["updated_at"], tracks[0]["added_at"])
+
     def test_a_column_nobody_defined_is_ignored_rather_than_run(self):
         r = self.c.get("/api/library?sort=t.rel_path);DROP+TABLE+track;--")
         self.assertEqual(r.status_code, 200)

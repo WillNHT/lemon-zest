@@ -233,6 +233,7 @@ def create_app(db_path=None):
             "state": [en.STATE_SQL, "t.rel_path"],
             "format": ["t.ext", "t.bitrate"],
             "added": ["t.added_at", "t.id"],
+            "updated": ["COALESCE(t.updated_at, t.added_at)", "t.id"],
             "isrc": ["t.isrc"],
             "on_device": ["t.rel_path"],
         }
@@ -346,6 +347,7 @@ def create_app(db_path=None):
                 "confidence": r["enrich_confidence"],
                 "overrides": r["overrides"],
                 "added_at": r["added_at"],
+                "updated_at": r["updated_at"] or r["added_at"],
                 "mtime": r["mtime"],
                 "empty": r["size"] == 0,
                 "untagged": not r["title"],

@@ -42,13 +42,30 @@ CREATE TABLE IF NOT EXISTS track (
     added_at     REAL,
     -- When this file stopped being new. Written by the promotion rule
     -- below rather than by a person: see promote_inbox.
-    inbox_done_at REAL
+    inbox_done_at REAL,
+    -- When what the catalog holds for this file last changed: its tags,
+    -- its bytes or its place. Kept by the trigger below rather than by each
+    -- writer, so a scan, an enrichment, a hand edit and a tag write all
+    -- count without any of them having to remember to.
+    updated_at   REAL
 );
 CREATE INDEX IF NOT EXISTS ix_track_isrc   ON track(isrc);
 CREATE INDEX IF NOT EXISTS ix_track_artist ON track(artist);
 CREATE INDEX IF NOT EXISTS ix_track_album  ON track(album);
 CREATE INDEX IF NOT EXISTS ix_track_root   ON track(root);
 CREATE INDEX IF NOT EXISTS ix_track_added  ON track(added_at);
+
+CREATE TRIGGER IF NOT EXISTS track_updated AFTER UPDATE ON track
+WHEN OLD.path IS NOT NEW.path OR OLD.content_key IS NOT NEW.content_key
+  OR OLD.title IS NOT NEW.title OR OLD.artist IS NOT NEW.artist
+  OR OLD.album IS NOT NEW.album OR OLD.album_artist IS NOT NEW.album_artist
+  OR OLD.track_no IS NOT NEW.track_no OR OLD.disc_no IS NOT NEW.disc_no
+  OR OLD.year IS NOT NEW.year OR OLD.genre IS NOT NEW.genre
+  OR OLD.isrc IS NOT NEW.isrc
+BEGIN
+  UPDATE track SET updated_at = (julianday('now') - 2440587.5) * 86400.0
+  WHERE id = NEW.id;
+END;
 
 -- Library folders the scanner watches. Kept apart from track.root so a
 -- folder that holds no music yet is still a place downloads can land: an
@@ -276,6 +293,17 @@ def migrate(con):
         # last seen. Backdating them all to now would put an existing
         # library in the inbox, which is exactly what the inbox is not for.
         con.execute("UPDATE track SET added_at = seen_at WHERE added_at IS NULL")
+
+    if track_cols and "updated_at" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN updated_at REAL")
+        # The best record there is of the last change: an applied match or
+        # a typed value, whichever came last, else when the file arrived.
+        con.execute(
+            "UPDATE track SET updated_at = MAX(COALESCE(added_at, seen_at), "
+            "COALESCE((SELECT applied_at FROM enrichment e "
+            "  WHERE e.content_key = track.content_key), 0), "
+            "COALESCE((SELECT MAX(set_at) FROM track_override o "
+            "  WHERE o.content_key = track.content_key), 0))")
 
     root_cols = _columns(con, "library_root")
     if root_cols and "hidden" not in root_cols:

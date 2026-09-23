@@ -572,6 +572,12 @@ const COLUMNS = {
     cell: (t) => h(ago(t.added_at)),
     cellTitle: (t) => `added ${when(t.added_at)} · file modified ${when(t.mtime)}`,
   },
+  updated: {
+    label: 'Updated', w: 104, cls: 'mono', sort: 'updated',
+    title: 'When its tags, its file or its place last changed',
+    cell: (t) => h(ago(t.updated_at)),
+    cellTitle: (t) => `updated ${when(t.updated_at)} · added ${when(t.added_at)}`,
+  },
   isrc: {
     label: 'ISRC', w: 110, cls: 'mono', sort: 'isrc',
     cell: (t) => h(t.isrc || ''),
@@ -582,11 +588,11 @@ const COLUMNS = {
 // landed, because that is the question it is asking.
 const DEFAULT_COLS = {
   library: ['on', 'no', 'title', 'duration', 'artist', 'album', 'state',
-            'format', 'added', 'isrc'],
+            'format', 'added', 'updated', 'isrc'],
   inbox: ['added', 'no', 'title', 'duration', 'artist', 'album', 'state',
-          'format', 'isrc'],
+          'format', 'updated', 'isrc'],
   playlist: ['on', 'no', 'title', 'duration', 'artist', 'album', 'state',
-             'format', 'added', 'isrc'],
+             'format', 'added', 'updated', 'isrc'],
 };
 
 const COLS_KEY = (view) => 'lz.cols.' + view;
@@ -968,6 +974,7 @@ function renderInspector() {
           bytes(row.size)].filter(Boolean).join(' \u00b7 '))}
         ${line('isrc', value('isrc'))}
         ${line('added', when(row.added_at))}
+        ${line('updated', when(row.updated_at))}
         ${line('modified', when(row.mtime))}
       </dl>
       <div class="path pick mono" title="${h(d.path || '')}">${h(d.path || '')}</div>
