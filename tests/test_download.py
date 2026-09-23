@@ -564,12 +564,22 @@ class DownloadTests(unittest.TestCase):
         summary = download.download(self.con, ["https://example.test/list"],
                                     root=self.root, cfg=self.cfg())
         path = summary["playlists"][0]["file"]
-        self.assertTrue(path.endswith("playlists/stub list.m3u8"), path)
+        # Beside the library folder, not inside it: /Music and /Playlists,
+        # the way a Rockbox card lays them out.
+        self.assertEqual(os.path.normcase(os.path.dirname(path)),
+                         os.path.normcase(os.path.join(
+                             os.path.dirname(self.root), "Playlists")
+                             .replace("\\", "/")))
         body = open(path, encoding="utf-8").read()
         self.assertIn("#PLAYLIST: stub list", body)
-        # Relative to the playlist file, so the folder can be moved whole.
-        self.assertIn("../A/x/one.m4a", body)
+        # From the card's root, so it reads the same on the card as here.
+        top = os.path.basename(self.root)
+        self.assertIn("/%s/A/x/one.m4a" % top, body)
+        self.assertNotIn("../", body)
         self.assertNotIn(self.root, body)
+        # And it reads back: a rescan finds the same tracks it names.
+        again = playlists.read(path)
+        self.assertTrue(all(e["abs_path"] for e in again["entries"]))
 
     def test_a_second_run_rewrites_the_file_rather_than_growing_it(self):
         os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
@@ -577,7 +587,20 @@ class DownloadTests(unittest.TestCase):
             summary = download.download(self.con, ["https://example.test/l"],
                                         root=self.root, cfg=self.cfg())
         body = open(summary["playlists"][0]["file"], encoding="utf-8").read()
-        self.assertEqual(body.count("../A/x/one.m4a"), 1)
+        self.assertEqual(body.count("/A/x/one.m4a"), 1)
+
+    def test_a_playlist_in_the_old_place_moves_on_the_next_scan(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root, cfg=self.cfg())
+        new = summary["playlists"][0]["file"]
+        os.remove(new)
+        old = os.path.join(self.root, "playlists", "stub list.m3u8")
+        playlists.write(old, "stub list", [("../A/x/one.m4a", "t", 1, None)],
+                        source_uri="https://example.test/list")
+        playlists.import_library(self.con, self.root)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
 
     def test_the_urls_asked_for_are_remembered(self):
         os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"

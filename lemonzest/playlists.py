@@ -89,6 +89,12 @@ def read(path):
             decoded = urllib.parse.unquote(raw)
             cand = decoded if os.path.isabs(decoded) else os.path.join(base, decoded)
             resolved = resolve_existing(os.path.normpath(cand))
+            if resolved is None and decoded[:1] in ("/", "\\"):
+                # "/Music/..." names a file from the root of the card the
+                # playlist sits on, which is the folder above the playlist
+                # folder. On a PC that is the folder the library sits in.
+                resolved = resolve_existing(os.path.normpath(os.path.join(
+                    os.path.dirname(base), decoded.lstrip("/\\"))))
             out["entries"].append({
                 "raw_path": raw,
                 "abs_path": norm(os.path.abspath(resolved)) if resolved else None,
@@ -325,18 +331,41 @@ def append_tracks(con, name, track_ids, origin="local", source_uri=None):
             "entries": pos}
 
 
-# Where a playlist lives on the PC side: a folder of its own inside the
-# library folder it describes. One place for both halves of a library, so a
-# library that is copied, moved or backed up takes its playlists with it,
-# and a scan of the folder finds them without being told where to look.
-LOCAL_DIR = "playlists"
+# Where a playlist lives on the PC side: a "Playlists" folder beside the
+# library folder, laid out the way a Rockbox card is - /Music and
+# /Playlists side by side - so the two folders can be copied onto a card as
+# they are. Entries are written from that shared parent ("/Music/Artist/..."),
+# which is what Rockbox resolves from the root of the card.
+LOCAL_DIR = "Playlists"
+# Where they used to go: a folder inside the library, with paths relative to
+# it. Read, and moved out of, but never written.
+LEGACY_DIR = "playlists"
 
 
-def local_path(root, name, directory=LOCAL_DIR):
-    return os.path.join(root, directory, safe_filename(name))
+def _parent(root):
+    """The folder a library folder sits in; the folder itself for a drive."""
+    root = os.path.abspath(root)
+    parent = os.path.dirname(root)
+    return root if os.path.normcase(parent) == os.path.normcase(root) \
+        else parent
 
 
-def write_local(con, name, root, directory=LOCAL_DIR):
+def local_dir(root):
+    return os.path.join(_parent(root), LOCAL_DIR)
+
+
+def local_path(root, name):
+    return os.path.join(local_dir(root), safe_filename(name))
+
+
+def card_path(track_root, rel_path):
+    """A track as a Rockbox playlist names it: from the card's root."""
+    top = os.path.abspath(track_root)
+    top = "" if _parent(top) == top else os.path.basename(top)
+    return "/" + "/".join(x for x in (norm(top), norm(rel_path)) if x)
+
+
+def write_local(con, name, root):
     """Write a catalog playlist out as a file beside the library.
 
     The device copies are written at sync time, against that device's own
@@ -353,24 +382,51 @@ def write_local(con, name, root, directory=LOCAL_DIR):
                       (name,)).fetchone()
     if row is None:
         raise ValueError("no such playlist: " + name)
-    path = local_path(root, name, directory)
-    folder = os.path.dirname(path)
+    path = local_path(root, name)
     rows = []
     for e in con.execute(
-            "SELECT e.raw_path, e.title_hint, e.duration, e.source_uri, "
-            "t.path AS track_path FROM playlist_entry e "
-            "LEFT JOIN track t ON t.id = e.track_id "
+            "SELECT e.title_hint, e.duration, e.source_uri, "
+            "t.path AS track_path, t.root, t.rel_path FROM playlist_entry e "
+            "JOIN track t ON t.id = e.track_id "
             "WHERE e.playlist_id = ? ORDER BY e.pos", (row["id"],)):
-        target = e["track_path"] or e["raw_path"]
-        if not target or not os.path.isfile(target):
+        if not os.path.isfile(e["track_path"]):
             continue
-        rows.append((norm(os.path.relpath(target, folder)), e["title_hint"],
+        rows.append((card_path(e["root"], e["rel_path"]), e["title_hint"],
                      e["duration"], e["source_uri"]))
     # The source goes in the file, not only in the catalog: a re-import -
     # which every scan of the library folder now does - would otherwise
     # read back a playlist that had forgotten where it came from.
     write(path, name, rows, source_uri=row["source_uri"])
+    legacy = os.path.join(root, LEGACY_DIR, safe_filename(name))
+    if os.path.isfile(legacy):
+        os.remove(legacy)
+        try:
+            os.rmdir(os.path.dirname(legacy))
+        except OSError:
+            pass            # not empty: something else still lives there
     return {"path": norm(path), "entries": len(rows)}
+
+
+def import_library(con, root):
+    """Read every playlist that belongs to a library folder.
+
+    The ones inside it, and the ones in the Playlists folder beside it. A
+    playlist a download wrote in the old place - inside the library, with
+    relative paths - is written out again in the new one.
+    """
+    found = import_dir(con, root, recursive=True)
+    if os.path.isdir(local_dir(root)):
+        found += import_dir(con, local_dir(root))
+    legacy = os.path.join(root, LEGACY_DIR)
+    for f in list_playlist_files(legacy):
+        name = read(os.path.join(legacy, f))["name"]
+        # Only what a download made: a hand-made playlist in that folder may
+        # name files the catalog does not hold, and rewriting it would drop
+        # them.
+        if con.execute("SELECT 1 FROM download_url WHERE playlist_name = ?",
+                       (name,)).fetchone():
+            write_local(con, name, root)
+    return found
 
 
 DEFAULT_TEMPLATE = "{name}.m3u8"

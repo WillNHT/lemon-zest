@@ -153,6 +153,14 @@ with no rescan in between. `--embed-metadata` writes the source URL into the
 `purl` tag, which the scanner already reads, so where a track came from
 survives in the catalog.
 
+A playlist URL becomes a playlist, written to a `Playlists` folder **beside**
+the library folder - `…/Music` and `…/Playlists`, the way a Rockbox card lays
+them out - with every entry named from that shared parent
+(`/Music/blink-182/…/Stay Together For The Kids.m4a`). Copy both folders to
+the root of a card and the playlists play as they are. A playlist an older
+version wrote inside the library (`Music/playlists`, relative paths) is moved
+out on the next scan.
+
 Two things stop a second run re-fetching what you already have. yt-dlp keeps
 a download archive at `.lemon-zest-downloads.txt` in the folder (pass
 `--no-archive` to ignore it), and adding a track to a playlist it is already

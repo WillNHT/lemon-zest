@@ -1031,7 +1031,7 @@ def create_app(db_path=None):
                 # an entry can only be matched to a track the scan has
                 # already catalogued.
                 _update(job_id, detail="reading playlists")
-                found = playlists.import_dir(c, root, recursive=True)
+                found = playlists.import_library(c, root)
                 counts["playlists"] = len(found)
                 counts["playlist_entries"] = sum(f["total"] for f in found)
                 # Whatever the scan found that has never been looked at

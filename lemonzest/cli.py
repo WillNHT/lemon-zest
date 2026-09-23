@@ -98,7 +98,7 @@ def scan_cmd(ctx, root, full, workers):
     )
     # The folder's playlists are part of the folder. Read after the audio,
     # because an entry can only be matched to a track already catalogued.
-    found = playlists.import_dir(con, root, recursive=True)
+    found = playlists.import_library(con, root)
     if found:
         matched = sum(f["matched"] for f in found)
         total = sum(f["total"] for f in found)
