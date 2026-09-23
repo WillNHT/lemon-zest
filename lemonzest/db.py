@@ -372,6 +372,13 @@ def migrate(con):
         con.execute("UPDATE download_url SET playlist_name = NULL "
                     "WHERE instr(url, 'list=OLAK5uy_') > 0")
 
+    # A YouTube category is not a genre (see meta.NOT_GENRES); a catalog
+    # that stored one treats it as the blank it is, so a lookup fills it.
+    if track_cols:
+        from .meta import NOT_GENRES
+        con.execute("UPDATE track SET genre = NULL WHERE LOWER(genre) IN (%s)"
+                    % ",".join("?" * len(NOT_GENRES)), sorted(NOT_GENRES))
+
     # Typing a value used to mark a file enriched at 1.00 with nothing
     # matched behind it. Those rows go back to raw; the typed values live in
     # track_override and are untouched.

@@ -375,6 +375,42 @@ class EnrichTests(unittest.TestCase):
                       date="1999-01-01", length=2.0)]))
         self.assertEqual(self.row("Blue")["genre"], "City Pop")
 
+    def test_a_youtube_category_is_not_a_genre(self):
+        """yt-dlp writes "Music" into the genre tag. That must not count."""
+        self.add("Tagged/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha",
+                 genre="People & Blogs")
+        scan.scan(self.con, self.lib)
+        self.assertIsNone(self.row("Blue")["genre"])
+
+        class ArtistOnly(StubMB):
+            def release_genres(self, release_id):
+                return []
+
+            def artist_genres(self, artist_id):
+                return ["j-pop"] if artist_id == "a-Alpha" else []
+
+        enrich.enrich_track(self.con, self.row("Blue"), ArtistOnly(search=[
+            recording("r1", "Blue", ["Alpha"], album="First",
+                      date="1999-01-01", length=2.0)]))
+        # The release had nothing; the artist is the common answer.
+        self.assertEqual(self.row("Blue")["genre"], "J-Pop")
+
+    def test_identified_tracks_without_a_genre_can_be_filled_later(self):
+        self.add("Tagged/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha")
+        scan.scan(self.con, self.lib)
+        enrich.enrich_track(self.con, self.row("Blue"), StubMB(search=[
+            recording("r1", "Blue", ["Alpha"], album="First",
+                      date="1999-01-01", length=2.0)]))
+        self.assertIsNone(self.row("Blue")["genre"])
+
+        class Later(StubMB):
+            def release_genres(self, release_id):
+                return ["rock"]
+
+        counts = enrich.fill_genres(self.con, Later(), write_tags=False)
+        self.assertEqual((counts["considered"], counts["filled"]), (1, 1))
+        self.assertEqual(self.row("Blue")["genre"], "Rock")
+
     def test_a_genre_lookup_that_fails_does_not_lose_the_match(self):
         self.add("Tagged/Blue.mp3", seconds=2.0, title="Blue", artist="Alpha")
         scan.scan(self.con, self.lib)

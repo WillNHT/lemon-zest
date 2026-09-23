@@ -491,6 +491,42 @@ def create_app(db_path=None):
                 q.resume()
         return jsonify(out)
 
+    # What the library is missing, filled in on request. Each asks somebody
+    # else's service about every file that lacks the thing, so it is a job
+    # with progress rather than a click that hangs.
+    MAINTENANCE = {"genres": "missing genres"}
+
+    @app.post("/api/maintenance/<task>")
+    def maintenance(task):
+        if task not in MAINTENANCE:
+            return jsonify({"error": "unknown task"}), 404
+        job_id = _new_job("maintenance", MAINTENANCE[task])
+
+        def work():
+            from . import enrich as en
+            try:
+                c = db_mod.connect(app.config["DB_PATH"])
+
+                def cb(done, total):
+                    _update(job_id, done=done, total=total,
+                            detail="%d of %d" % (done, total))
+
+                # MusicBrainz, so through the queue's one client.
+                with _queue().exclusive() as client:
+                    counts = en.fill_genres(c, client, progress=cb)
+                detail = ("%d of %d given a genre, %d have none on record"
+                          % (counts["filled"], counts["considered"],
+                             counts["none"]))
+                _update(job_id, state="done", result=counts, detail=detail,
+                        finished=time.time())
+            except Exception as exc:
+                _update(job_id, state="failed", error=str(exc),
+                        finished=time.time())
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+        return jsonify({"job": job_id})
+
     @app.get("/api/art/<path:content_key>")
     def track_art(content_key):
         """The artwork embedded in the file itself.

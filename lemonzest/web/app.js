@@ -2320,6 +2320,7 @@ function renderUtilities() {
   const ready = r && !r.loading && !r.error;
   const last = S.resetResult;
   return `<div class="pad stack">
+    ${renderMaintenance()}
     <div class="card">
       <header><h3>Start the library over</h3></header>
       <div class="in stack">
@@ -2352,6 +2353,36 @@ function renderUtilities() {
             <div class="mono">${last.errors.map(h).join('<br>')}</div>` : ''}
           </div></div>` : ''}
       </div>
+    </div>
+  </div>`;
+}
+
+/* What the library is missing, filled in on request.
+
+   Each of these asks somebody else's service about every file that lacks
+   the thing, so it is a job with a bar rather than something done on every
+   visit. New downloads get them on arrival; this is for what came before. */
+const MAINTENANCE = [
+  ['genres', 'Genres', 'Identified tracks with no genre get the one '
+    + 'MusicBrainz has for their release, or else for their artist.'],
+];
+
+function renderMaintenance() {
+  const job = S.job && S.job.kind === 'maintenance' ? S.job : null;
+  const running = !!(S.job && S.job.state === 'running');
+  return `<div class="card">
+    <header><h3>Fill in what is missing</h3>
+      <span class="muted">new downloads get these on arrival; this is for
+        the files that came before.</span></header>
+    <div class="in stack">
+      ${MAINTENANCE.map(([task, label, what]) => `<div class="hstack">
+        <button class="btn" data-maint="${task}" ${running ? 'disabled' : ''}
+          style="min-width:90px">${h(label)}</button>
+        <span class="muted">${h(what)}</span></div>`).join('')}
+      ${job ? `<div class="hstack"><span class="${
+          job.state === 'running' ? 'spin' : ''}"></span>
+        <span class="muted">${h(job.label)}: ${h(job.error || job.detail
+          || job.state)}</span></div>` : ''}
     </div>
   </div>`;
 }
@@ -2429,7 +2460,7 @@ function renderStatus() {
     const VERB = {
       sync: 'Syncing \u2192 ', download: 'Downloading ',
       enrich: 'Identifying ', 'write-tags': 'Writing tags to ',
-      scan: 'Scanning ',
+      scan: 'Scanning ', maintenance: 'Filling in ',
     };
     $('#status-label').textContent =
       (VERB[job.kind] || 'Working on ') + job.label;
@@ -3158,7 +3189,7 @@ document.addEventListener('click', (ev) => {
     + '[data-probe],[data-copylog],[data-inbox-seen],[data-clear-urls],'
     + '[data-play],[data-play-close],[data-useurl],[data-keep],[data-unkeep],'
     + '[data-keeprun],[data-pl-refresh],[data-sl-remove],[data-sl-clear],'
-    + '[data-queue],[data-reset-open],[data-reset-go],'
+    + '[data-queue],[data-reset-open],[data-reset-go],[data-maint],'
     + '[data-sl-apply],[data-pl-tolist],'
     + '[data-close-inspector],[data-dismiss-outcome],'
     + '[data-root-hide],[data-root-remove],[data-root-forget],'
@@ -3216,6 +3247,14 @@ document.addEventListener('click', (ev) => {
     });
   }
 
+  if (d.maint) {
+    return guard(async () => {
+      const res = await api('/maintenance/' + d.maint, { method: 'POST' });
+      S.job = { id: res.job, kind: 'maintenance', state: 'running', done: 0,
+                total: 0, label: d.maint };
+      watchJob(res.job, (job) => jobFinished(job));
+    });
+  }
   if (d.act === 'review') {
     // Out of the problems page and into the library, asking the one
     // question the card was about.

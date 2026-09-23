@@ -1073,6 +1073,20 @@ def enrich_backfill(ctx, dry_run):
                       "'enrich review' or the next 'enrich run'.[/]")
 
 
+@enrich.command("genres")
+@click.pass_context
+def enrich_genres(ctx):
+    """Give identified tracks with no genre the one MusicBrainz has."""
+    from . import enrich as en
+    con = _con(ctx)
+    cfg = en.get_config(con)
+    counts = en.fill_genres(con, en.MusicBrainz(contact=cfg["contact"] or None))
+    console.print(f"{counts['considered']:,} identified tracks had no genre - "
+                  f"[green]{counts['filled']:,}[/] filled, "
+                  f"{counts['none']:,} have none on record, "
+                  f"{counts['failed']:,} failed")
+
+
 @enrich.command("run")
 @click.option("--root", type=click.Path(), default=None,
               help="Only tracks under this library root.")

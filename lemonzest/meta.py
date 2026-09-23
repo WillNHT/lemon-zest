@@ -14,6 +14,17 @@ AUDIO_EXTS = {".m4a", ".mp3", ".flac", ".opus", ".ogg", ".aac", ".wav", ".alac",
 
 _CHUNK = 256 * 1024  # head and tail sampled for the content key
 
+# YouTube's video categories. yt-dlp writes the category into the genre tag,
+# so every download arrived with a genre of "Music" or "People & Blogs" -
+# which is not a genre, and which stopped the real one ever being looked
+# up, because a genre is only asked for when the file has none.
+NOT_GENRES = {
+    "music", "people & blogs", "entertainment", "film & animation",
+    "gaming", "comedy", "education", "howto & style", "news & politics",
+    "nonprofits & activism", "science & technology", "sports",
+    "travel & events", "autos & vehicles", "pets & animals",
+}
+
 
 def is_audio(path):
     return os.path.splitext(path)[1].lower() in AUDIO_EXTS
@@ -125,6 +136,8 @@ def read_tags(path):
     out["date"] = g("----:com.apple.itunes:releasedate", "tdrl",
                     "releasedate")
     out["genre"] = g("\xa9gen", "tcon", "genre")
+    if out["genre"] and out["genre"].strip().lower() in NOT_GENRES:
+        out["genre"] = None
     out["isrc"] = g("tsrc", "isrc", "----:com.apple.itunes:isrc")
     # yt-dlp writes the source URL here; on MP3 it lands in a TXXX/WXXX frame.
     out["purl"] = g("purl", "txxx:purl", "wxxx:purl", "comment", "\xa9cmt")

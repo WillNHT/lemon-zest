@@ -478,6 +478,10 @@ def build_args(cfg, urls, root, no_playlist=False, archive=True, output=None,
         # yt-dlp writes upload_date (20180201) into the date tag, which
         # Rockbox shows as the year verbatim. Keep only the year.
         "--parse-metadata", "%(release_year,upload_date>%Y)s:%(meta_date)s",
+        # yt-dlp fills the genre tag from YouTube's category - "Music",
+        # "People & Blogs" - which is not a genre. Left empty, the real one
+        # is looked up once the track is identified.
+        "--parse-metadata", ":(?P<meta_genre>)",
         # Long titles become path components; keep them inside what the
         # card's filesystem will accept later.
         "--trim-filenames", "120",

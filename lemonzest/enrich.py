@@ -439,6 +439,18 @@ class MusicBrainz:
         return [n for n, _ in sorted(by_name.items(),
                                      key=lambda kv: (-kv[1], kv[0]))]
 
+    def artist_genres(self, artist_id):
+        """The genres MusicBrainz records for an artist, best first."""
+        if ("artist", artist_id) not in self._genre_cache:
+            data = self.get(f"artist/{urllib.parse.quote(artist_id)}",
+                            inc="genres")
+            got = sorted((g for g in (data or {}).get("genres") or []
+                          if (g.get("name") or "").strip()),
+                         key=lambda g: (-(g.get("count") or 0), g["name"]))
+            self._genre_cache[("artist", artist_id)] = [
+                g["name"].strip() for g in got]
+        return self._genre_cache[("artist", artist_id)]
+
     def recording(self, mbid):
         """One recording in full, by id. How a fingerprint result is read."""
         return self.get(f"recording/{urllib.parse.quote(mbid)}",
@@ -717,7 +729,11 @@ def recording_fields(recording, prefer_album=None):
     length = recording.get("length")
     out = {"fields": fields, "artists": artists,
            "duration": (length / 1000.0) if length else None,
-           "mbid": recording.get("id"), "release_id": None}
+           "mbid": recording.get("id"), "release_id": None,
+           "artist_id": next((c["artist"].get("id")
+                              for c in recording.get("artist-credit") or []
+                              if isinstance(c, dict) and c.get("artist")),
+                             None)}
 
     isrcs = recording.get("isrcs") or []
     if isrcs:
@@ -777,6 +793,27 @@ def recording_fields(recording, prefer_album=None):
 # spent where it changes anything: on a file whose own tag is empty. A file
 # that already says "Shibuya-kei" is not improved by MusicBrainz voting for
 # "pop", and the release it came from is asked about once either way.
+def lookup_genres(client, release_id, artist_id):
+    """Genres for a track: its release's, or else its artist's.
+
+    Most releases carry no genre votes at all - a single, a Japanese
+    pressing, anything nobody has tagged - while the artist usually does.
+    The artist is the coarser answer and the far more common one, so it is
+    asked second, and only when the release had nothing. Never raises.
+    """
+    for ask, ref in (("release_genres", release_id),
+                     ("artist_genres", artist_id)):
+        if not ref or not hasattr(client, ask):
+            continue
+        try:
+            names = getattr(client, ask)(ref)
+        except Exception:      # noqa: BLE001 - a genre is never worth a failure
+            continue
+        if names:
+            return names
+    return []
+
+
 def _add_genre(client, cand, row):
     """Fill the candidate's genre from MusicBrainz, when the file has none.
 
@@ -788,12 +825,9 @@ def _add_genre(client, cand, row):
             return
     except (IndexError, KeyError):
         pass
-    if not cand.get("release_id") or cand["release_fields"].get("genre"):
+    if cand["release_fields"].get("genre"):
         return
-    try:
-        names = client.release_genres(cand["release_id"])
-    except Exception:      # noqa: BLE001 - a genre is never worth a failure
-        return
+    names = lookup_genres(client, cand.get("release_id"), cand.get("artist_id"))
     if names:
         # Title case, because that is how every other tagger writes them and
         # a library sorted by genre should not hold "rock" and "Rock".
@@ -1854,6 +1888,53 @@ def _drop_skipped(con, rows, counts):
     wanted = [r for r in rows if r["content_key"] not in blocked]
     counts["skipped"] += len(rows) - len(wanted)
     return wanted
+
+
+def fill_genres(con, client, progress=None, write_tags=True):
+    """Give identified tracks with no genre the one MusicBrainz has.
+
+    For files identified before genres came from the artist as well as the
+    release, and before a YouTube category stopped counting as one. Asks
+    only about identified tracks - the others have no recording to ask
+    about - and fills a blank, never replaces a genre. Returns counts.
+    """
+    rows = con.execute(
+        "SELECT t.content_key, e.mbid, e.release_id FROM track t "
+        "JOIN enrichment e ON e.content_key = t.content_key "
+        "WHERE e.status = 'applied' AND e.mbid IS NOT NULL "
+        "AND (t.genre IS NULL OR t.genre = '') AND t.size > 0 "
+        "GROUP BY t.content_key").fetchall()
+    counts = {"considered": len(rows), "filled": 0, "none": 0, "failed": 0,
+              "written": 0, "errors": []}
+    consecutive = 0
+    for i, r in enumerate(rows, 1):
+        try:
+            artist_id = None
+            names = lookup_genres(client, r["release_id"], None)
+            if not names:
+                rec = client.recording(r["mbid"]) or {}
+                artist_id = recording_fields(rec).get("artist_id")
+                names = lookup_genres(client, None, artist_id)
+            consecutive = 0
+        except LookupError_ as exc:
+            counts["failed"] += 1
+            _note_error(counts, exc)
+            consecutive += 1
+            if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                break
+            continue
+        if not names:
+            counts["none"] += 1
+        else:
+            _apply_fields(con, r["content_key"], {"genre": names[0].title()},
+                          time.time())
+            con.commit()
+            counts["filled"] += 1
+            if write_tags and write_back_result(con, r["content_key"])["ok"]:
+                counts["written"] += 1
+        if progress:
+            progress(i, len(rows))
+    return counts
 
 
 def run_tracks(con, content_keys, client=None, write_tags=False, artwork=False,

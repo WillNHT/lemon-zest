@@ -395,9 +395,14 @@ guess and you have just said what the answer is. Over a selection the box
 is not offered: one query cannot describe forty tracks.
 
 Genre comes from the release when the file has none — MusicBrainz records it
-per release and per release group, and the votes decide. It is only asked
-for when the tag is empty, so a file that already says *City Pop* keeps it
-and costs no extra request.
+per release and per release group, and the votes decide - and from the
+artist when the release has no votes, which is most singles. It is only
+asked for when the tag is empty, so a file that already says *City Pop*
+keeps it and costs no extra request. A YouTube *category* - "Music",
+"People & Blogs", which yt-dlp used to write into the genre tag - is not a
+genre and counts as empty; downloads no longer carry one. **Utilities > Fill
+in what is missing > Genres** (or `lemon-zest enrich genres`) fills the
+tracks identified before this.
 
 **Edit metadata** opens on one track with three tiers side by side — what the
 catalog says now, what the source proposed (click a proposal to drop it into
