@@ -12,6 +12,7 @@ import os
 # should be making rate-limited calls to somebody else's service.
 os.environ["LEMONZEST_AUTO_ENRICH"] = "0"
 
+import io
 import shutil
 import subprocess
 import sys
@@ -140,6 +141,29 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(p["copies"], [])
         self.assertEqual(p["deletes"], [])
         self.assertEqual(len(p["unchanged"]), 3)
+
+    def test_a_playlist_cover_goes_beside_the_playlist(self):
+        # What save_cover leaves beside the library: Playlists/<name>.jpg.
+        jpg = subprocess.run(
+            [FFMPEG, "-v", "quiet", "-f", "lavfi", "-i", "testsrc=size=64x64",
+             "-frames:v", "1", "-pix_fmt", "yuvj420p", "-f", "mjpeg", "pipe:1"],
+            capture_output=True, check=True).stdout
+        saved = playlists.save_cover(
+            "mix", self.lib, "https://example.test/cover.jpg",
+            opener=lambda req, timeout=None: io.BytesIO(jpg))
+        self.assertEqual(os.path.normcase(os.path.dirname(saved)),
+                         os.path.normcase(playlists.local_dir(self.lib)
+                                          .replace("\\", "/")))
+        self.assertEqual(playlists.find_cover(self.con, "mix"),
+                         playlists.cover_path(self.lib, "mix"))
+        self._sync()
+        cover = os.path.join(self.card, "Music", "mix.jpg")
+        self.assertTrue(os.path.isfile(cover))
+        # Unticking the playlist takes its cover off the card with it.
+        self.con.execute("DELETE FROM device_set")
+        self.con.commit()
+        self._sync()
+        self.assertFalse(os.path.exists(cover))
 
     def test_rockbox_playlists_use_absolute_music_paths(self):
         # Rockbox wants playlists in their own folder and entries written

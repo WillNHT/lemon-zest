@@ -99,6 +99,9 @@ def reset_library(con, delete_files=False):
                     if (only is None or name in only) and \
                             _remove(os.path.join(folder, name), errors):
                         playlist_files_deleted += 1
+                        # and its cover, which is named after it
+                        _remove(os.path.join(folder, os.path.splitext(name)[0]
+                                             + ".jpg"), errors)
 
     archives_deleted = 0
     for root in roots:

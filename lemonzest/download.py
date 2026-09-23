@@ -604,6 +604,12 @@ def probe(url, cfg, timeout=120):
         "is_playlist": bool(entries),
         "is_album": bool(entries) and pl_mod.is_album(url, info),
         "count": len(entries) if entries else 1,
+        # The biggest picture the listing offers. For a playlist that is its
+        # cover, square on YouTube Music; see playlists.save_cover.
+        "thumbnail": max((t for t in info.get("thumbnails") or []
+                          if t.get("url")),
+                         key=lambda t: (t.get("width") or 0), default={}
+                         ).get("url"),
         "entries": [{"title": e.get("title"), "duration": e.get("duration"),
                      "url": e.get("url") or e.get("id")}
                     for e in entries[:200]],
@@ -1257,6 +1263,11 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
             got["file"] = wrote["path"]
             log.append("wrote %s (%d entries)"
                        % (wrote["path"], wrote["entries"]))
+            thumb = ((probes or {}).get(got.get("url")) or {}).get("thumbnail")
+            if thumb:
+                cover = pl_mod.save_cover(got["name"], root, thumb)
+                if cover:
+                    log.append("wrote the playlist cover " + cover)
         except Exception as exc:      # noqa: BLE001
             # The catalog has the playlist either way; a folder that cannot
             # be written is not a reason to fail a download that worked.

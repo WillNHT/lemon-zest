@@ -187,6 +187,9 @@ def execute(con, plan, prune=False, on_event=None, dry_run=False):
         try:
             if os.path.exists(stale):
                 os.remove(stale)
+            cover = _on_disk(os.path.splitext(stale)[0] + ".jpg")
+            if os.path.exists(cover):
+                os.remove(cover)
             con.execute(
                 "DELETE FROM device_playlist WHERE device_id=? AND filename=?",
                 (device["id"], pd["filename"]),
@@ -229,6 +232,12 @@ def execute(con, plan, prune=False, on_event=None, dry_run=False):
                 "written_at=excluded.written_at",
                 (device["id"], fname, p["name"], n, time.time()),
             )
+            if p.get("cover"):
+                cover = os.path.splitext(dst)[0] + ".jpg"
+                try:
+                    _copy_one(p["cover"], cover)
+                except OSError as exc:
+                    summary["errors"].append(f"cover for {p['name']}: {exc}")
             log(con, device["id"], "playlist", f"{p['name']} ({n} entries)")
             con.commit()
             summary["playlists"] += 1

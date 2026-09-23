@@ -172,6 +172,11 @@ the root of a card and the playlists play as they are. A playlist an older
 version wrote inside the library (`Music/playlists`, relative paths) is moved
 out on the next scan.
 
+The playlist's own picture comes with it: `Playlists/<name>.jpg`, squared and
+saved as a baseline JPEG like every other cover, beside the playlist file
+where the player looks for it. A sync copies it next to the playlist on the
+card, and takes it off again with the playlist.
+
 An album or EP is not a playlist. YouTube Music serves one as a playlist URL
 (`list=OLAK5uy_…`, titled *Album - Dookie*); its tracks are downloaded and
 filed under the album, and no playlist is made for it. Album playlists made

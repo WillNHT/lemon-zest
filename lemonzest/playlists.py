@@ -426,6 +426,56 @@ def write_local(con, name, root):
     return {"path": norm(path), "entries": len(rows)}
 
 
+def cover_path(root, name):
+    """Where a playlist's cover sits: beside its file, same name, JPEG.
+
+    Which is where the player looks for it - "chill.jpg" next to
+    "chill.m3u8" - so the Playlists folder copied onto a card as it is
+    shows the covers too.
+    """
+    return os.path.splitext(local_path(root, name))[0] + ".jpg"
+
+
+def save_cover(name, root, url, opener=None):
+    """Fetch a playlist's own picture and keep it beside the playlist.
+
+    Squared and re-encoded as a baseline JPEG on the way in, like every
+    other cover, because that is the only kind Rockbox draws in colour.
+    Returns the path written, or None - a playlist with no cover still
+    shows its first track's, so a failure here costs nothing.
+    """
+    import urllib.request
+
+    from . import artwork
+    from .enrich import HTTP_TIMEOUT, USER_AGENT
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with (opener or urllib.request.urlopen)(req, timeout=HTTP_TIMEOUT) as r:
+            data = r.read()
+    except Exception:      # noqa: BLE001 - a cover is never worth a failure
+        return None
+    data, _ = artwork.normalise(data)
+    if not data or data[:2] != b"\xff\xd8":
+        return None      # not a JPEG and no ffmpeg to make it one
+    path = cover_path(root, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".lz-tmp", "wb") as fh:
+        fh.write(data)
+    os.replace(path + ".lz-tmp", path)
+    return norm(path)
+
+
+def find_cover(con, name):
+    """The cover saved for a playlist beside any library folder, or None."""
+    from .db import roots
+    for root in roots(con):
+        path = cover_path(root, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def import_library(con, root):
     """Read every playlist that belongs to a library folder.
 
