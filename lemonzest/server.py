@@ -494,7 +494,7 @@ def create_app(db_path=None):
     # What the library is missing, filled in on request. Each asks somebody
     # else's service about every file that lacks the thing, so it is a job
     # with progress rather than a click that hangs.
-    MAINTENANCE = {"genres": "missing genres"}
+    MAINTENANCE = {"genres": "missing genres", "lyrics": "missing lyrics"}
 
     @app.post("/api/maintenance/<task>")
     def maintenance(task):
@@ -511,12 +511,20 @@ def create_app(db_path=None):
                     _update(job_id, done=done, total=total,
                             detail="%d of %d" % (done, total))
 
-                # MusicBrainz, so through the queue's one client.
-                with _queue().exclusive() as client:
-                    counts = en.fill_genres(c, client, progress=cb)
-                detail = ("%d of %d given a genre, %d have none on record"
-                          % (counts["filled"], counts["considered"],
-                             counts["none"]))
+                if task == "lyrics":
+                    from . import lyrics
+                    counts = lyrics.fill(c, progress=cb)
+                    detail = ("%d of %d given lyrics, %d not found, %d "
+                              "already had them" % (
+                                  counts["written"], counts["considered"],
+                                  counts["none"], counts["had"]))
+                else:
+                    # MusicBrainz, so through the queue's one client.
+                    with _queue().exclusive() as client:
+                        counts = en.fill_genres(c, client, progress=cb)
+                    detail = ("%d of %d given a genre, %d have none on record"
+                              % (counts["filled"], counts["considered"],
+                                 counts["none"]))
                 _update(job_id, state="done", result=counts, detail=detail,
                         finished=time.time())
             except Exception as exc:

@@ -1597,7 +1597,7 @@ def _note_error(counts, message, track=None):
 
 
 def _process(con, rows, client, acoustid, counts, write_tags, artwork,
-             progress, query=None):
+             progress, query=None, with_lyrics=False):
     """The lookup loop. Shared by a whole-library run and a hand-picked one."""
     total = len(rows)
     consecutive = 0
@@ -1619,7 +1619,8 @@ def _process(con, rows, client, acoustid, counts, write_tags, artwork,
         counts[{"applied": "applied", "candidate": "candidates",
                 "none": "unmatched"}[status]] += 1
         if status == "applied" and write_tags:
-            res = write_back_result(con, row["content_key"], artwork=artwork)
+            res = write_back_result(con, row["content_key"], artwork=artwork,
+                                    with_lyrics=with_lyrics)
             counts["written" if res["ok"] else "write_failed"] += 1
             if res["reason"]:
                 _note_error(counts, res["reason"], row["rel_path"])
@@ -1718,7 +1719,7 @@ def auto_after_ingest(con, root=None, content_keys=None, progress=None,
         _process(con, rows, client, acoustid, counts,
                  True,   # write_tags: the point of the mode
                  True,   # artwork: a download's cover is a video frame
-                 progress)
+                 progress, with_lyrics=True)
     except Exception as exc:      # noqa: BLE001 - reported, never propagated
         counts["stopped"] = "%s: %s" % (type(exc).__name__, exc)
         _note_error(counts, exc)
@@ -1814,7 +1815,7 @@ class IngestStream:
                      self.counts,
                      True,   # write_tags: the point of the mode
                      True,   # artwork: a download's cover is a video frame
-                     None)
+                     None, with_lyrics=True)
             return self._outcome(content_key, before)
         except Exception as exc:      # noqa: BLE001 - reported, never raised
             self.counts["failed"] += 1
@@ -2015,7 +2016,7 @@ def pending_write(con, content_key):
     }
 
 
-def write_back_result(con, content_key, artwork=False):
+def write_back_result(con, content_key, artwork=False, with_lyrics=False):
     """Push an applied enrichment into the audio file. Returns a report.
 
     ``{"ok": bool, "reason": str|None, "wrote": bool}``. A failure is
@@ -2048,6 +2049,22 @@ def write_back_result(con, content_key, artwork=False):
     if not fields:
         return out(False, "the catalog has no values for this file to write - "
                           "identify it or type something in first")
+
+    from .paths import resolve_existing
+    if with_lyrics and resolve_existing(row["path"]) \
+            and not tags_mod.has_lyrics(row["path"]):
+        # Asked of LRCLIB with what the catalog now says, which is only
+        # worth asking once the track has been identified - and this is
+        # only reached then. Lyrics are a nicety: no answer, or no service,
+        # writes the rest of the tags regardless.
+        from . import lyrics as lyrics_mod
+        try:
+            text = lyrics_mod.fetch(row["artist"], row["title"], row["album"],
+                                    row["duration"])
+        except LookupError_:
+            text = None
+        if text:
+            fields["lyrics"] = text
 
     cover = None
     cover_note = None

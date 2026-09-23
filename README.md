@@ -404,6 +404,14 @@ genre and counts as empty; downloads no longer carry one. **Utilities > Fill
 in what is missing > Genres** (or `lemon-zest enrich genres`) fills the
 tracks identified before this.
 
+Lyrics come from [LRCLIB](https://lrclib.net), a free lyrics database that
+needs no key, and go **into the file** - `©lyr` in MP4, `USLT` in ID3,
+`LYRICS` in Vorbis comments - time-synced (LRC) when LRCLIB has them, plain
+when it does not. They are fetched when an identified track's tags are
+written, so every download that is identified gets them without being asked;
+**Utilities > Fill in what is missing > Lyrics** (or `lemon-zest lyrics`)
+fills the rest of the library. A file that already has lyrics is left alone.
+
 **Edit metadata** opens on one track with three tiers side by side — what the
 catalog says now, what the source proposed (click a proposal to drop it into
 the box), and anything already typed by hand. On a selection of many it edits

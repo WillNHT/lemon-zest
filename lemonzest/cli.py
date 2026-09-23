@@ -1087,6 +1087,19 @@ def enrich_genres(ctx):
                   f"{counts['failed']:,} failed")
 
 
+@cli.command("lyrics")
+@click.pass_context
+def lyrics_cmd(ctx):
+    """Embed lyrics from LRCLIB into every file that has none."""
+    from . import lyrics
+    counts = lyrics.fill(_con(ctx))
+    console.print(f"{counts['considered']:,} files without lyrics - "
+                  f"[green]{counts['written']:,}[/] written, "
+                  f"{counts['none']:,} not found, {counts['failed']:,} failed")
+    for e in counts["errors"][:5]:
+        console.print(f"[red]{e}[/]")
+
+
 @enrich.command("run")
 @click.option("--root", type=click.Path(), default=None,
               help="Only tracks under this library root.")

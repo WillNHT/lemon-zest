@@ -29,7 +29,7 @@ import tempfile
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import (APIC, TALB, TCON, TDRC, TDRL, TIT2, TPE1, TPE2,
-                         TPOS, TRCK, TSRC)
+                         TPOS, TRCK, TSRC, USLT)
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
@@ -44,6 +44,7 @@ from .paths import resolve_existing
 _MP4 = {
     "title": "\xa9nam", "artist": "\xa9ART", "album": "\xa9alb",
     "album_artist": "aART", "year": "\xa9day", "genre": "\xa9gen",
+    "lyrics": "\xa9lyr",
 }
 # The full release date has a tag of its own in every format, because the
 # year tag is what Rockbox shows as the year and "2018-02-01" is not one.
@@ -58,7 +59,7 @@ _VORBIS = {
     "title": "title", "artist": "artist", "album": "album",
     "album_artist": "albumartist", "year": "date", "genre": "genre",
     "isrc": "isrc", "track_no": "tracknumber", "disc_no": "discnumber",
-    "date": "releasedate",
+    "date": "releasedate", "lyrics": "lyrics",
 }
 
 
@@ -101,6 +102,10 @@ def _write_id3(audio, fields, cover):
         tags.setall("TRCK", [TRCK(encoding=3, text=[str(fields["track_no"])])])
     if fields.get("disc_no") is not None:
         tags.setall("TPOS", [TPOS(encoding=3, text=[str(fields["disc_no"])])])
+    if fields.get("lyrics") is not None:
+        tags.delall("USLT")
+        tags.add(USLT(encoding=3, lang="eng", desc="",
+                      text=str(fields["lyrics"])))
     if cover:
         data, mime = cover
         tags.delall("APIC")
@@ -253,6 +258,21 @@ def read_cover(path):
                 if audio.pictures else None)
     apic = audio.tags.getall("APIC") if hasattr(audio.tags, "getall") else []
     return (apic[0].data, apic[0].mime) if apic else None
+
+
+def has_lyrics(path):
+    """Whether the file already carries lyrics, in any format's tag."""
+    real = resolve_existing(path)
+    try:
+        audio = MutagenFile(real) if real else None
+    except Exception:      # noqa: BLE001 - unreadable is "no"
+        return False
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return False
+    if hasattr(tags, "getall"):
+        return bool(tags.getall("USLT") or tags.getall("SYLT"))
+    return bool(_raw_tag(audio, ("\xa9lyr", "lyrics", "unsyncedlyrics")))
 
 
 def _raw_tag(audio, keys):

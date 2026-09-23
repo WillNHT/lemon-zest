@@ -2365,6 +2365,8 @@ function renderUtilities() {
 const MAINTENANCE = [
   ['genres', 'Genres', 'Identified tracks with no genre get the one '
     + 'MusicBrainz has for their release, or else for their artist.'],
+  ['lyrics', 'Lyrics', 'Tracks with no lyrics get them from LRCLIB - '
+    + 'time-synced where it has them - written into the file.'],
 ];
 
 function renderMaintenance() {
