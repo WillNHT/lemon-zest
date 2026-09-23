@@ -1775,6 +1775,7 @@ function renderRecent(d) {
       <span class="clip" style="flex:1" title="${h(r.url)}">
         ${h(r.title || r.url)}
         ${r.is_playlist ? `<span class="tag">${num(r.item_count)} items</span>` : ''}
+        ${/list=OLAK5uy_/.test(r.url) ? '<span class="tag">album</span>' : ''}
         <span class="u">${h(r.url)}</span></span>
       <span class="faint mono" style="font-size:10px">${h(ago(r.last_used))}</span>
       ${r.is_playlist && !r.kept ? `<button class="btn sm" data-keep="${h(r.url)}"
@@ -1988,7 +1989,10 @@ function renderDownload() {
           ${S.dlProbe.uploader ? ' &middot; ' + h(S.dlProbe.uploader) : ''}
           &middot; ${S.dlProbe.is_playlist
             ? num(S.dlProbe.count) + ' items' : dur(S.dlProbe.duration)}
-          ${S.dlProbe.is_playlist ? `<div class="hstack" style="margin-top:6px">
+          ${S.dlProbe.is_album ? `<div class="faint" style="margin-top:6px">An
+            album, not a playlist: its tracks are filed under the album and no
+            playlist is made for it.</div>` : ''}
+          ${S.dlProbe.is_playlist && !S.dlProbe.is_album ? `<div class="hstack" style="margin-top:6px">
             <button class="btn sm" data-keep="${h(S.dlProbe.url)}"
               >${icon('i-keep')} Keep this playlist</button>
             <span class="faint">kept playlists sit above the log and fetch

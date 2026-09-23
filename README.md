@@ -161,6 +161,11 @@ the root of a card and the playlists play as they are. A playlist an older
 version wrote inside the library (`Music/playlists`, relative paths) is moved
 out on the next scan.
 
+An album or EP is not a playlist. YouTube Music serves one as a playlist URL
+(`list=OLAK5uy_…`, titled *Album - Dookie*); its tracks are downloaded and
+filed under the album, and no playlist is made for it. Album playlists made
+by earlier versions are dropped from the catalog and from beside the library.
+
 Two things stop a second run re-fetching what you already have. yt-dlp keeps
 a download archive at `.lemon-zest-downloads.txt` in the folder (pass
 `--no-archive` to ignore it), and adding a track to a playlist it is already

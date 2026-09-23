@@ -145,6 +145,23 @@ ORIGINS = (("music.youtube.", "youtube"), ("youtube.com", "youtube"),
            ("spotify.com", "spotify"))
 
 
+# YouTube Music serves an album, an EP or a single as a playlist whose id
+# starts with this, titled "Album - Dookie" or "EP - 7". It is a release,
+# not somebody's list, and the library already groups a release by its
+# album tag - a playlist of it only lengthens the playlist menu on a player.
+ALBUM_LIST_PREFIX = "OLAK5uy_"
+_ALBUM_TITLE = re.compile(r"^(album|ep|single)\s+-\s+", re.I)
+
+
+def is_album(url, info=None):
+    """Whether a playlist URL (or its listing) is really an album or EP."""
+    if ("list=" + ALBUM_LIST_PREFIX) in (url or ""):
+        return True
+    info = info or {}
+    return (str(info.get("id") or "").startswith(ALBUM_LIST_PREFIX)
+            or bool(_ALBUM_TITLE.match(str(info.get("title") or ""))))
+
+
 def origin_of(source_uri):
     uri = (source_uri or "").lower()
     for needle, name in ORIGINS:
@@ -174,6 +191,8 @@ def import_dir(con, directory, recursive=False):
     results = []
     for f in files:
         pl = read(f)
+        if pl["source_uri"] and is_album(pl["source_uri"]):
+            continue            # a release, not a playlist: see is_album
         matched = unmatched = 0
         origin = origin_of(pl["source_uri"])
         # How many of these entries actually resolve to catalogued files?
@@ -414,10 +433,18 @@ def import_library(con, root):
     playlist a download wrote in the old place - inside the library, with
     relative paths - is written out again in the new one.
     """
+    legacy = os.path.join(root, LEGACY_DIR)
+    # An album an older version made into a playlist. Only a download
+    # writes a YouTube Music album URL into a file, so these are ours to
+    # remove - and left beside the library they would reach the card.
+    for folder in (local_dir(root), legacy):
+        for f in list_playlist_files(folder):
+            path = os.path.join(folder, f)
+            if is_album(read(path)["source_uri"] or ""):
+                os.remove(path)
     found = import_dir(con, root, recursive=True)
     if os.path.isdir(local_dir(root)):
         found += import_dir(con, local_dir(root))
-    legacy = os.path.join(root, LEGACY_DIR)
     for f in list_playlist_files(legacy):
         name = read(os.path.join(legacy, f))["name"]
         # Only what a download made: a hand-made playlist in that folder may

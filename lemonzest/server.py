@@ -1223,7 +1223,8 @@ def create_app(db_path=None):
             return jsonify({"error": "that URL is a single video, not a "
                                      "playlist"}), 400
         dl_mod.keep_url(c, url, kept=True, info=info,
-                        playlist_name=playlists.norm_name(info["title"] or url),
+                        playlist_name=None if info.get("is_album")
+                        else playlists.norm_name(info["title"] or url),
                         root=(body.get("root") or "").strip() or None)
         return jsonify(_download_state(c))
 

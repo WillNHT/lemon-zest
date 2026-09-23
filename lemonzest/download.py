@@ -593,6 +593,7 @@ def probe(url, cfg, timeout=120):
         "uploader": info.get("uploader") or info.get("channel"),
         "duration": info.get("duration"),
         "is_playlist": bool(entries),
+        "is_album": bool(entries) and pl_mod.is_album(url, info),
         "count": len(entries) if entries else 1,
         "entries": [{"title": e.get("title"), "duration": e.get("duration"),
                      "url": e.get("url") or e.get("id")}
@@ -862,12 +863,17 @@ def _auto_playlists(con, urls, cfg, probes, downloaded, log):
     library with nothing tying them together.
 
     Only a URL that listed as a playlist makes one, and only under the name
-    the source gives it. A single video does not become a playlist of one.
+    the source gives it. A single video does not become a playlist of one,
+    and an album or EP does not become a playlist at all.
     """
     made = []
     for url in urls:
         info = (probes or {}).get(url)
         if not info or not info.get("is_playlist"):
+            continue
+        if pl_mod.is_album(url, info):
+            log.append("%s is an album, not a playlist: no playlist made"
+                       % (info.get("title") or url))
             continue
         name = pl_mod.norm_name(info.get("title") or "")
         if not name:

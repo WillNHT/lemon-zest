@@ -357,6 +357,16 @@ def migrate(con):
             "WHERE origin IN ('local', 'download') AND ("
             "  source_uri LIKE '%youtube.com%' OR source_uri LIKE '%youtu.be%')")
 
+    # A YouTube Music album or EP used to be made into a playlist. It is a
+    # release, not a list anybody made, so those go - the tracks stay, and
+    # a device carrying one drops its playlist file on the next sync.
+    if pl_cols:
+        con.execute("DELETE FROM playlist "
+                    "WHERE instr(source_uri, 'list=OLAK5uy_') > 0")
+    if dl_cols:
+        con.execute("UPDATE download_url SET playlist_name = NULL "
+                    "WHERE instr(url, 'list=OLAK5uy_') > 0")
+
     # Typing a value used to mark a file enriched at 1.00 with nothing
     # matched behind it. Those rows go back to raw; the typed values live in
     # track_override and are untouched.

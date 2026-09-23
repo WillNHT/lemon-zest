@@ -44,7 +44,9 @@ if "-J" in args:
                for i, n in enumerate(names)]
     one = len(entries) == 1 and not os.environ.get("LZ_FAKE_PLAYLIST")
     print(json.dumps({"title": "stub", "uploader": "stub", "duration": 1}
-                     if one else {"title": "stub list", "entries": entries}))
+                     if one else {"title": os.environ.get("LZ_FAKE_TITLE",
+                                                          "stub list"),
+                                  "entries": entries}))
     sys.exit(0)
 
 out = args[args.index("-o") + 1]
@@ -545,6 +547,42 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual([p["name"] for p in summary["playlists"]],
                          ["stub list"])
         self.assertEqual(summary["playlist"]["added"], 2)
+
+    def test_an_album_does_not_become_a_playlist(self):
+        os.environ["LZ_FAKE_FILES"] = "A/x/one.m4a;A/x/two.m4a"
+        os.environ["LZ_FAKE_TITLE"] = "Album - Dookie"
+        summary = download.download(self.con, ["https://example.test/list"],
+                                    root=self.root, cfg=self.cfg())
+        self.assertEqual(summary["playlists"], [])
+        self.assertEqual(summary["downloaded"], 2)
+        self.assertIsNone(self.con.execute(
+            "SELECT 1 FROM playlist").fetchone())
+
+    def test_an_album_url_is_known_by_its_list_id(self):
+        url = ("https://music.youtube.com/playlist?"
+               "list=OLAK5uy_mrF_EHJJul_9cUfE-snfFgdEY_nggl9c0")
+        self.assertTrue(playlists.is_album(url))
+        self.assertFalse(playlists.is_album(
+            "https://www.youtube.com/playlist?list=PLabc", {"title": "chill"}))
+
+    def test_album_playlists_made_before_are_dropped(self):
+        url = "https://music.youtube.com/playlist?list=OLAK5uy_abc"
+        playlists.append_tracks(self.con, "Album - Dookie", [],
+                                origin="youtube", source_uri=url)
+        playlists.append_tracks(self.con, "chill", [], origin="youtube",
+                                source_uri="https://youtube.com/playlist?list=PLx")
+        db.migrate(self.con)
+        self.assertEqual([r["name"] for r in self.con.execute(
+            "SELECT name FROM playlist")], ["chill"])
+        # And a file one of them left beside the library does not come back.
+        folder = playlists.local_dir(self.root)
+        playlists.write(os.path.join(folder, "Album - Dookie.m3u8"),
+                        "Album - Dookie", [], source_uri=url)
+        playlists.import_library(self.con, self.root)
+        self.assertFalse(os.path.exists(
+            os.path.join(folder, "Album - Dookie.m3u8")))
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM playlist").fetchone()[0], 1)
 
     def test_a_single_video_does_not_become_a_playlist_of_one(self):
         summary = download.download(self.con, ["https://example.test/v"],
