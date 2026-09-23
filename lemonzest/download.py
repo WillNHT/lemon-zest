@@ -914,6 +914,78 @@ def _already_have(con, root):
     return have
 
 
+# What a file said about itself on arrival, kept in media.initial_tags.
+INITIAL_FIELDS = ("title", "artist", "album", "album_artist", "track_no",
+                  "disc_no", "year", "date", "genre", "isrc")
+
+
+def note_source(con, source_id, url, now=None):
+    """Write down that ``url`` asked for this media item."""
+    if not source_id or not url:
+        return
+    now = now or time.time()
+    con.execute(
+        "INSERT INTO media_source(source_id, url, first_at, last_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(source_id, url) DO UPDATE SET "
+        "last_at = excluded.last_at", (source_id, url, now, now))
+
+
+def record_arrival(con, root, path, source_url=None):
+    """Keep what a downloaded file was the moment it arrived.
+
+    Called once it is catalogued and before anything identifies or tags it,
+    so the row it reads is the file as yt-dlp left it. The first arrival is
+    the one kept: a video fetched again later does not rewrite its history.
+    Returns the source id, or None for a file with no source URL in it.
+    """
+    import json
+    row = con.execute("SELECT * FROM track WHERE path = ?",
+                      (norm(os.path.abspath(path)),)).fetchone()
+    if not row or not row["source_id"]:
+        return None
+    con.execute(
+        "INSERT INTO media(source_id, url, root, initial_path, initial_key, "
+        "initial_tags, downloaded_at) VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(source_id) DO NOTHING",
+        (row["source_id"], row["purl"], row["root"], row["rel_path"],
+         row["content_key"],
+         json.dumps({f: row[f] for f in INITIAL_FIELDS
+                     if row[f] not in (None, "")}, ensure_ascii=False),
+         time.time()))
+    note_source(con, row["source_id"], source_url)
+    con.commit()
+    return row["source_id"]
+
+
+def provenance(con, content_key):
+    """Where a track came from and what it was, for the inspector.
+
+    None for a file that was not downloaded - or was, before its source URL
+    was written into it.
+    """
+    import json
+    row = con.execute("SELECT root, source_id, purl FROM track "
+                      "WHERE content_key = ? ORDER BY id LIMIT 1",
+                      (content_key,)).fetchone()
+    if not row or not row["source_id"]:
+        return None
+    m = con.execute("SELECT * FROM media WHERE source_id = ?",
+                    (row["source_id"],)).fetchone()
+    return {
+        "source_id": row["source_id"],
+        "url": (m["url"] if m else None) or row["purl"],
+        "downloaded_at": m["downloaded_at"] if m else None,
+        "backfilled": bool(m["backfilled"]) if m else True,
+        "initial_path": (norm(os.path.join(m["root"], m["initial_path"]))
+                         if m and m["initial_path"] else None),
+        "initial_tags": (json.loads(m["initial_tags"])
+                         if m and m["initial_tags"] else None),
+        "sources": [r["url"] for r in con.execute(
+            "SELECT url FROM media_source WHERE source_id = ? "
+            "ORDER BY first_at", (row["source_id"],))],
+    }
+
+
 def _write_date(path, released, log):
     """Put the release date yt-dlp knows into the file's own date tag.
 
@@ -1151,6 +1223,10 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
     have = _already_have(con, root) if archive else set()
     todo, seen_vids = [], set()
     for unit in units:
+        # Every URL that asks for a video is one of its sources, whether or
+        # not this run ends up fetching it.
+        if unit["vid"]:
+            note_source(con, "youtube:" + unit["vid"], unit["source"])
         if unit["vid"] and (unit["vid"] in have or unit["vid"] in seen_vids):
             # Already here, or already asked for by another URL in this run.
             batch["skipped"] += 1
@@ -1159,6 +1235,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         if unit["vid"]:
             seen_vids.add(unit["vid"])
         todo.append(unit)
+    con.commit()
     workers = max(1, min(MAX_WORKERS, _number(cfg.get("workers")) or 1,
                          len(todo) or 1))
     batch["workers"] = workers
@@ -1219,6 +1296,7 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         """Catalog one arrival, then hand it to the identification queue."""
         set_state(item, "indexing", "adding to the catalog")
         counts_one, ids = scan_mod.index_paths(c2, root, [item["path"]])
+        record_arrival(c2, root, item["path"], item.get("source"))
         for key in indexed:
             indexed[key] += counts_one[key]
         track_ids.extend(ids)
@@ -1467,6 +1545,8 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
                                      "" if len(arrived) == 1 else "s"),
              len(arrived), len(arrived))
         counts, track_ids = scan_mod.index_paths(con, root, arrived)
+        for item in batch["items"]:
+            record_arrival(con, root, item["path"], item.get("source"))
     if box.get("broken"):
         log.append("identifying arrivals as they landed could not be "
                    "started (%s); indexed at the end instead" % box["broken"])

@@ -7,6 +7,7 @@ and transcoding, neither of which the MVP does.
 """
 import hashlib
 import os
+import re
 
 from mutagen import File as MutagenFile
 
@@ -24,6 +25,22 @@ NOT_GENRES = {
     "nonprofits & activism", "science & technology", "sports",
     "travel & events", "autos & vehicles", "pets & animals",
 }
+
+
+_YOUTUBE_ID = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})")
+
+
+def source_id(url):
+    """What a file is, whatever it has been renamed or re-tagged to since.
+
+    ``youtube:<video id>``, read off the source URL yt-dlp writes into the
+    ``purl`` tag. The tag travels with the file and no tag write of ours
+    touches it, so it is the one identity a download keeps for life.
+    """
+    m = _YOUTUBE_ID.search(url or "")
+    return "youtube:" + m.group(1) if m else None
 
 
 def is_audio(path):
@@ -173,6 +190,7 @@ def probe(path):
            "ext": os.path.splitext(path)[1].lower(),
            "content_key": content_key(path, st.st_size)}
     rec.update(read_tags(path))
+    rec["source_id"] = source_id(rec["purl"])
     return rec
 
 

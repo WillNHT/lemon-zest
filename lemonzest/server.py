@@ -710,6 +710,9 @@ def create_app(db_path=None):
             "JOIN track t ON t.id = e.track_id "
             "WHERE t.content_key = ? GROUP BY p.id ORDER BY p.name",
             (content_key,))]
+        # Where it came from and what it was on arrival, when it was
+        # downloaded: the other half of "what is this file".
+        out["origin"] = dl_mod.provenance(c, content_key)
         return jsonify(out)
 
     @app.post("/api/enrich/<action>")

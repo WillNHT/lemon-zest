@@ -999,6 +999,7 @@ function renderInspector() {
              <button class="btn sm" data-sel-act="accept">Accept</button>
              <button class="btn sm" data-sel-act="reject">Reject</button>
            </div>` : ''}
+      ${renderOrigin(d)}
       <div class="pl-seen">
         <h4>As seen in</h4>
         ${(d.playlists || []).length
@@ -1012,6 +1013,42 @@ function renderInspector() {
       </div>
     </div>
   </aside>`;
+}
+
+/* Where a downloaded track came from, and what it was when it arrived.
+
+   The row above is the file now - renamed, re-tagged, identified. This is
+   the file before any of that: the video, every URL that asked for it,
+   where yt-dlp first put it and what its tags said then. */
+const ORIGIN_FIELDS = [['artist', 'artist'], ['title', 'title'],
+  ['album', 'album'], ['album_artist', 'album artist'], ['year', 'year'],
+  ['genre', 'genre']];
+
+function renderOrigin(d) {
+  const o = d.origin;
+  if (!o) return '';
+  const was = o.initial_tags || {};
+  const now = (f) => (d.overrides && d.overrides[f] !== undefined
+    ? d.overrides[f] : d.current[f]);
+  const changed = ORIGIN_FIELDS.filter(([f]) => was[f] !== undefined
+    && String(was[f]) !== String(now(f) === null || now(f) === undefined ? '' : now(f)));
+  return `<div class="pl-seen">
+    <h4>Where it came from</h4>
+    <dl class="kv">
+      ${o.url ? `<dt>video</dt><dd><a class="mono" style="word-break:break-all"
+        href="${h(o.url)}" target="_blank" rel="noreferrer">${h(o.url)}</a></dd>` : ''}
+      ${(o.sources || []).length ? `<dt>asked for by</dt><dd>${o.sources.map(u =>
+        `<div class="mono clip" title="${h(u)}" style="font-size:10px">${h(u)}</div>`).join('')}</dd>` : ''}
+      ${o.downloaded_at ? `<dt>downloaded</dt><dd>${h(when(o.downloaded_at))}</dd>` : ''}
+      ${o.initial_path ? `<dt>first saved as</dt><dd class="mono pick"
+        style="font-size:10px;word-break:break-all">${h(o.initial_path)}</dd>` : ''}
+      ${changed.map(([f, label]) => `<dt>${h(label)} was</dt>
+        <dd>${h(was[f])}</dd>`).join('')}
+    </dl>
+    ${o.backfilled ? `<div class="faint" style="font-size:10px">Downloaded
+      before this was recorded: what it looked like on arrival is not
+      known.</div>` : ''}
+  </div>`;
 }
 
 // The inspector follows the selection: one row, one subject.
@@ -2821,6 +2858,12 @@ function showEnrichModal(keys) {
           ${field('title', 'Title', search.title)}
           ${field('album', 'Album', search.album, 'used to prefer one release')}
         </form>
+        ${one.origin && one.origin.initial_tags ? `<div class="hstack" style="margin-top:6px">
+          <button class="btn sm" type="button" data-use-origin="1">Use what it
+            arrived as</button>
+          <span class="faint" style="font-size:10px">${h([
+            one.origin.initial_tags.artist, one.origin.initial_tags.title]
+            .filter(Boolean).join(' - '))}</span></div>` : ''}
         <p class="muted" style="margin-top:8px;font-size:11px">
           These start as what an automatic lookup would use - the tags, or
           the two halves of a video title when the artist tag is a channel
@@ -3213,6 +3256,18 @@ document.addEventListener('click', (ev) => {
   if (ev.target.closest('[data-run-enrich]')) return startEnrich(S.dialogKeys);
   if (ev.target.closest('[data-run-write]')) return startWriteTags(S.dialogKeys);
   if (ev.target.closest('[data-save-edit]')) return saveEdit(S.dialogKeys);
+  if (ev.target.closest('[data-use-origin]')) {
+    // Search from the file as it arrived rather than as it is now: the
+    // way back when a later edit or a wrong match led the tags astray.
+    const form = $('#enrich-query');
+    const was = (S.detail && S.detail.origin && S.detail.origin.initial_tags) || {};
+    if (form) {
+      for (const f of ['artist', 'title', 'album']) {
+        form.elements[f].value = was[f] || '';
+      }
+    }
+    return;
+  }
   const use = ev.target.closest('[data-use-proposed]');
   if (use) {
     const form = $('#edit-form');

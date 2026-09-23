@@ -182,6 +182,26 @@ An album or EP is not a playlist. YouTube Music serves one as a playlist URL
 filed under the album, and no playlist is made for it. Album playlists made
 by earlier versions are dropped from the catalog and from beside the library.
 
+### Where every file came from
+
+A download is traceable from the URL somebody typed to the file it became,
+however much it changed on the way:
+
+- **the source URLs** - every URL that asked for the video, so one song in
+  two playlists has both;
+- **the file as it arrived** - where yt-dlp first put it and what its tags
+  said, recorded once, before anything identifies or renames it;
+- **the file now** - the catalog row, after enrichment, hand edits and
+  `organise`.
+
+They are tied together by the video id in the source URL yt-dlp writes into
+the file (`purl`), which no tag write touches - so a video that became
+*Title X by Artist C* in a different folder is still known to be the one
+downloaded, and is not fetched again. The inspector shows it under **Where
+it came from**, and **Identify again** can search from what the file arrived
+as instead of what it says now. Files downloaded before this was recorded
+get a record from what the catalog held.
+
 ### Big libraries: several at once, pause and resume
 
 A playlist is split into its videos and fetched **three at a time** (one to

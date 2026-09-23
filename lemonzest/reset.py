@@ -120,6 +120,9 @@ def reset_library(con, delete_files=False):
     con.execute("DELETE FROM track")
     con.execute("DELETE FROM enrichment")
     con.execute("DELETE FROM track_override")
+    # Where each download came from goes with the files it describes.
+    con.execute("DELETE FROM media")
+    con.execute("DELETE FROM media_source")
     con.execute("DELETE FROM sync_list")
     # The URLs stay, but nothing they fed exists any more.
     con.execute("UPDATE download_url SET last_added = 0, last_checked = NULL")

@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS track (
     genre        TEXT,
     isrc         TEXT,
     purl         TEXT,                   -- yt-dlp source URL
+    -- "youtube:<video id>", off purl: who this file is for life, whatever
+    -- it is renamed or re-tagged to. The key into media below.
+    source_id    TEXT,
     codec        TEXT,
     bitrate      INTEGER,
     sample_rate  INTEGER,
@@ -55,6 +58,36 @@ CREATE INDEX IF NOT EXISTS ix_track_artist ON track(artist);
 CREATE INDEX IF NOT EXISTS ix_track_album  ON track(album);
 CREATE INDEX IF NOT EXISTS ix_track_root   ON track(root);
 CREATE INDEX IF NOT EXISTS ix_track_added  ON track(added_at);
+CREATE INDEX IF NOT EXISTS ix_track_source ON track(source_id);
+
+-- Where a downloaded file came from, and what it was when it arrived. The
+-- track row is what the file is now - renamed by organise, re-tagged by
+-- enrichment or by hand - and this is what it was before any of that: the
+-- file yt-dlp wrote, where, and what its tags said. Written once, on first
+-- arrival, and never updated, so a later pass can start again from the
+-- original rather than from whatever the last one left.
+CREATE TABLE IF NOT EXISTS media (
+    source_id     TEXT PRIMARY KEY,      -- "youtube:<video id>"
+    url           TEXT,                  -- the video itself
+    root          TEXT,                  -- library folder it landed in
+    initial_path  TEXT,                  -- relative to root, as yt-dlp named it
+    initial_key   TEXT,
+    initial_tags  TEXT,                  -- JSON: what the file said on arrival
+    downloaded_at REAL,
+    -- Recorded after the fact, for a file downloaded before this table
+    -- existed: the "initial" values are what the catalog held then.
+    backfilled    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Every URL that asked for a media item. Many to one: the same video in two
+-- playlists is one file with two sources, and both are kept.
+CREATE TABLE IF NOT EXISTS media_source (
+    source_id TEXT NOT NULL,
+    url       TEXT NOT NULL,
+    first_at  REAL,
+    last_at   REAL,
+    PRIMARY KEY (source_id, url)
+);
 
 CREATE TRIGGER IF NOT EXISTS track_updated AFTER UPDATE ON track
 WHEN OLD.path IS NOT NEW.path OR OLD.content_key IS NOT NEW.content_key
@@ -299,6 +332,14 @@ def migrate(con):
     if track_cols and "date" not in track_cols:
         con.execute("ALTER TABLE track ADD COLUMN date TEXT")
 
+    if track_cols and "source_id" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN source_id TEXT")
+        # purl is what yt-dlp writes: https://www.youtube.com/watch?v=<id>.
+        con.execute(
+            "UPDATE track SET source_id = 'youtube:' || "
+            "substr(purl, instr(purl, 'watch?v=') + 8, 11) "
+            "WHERE instr(purl, 'youtube.com/watch?v=') > 0")
+
     if track_cols and "updated_at" not in track_cols:
         con.execute("ALTER TABLE track ADD COLUMN updated_at REAL")
         # The best record there is of the last change: an applied match or
@@ -496,6 +537,22 @@ def connect(path=None, same_thread=True):
         "SELECT DISTINCT root, NULL, NULL FROM track "
         "WHERE root NOT IN (SELECT root FROM library_root)"
     )
+    # Files downloaded before media existed get a record now, from what the
+    # catalog holds - the best "as it arrived" there is for them. Once.
+    if meta_get(con, "media_backfilled") is None:
+        con.execute(
+            "INSERT OR IGNORE INTO media(source_id, url, root, initial_path, "
+            "initial_key, downloaded_at, backfilled) "
+            "SELECT source_id, purl, root, rel_path, content_key, added_at, 1 "
+            "FROM track WHERE source_id IS NOT NULL")
+        con.execute(
+            "INSERT OR IGNORE INTO media_source(source_id, url, first_at, "
+            "last_at) SELECT DISTINCT t.source_id, p.source_uri, "
+            "p.imported_at, p.imported_at FROM playlist_entry e "
+            "JOIN playlist p ON p.id = e.playlist_id "
+            "JOIN track t ON t.id = e.track_id "
+            "WHERE t.source_id IS NOT NULL AND p.source_uri IS NOT NULL")
+        meta_set(con, "media_backfilled", time.time())
     con.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

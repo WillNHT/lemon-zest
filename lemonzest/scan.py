@@ -13,7 +13,7 @@ from .paths import norm
 
 TRACK_FIELDS = (
     "size mtime content_key ext duration title artist album album_artist "
-    "track_no disc_no year date genre isrc purl codec bitrate sample_rate"
+    "track_no disc_no year date genre isrc purl codec bitrate sample_rate source_id"
 ).split()
 
 
