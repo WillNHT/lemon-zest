@@ -656,9 +656,9 @@ def create_app(db_path=None):
     def enrich_state():
         """Move a selection between states by hand.
 
-        Only `skipped` and `raw` are settable: the other two are outcomes,
-        and a button that declared a file `enriched` with no answer behind it
-        would be writing a claim rather than recording one.
+        `skipped`, `raw` and `enriched` are settable. `awaiting` is an
+        outcome: a button that declared a proposal waiting with none behind
+        it would be writing a claim rather than recording one.
         """
         from . import enrich as en
         body = request.json or {}

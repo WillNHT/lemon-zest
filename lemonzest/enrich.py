@@ -1299,17 +1299,21 @@ def reject(con, content_key):
 def set_state(con, content_keys, state):
     """Move files between the four states by hand. Returns how many moved.
 
-    Only the two states a person sets directly are accepted here - ``skipped``
-    and ``raw``. ``enriched`` is what accepting or typing a value does, and
-    ``awaiting`` is what a lookup produces; setting either by decree would
-    claim an answer exists when none does.
+    ``skipped``, ``raw`` and ``enriched`` are accepted. ``awaiting`` is what a
+    lookup produces, and declaring one by hand would claim a proposal exists
+    when none does.
 
     ``raw`` deletes the row rather than storing a status. A file with no
     enrichment row is exactly what "never been through the queue" means, and
     leaving a husk behind would keep a stale confidence and a stale mbid
     attached to a file whose next lookup starts from nothing.
+
+    ``enriched`` is a person saying "this file is right as it is". It is
+    stored with source ``manual`` and no confidence - nothing was matched -
+    and it drops any stored proposal, since accepting one is what Accept is
+    for.
     """
-    if state not in ("skipped", "raw"):
+    if state not in ("skipped", "raw", "enriched"):
         raise ValueError("cannot set state %r by hand" % state)
     keys = [k for k in (content_keys or []) if k]
     if not keys:
@@ -1321,6 +1325,16 @@ def set_state(con, content_keys, state):
             cur = con.execute("DELETE FROM enrichment WHERE content_key = ?",
                               (key,))
             n += cur.rowcount if cur.rowcount > 0 else 0
+        elif state == "enriched":
+            con.execute(
+                "INSERT INTO enrichment(content_key, status, source, "
+                "confidence, fields, fetched_at, applied_at) "
+                "VALUES (?,'applied','manual',0.0,'{}',?,?) "
+                "ON CONFLICT(content_key) DO UPDATE SET status='applied', "
+                "source='manual', confidence=0.0, fields='{}', mbid=NULL, "
+                "release_id=NULL, applied_at=excluded.applied_at",
+                (key, now, now))
+            n += 1
         else:
             con.execute(
                 "INSERT INTO enrichment(content_key, status, source, "
@@ -1335,14 +1349,11 @@ def set_state(con, content_keys, state):
 def override(con, content_key, **fields):
     """Record a hand-typed value. Outranks every source, now and later.
 
-    The file also comes out of the queue as ``enriched``: somebody has said
-    what this track is, which is a better answer than any lookup was going to
-    return, and leaving it as ``raw`` would send a run off to overwrite the
-    columns the typing did not cover.
-
-    An existing row keeps its ``mbid`` and ``release_id`` - those identify a
-    recording, and correcting a spelling does not unidentify it. Only the
-    status and the provenance move.
+    Typing does not change the file's state. Correcting a spelling is not
+    identifying a recording, so a raw file stays raw - a later lookup fills
+    the columns the typing did not cover, and the typed ones still win - and
+    an enriched one keeps its source and confidence. Declaring a file
+    enriched is its own act: ``set_state(..., "enriched")``.
     """
     now = time.time()
     wrote = False
@@ -1355,13 +1366,6 @@ def override(con, content_key, **fields):
             "value=excluded.value, set_at=excluded.set_at",
             (content_key, field, value, now))
         wrote = True
-    if wrote:
-        con.execute(
-            "INSERT INTO enrichment(content_key, status, source, confidence, "
-            "fields, fetched_at, applied_at) VALUES (?,?,?,?,?,?,?) "
-            "ON CONFLICT(content_key) DO UPDATE SET status='applied', "
-            "source='manual', confidence=1.0, applied_at=excluded.applied_at",
-            (content_key, "applied", "manual", 1.0, "{}", now, now))
     _apply_fields(con, content_key, {}, now)
     con.commit()
     return wrote

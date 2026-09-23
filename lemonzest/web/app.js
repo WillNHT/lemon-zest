@@ -472,7 +472,7 @@ function renderBrowser() {
 const STATE_TAG = {
   raw:      { cls: '',     label: 'raw',      hint: 'never looked up. A run will pick this one up.' },
   awaiting: { cls: 'warn', label: 'review',   hint: 'a match is waiting for your decision.' },
-  enriched: { cls: 'ok',   label: 'enriched', hint: 'values are in the catalog.' },
+  enriched: { cls: 'ok',   label: 'enriched', hint: 'identified by a lookup, or marked enriched by hand.' },
   skipped:  { cls: 'bad',  label: 'skipped',  hint: 'excluded. Never looked up again until you change it.' },
 };
 
@@ -1161,6 +1161,7 @@ function renderSelectionBar(allShown) {
     ${btn('reject', 'Reject', 'R', '', offPage > 0 || has('awaiting'))}
     ${btn('skip', 'Skip', 'S')}
     ${btn('raw', 'Mark raw', 'U')}
+    ${btn('enriched', 'Mark enriched', 'N')}
     ${btn('edit', 'Edit metadata', '\u21b5')}
     ${btn('write', 'Write tags to files', 'W', 'danger')}
   </div>`;
@@ -2625,7 +2626,7 @@ function decide(act, keys) {
       await loadLibrary();
     });
   }
-  if (act === 'skip' || act === 'raw') {
+  if (act === 'skip' || act === 'raw' || act === 'enriched') {
     closeModal();
     // Filing, not a verdict: the rows stay picked, so changing your mind is
     // one more keystroke rather than another hunt through the table.
@@ -2633,7 +2634,7 @@ function decide(act, keys) {
       await api('/enrich/state', {
         method: 'POST',
         body: JSON.stringify({ content_keys: keys,
-                               state: act === 'skip' ? 'skipped' : 'raw' }),
+                               state: act === 'skip' ? 'skipped' : act }),
       });
       await loadCore();
       await loadLibrary();
@@ -3679,6 +3680,7 @@ document.addEventListener('keydown', (ev) => {
   if (key === 'r') { ev.preventDefault(); return selAction('reject'); }
   if (key === 's') { ev.preventDefault(); return selAction('skip'); }
   if (key === 'u') { ev.preventDefault(); return selAction('raw'); }
+  if (key === 'n') { ev.preventDefault(); return selAction('enriched'); }
   if (key === 'w') { ev.preventDefault(); return selAction('write'); }
   if (ev.key === 'Enter') { ev.preventDefault(); return selAction('edit'); }
 });

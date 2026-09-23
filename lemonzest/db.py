@@ -329,6 +329,14 @@ def migrate(con):
             "WHERE origin IN ('local', 'download') AND ("
             "  source_uri LIKE '%youtube.com%' OR source_uri LIKE '%youtu.be%')")
 
+    # Typing a value used to mark a file enriched at 1.00 with nothing
+    # matched behind it. Those rows go back to raw; the typed values live in
+    # track_override and are untouched.
+    if _columns(con, "enrichment"):
+        con.execute("DELETE FROM enrichment WHERE source = 'manual' "
+                    "AND status = 'applied' AND confidence = 1.0 "
+                    "AND fields = '{}' AND mbid IS NULL")
+
     if dl_cols and "seq" not in dl_cols:
         con.execute("ALTER TABLE download_url ADD COLUMN seq INTEGER NOT NULL "
                     "DEFAULT 0")

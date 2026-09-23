@@ -253,7 +253,7 @@ column of its own.
 | --- | --- | --- |
 | **raw** | never looked up, or a lookup that came back empty | picks it up |
 | **awaiting review** | a match is stored and wants your decision | leaves it alone |
-| **enriched** | values are in the catalog - matched, accepted or typed | leaves it alone unless you ask again |
+| **enriched** | identified - matched automatically, accepted, or marked enriched by hand | leaves it alone unless you ask again |
 | **skipped** | deliberately excluded | **never** looks at it, even with `--redo`, even when you select it by hand |
 
 `skipped` is the one with teeth. A live bootleg MusicBrainz will never have,
@@ -305,7 +305,9 @@ Four rules make it safe to run over a library you care about:
   appears on. Title, artist and ISRC come from the recording and are taken;
   album, year and track number are filled in only where the file was silent.
 - **A hand-typed value wins.** `enrich set` outranks every source, survives a
-  re-run, and is re-applied after any later match.
+  re-run, and is re-applied after any later match. Typing a value does not
+  make a file *enriched*: correcting a spelling is not identifying a
+  recording. Only a lookup, an accepted match, or **Mark enriched** does.
 - **Audio files are not touched** unless you pass `--write-tags`, which asks
   first. When you do, each file is rewritten to a copy and swapped in, so an
   interruption leaves the original — and the content key is recomputed in the
@@ -348,6 +350,7 @@ on screen. Arrow keys walk the list, shift extends. With something selected:
 | `A` / `R` | accept or reject the stored match |
 | `S` | skip |
 | `U` | mark raw |
+| `N` | mark enriched - "this file is right as it is" |
 | `Enter` | edit the metadata by hand |
 | `W` | write the tags into the files |
 | `Esc` | clear the selection |
