@@ -1,6 +1,104 @@
 # CHANGELOG
 
 
+## v0.9.0 (2026-09-24)
+
+### Bug Fixes
+
+- **download**: Youtube Music albums and EPs are not playlists
+  ([`8b117fc`](https://github.com/WillNHT/lemon-zest/commit/8b117fcc1ab254b15695728056b23b21e6c0a247))
+
+- **enrich**: Real genres instead of YouTube categories
+  ([`1f69a46`](https://github.com/WillNHT/lemon-zest/commit/1f69a4692ebc5e321856243475ae335efdb22134))
+
+- **enrich**: Typing metadata no longer marks a file enriched
+  ([`c49a95c`](https://github.com/WillNHT/lemon-zest/commit/c49a95c1618581ec7dafa4e1e31dcf855099f14b))
+
+- **playlists**: Write library playlists beside the library, from the card root
+  ([`c02dc17`](https://github.com/WillNHT/lemon-zest/commit/c02dc17ee04c029ab87b92dba1f86cdac8a371c0))
+
+### Continuous Integration
+
+- Keep build artifacts for a day, and only the newest three
+  ([`b5362a9`](https://github.com/WillNHT/lemon-zest/commit/b5362a9429df7084e64941ae91d58c0a366f950e))
+
+Each CI build uploads a ~190 MB zip, and a week of pushes filled the repository's artifact storage
+  so every later upload failed. Uploads now expire after one day, and a step after the upload
+  deletes all but the three newest lemon-zest-* artifacts. Releases carry their own zip and are
+  unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+- **download**: Fetch several at once, with pause, stop and resume
+  ([`26011da`](https://github.com/WillNHT/lemon-zest/commit/26011da8433ed2de98319b65de961980490d5a3f))
+
+- **download**: Trace every download from its source URL to the file it became
+  ([`82138cc`](https://github.com/WillNHT/lemon-zest/commit/82138ccf72da465b3542d5b1ebe19639d712a2a3))
+
+A media record per video keeps what yt-dlp wrote before anything changed it: the video URL, the
+  folder and path it first landed at, and the tags it arrived with. media_source keeps every URL
+  that asked for it, so one video in two playlists has both. The track links to it through
+  source_id, the video id read from the purl tag yt-dlp embeds - which no tag write touches, so the
+  link survives enrichment, hand edits and organise, and a file whose name, tags and folder all
+  changed is still recognised and not downloaded again.
+
+The inspector shows where a track came from and what it was on arrival, and Identify again can
+  search from the arrival tags. Downloads made before this get a record from what the catalog held.
+
+Closes #24
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **library**: Move a library to another computer by copying its folder
+  ([`7c27f04`](https://github.com/WillNHT/lemon-zest/commit/7c27f04d08d236682be020382d8694ed1f08aa41))
+
+Each library folder now carries a copy of the catalog in .lemon-zest/, refreshed after every scan
+  and download (and after a reset), so the folder is the thing to copy: music, playlists,
+  identifications, typed values, download history and paused downloads travel with it. On the other
+  computer, Utilities > Move to another computer (or lemon-zest unpack) takes the copy in and
+  relocates every stored path from where the folder was to where it is. Credentials - cookies, the
+  Firefox profile, the AcoustID key, the MusicBrainz contact - are never written into the copy, and
+  the receiving machine keeps its own.
+
+relocate (lemon-zest relocate, or "not found > Point here" under Add music) rewrites paths for a
+  folder moved on the same machine; rows a scan already made at the new place give way to the older
+  ones, which carry the playlists and rules.
+
+Closes #25
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **lyrics**: Embed lyrics from LRCLIB
+  ([`d08068c`](https://github.com/WillNHT/lemon-zest/commit/d08068c90f36f912e96b6b8121aecbd6f5225031))
+
+- **playlists**: Save and sync playlist covers
+  ([`0a3362a`](https://github.com/WillNHT/lemon-zest/commit/0a3362a3975684ba725bd090f387b15821b7f145))
+
+- **tags**: Keep the full release date beside a year-only year
+  ([`62b22f0`](https://github.com/WillNHT/lemon-zest/commit/62b22f07e41b4c98873bf5b3e2326344fddff858))
+
+- **ui**: List tracks that are in no playlist
+  ([`0b674a8`](https://github.com/WillNHT/lemon-zest/commit/0b674a82da3db57dc330cc52bdaf54b88c69f0ae))
+
+- **ui**: Updated column showing when a track last changed
+  ([`e2812d4`](https://github.com/WillNHT/lemon-zest/commit/e2812d4b0bbdff54fe536a282634957a90e431d7))
+
+### Testing
+
+- **download**: Stop two download tests racing the worker pool
+  ([`c63e0b6`](https://github.com/WillNHT/lemon-zest/commit/c63e0b6b56433eaf84afd9c8e484b6ed10e4541b))
+
+With several workers either item can arrive first, so a stop can catch either one unwritten: the
+  stop test now checks that every item is either downloaded or owed to a resume, not which. The
+  output-timing test measured the "batch:" line the engine now writes before any child starts, and
+  an absolute one-second bound that a loaded machine misses; it now waits for the child's own line
+  and checks it arrived well before the child exited.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.8.0 (2026-09-17)
 
 ### Features
