@@ -126,8 +126,19 @@ Pair with `--profile rockbox`. Music goes to `/Music`, playlists to their own
 
 Rockbox also shows a full date tag as the year and draws letterboxed or
 non-4:2:0 JPEG covers badly (padded, or in greyscale). New downloads are
-written with the year only and a square, baseline 4:2:0 cover. For files
-downloaded earlier, fix them once and sync again:
+written with the year only and a square, baseline 4:2:0 cover.
+
+The full date is not thrown away: it goes in a tag of its own, the one
+MusicBrainz Picard uses for a release date - `TDRL` in ID3, `RELEASEDATE` in
+Vorbis comments, and a `----:com.apple.iTunes:RELEASEDATE` atom in MP4 - so
+the year tag stays a year and a player that wants "this day, years ago" can
+still find the day. A download takes it from the video's release or upload
+date; an identified track from its MusicBrainz release, filling a blank only.
+The catalog keeps it as `date` (ISO, `2018-02-01`), editable beside the year.
+
+For files downloaded earlier, fix them once and sync again - `fix-tags` moves
+a full date out of the year tag into the release-date tag rather than
+discarding it:
 
 ```
 lemon-zest fix-tags --dry-run
@@ -152,6 +163,63 @@ is an ordinary library track immediately: tick it onto a card and sync,
 with no rescan in between. `--embed-metadata` writes the source URL into the
 `purl` tag, which the scanner already reads, so where a track came from
 survives in the catalog.
+
+A playlist URL becomes a playlist, written to a `Playlists` folder **beside**
+the library folder - `…/Music` and `…/Playlists`, the way a Rockbox card lays
+them out - with every entry named from that shared parent
+(`/Music/blink-182/…/Stay Together For The Kids.m4a`). Copy both folders to
+the root of a card and the playlists play as they are. A playlist an older
+version wrote inside the library (`Music/playlists`, relative paths) is moved
+out on the next scan.
+
+The playlist's own picture comes with it: `Playlists/<name>.jpg`, squared and
+saved as a baseline JPEG like every other cover, beside the playlist file
+where the player looks for it. A sync copies it next to the playlist on the
+card, and takes it off again with the playlist.
+
+An album or EP is not a playlist. YouTube Music serves one as a playlist URL
+(`list=OLAK5uy_…`, titled *Album - Dookie*); its tracks are downloaded and
+filed under the album, and no playlist is made for it. Album playlists made
+by earlier versions are dropped from the catalog and from beside the library.
+
+### Where every file came from
+
+A download is traceable from the URL somebody typed to the file it became,
+however much it changed on the way:
+
+- **the source URLs** - every URL that asked for the video, so one song in
+  two playlists has both;
+- **the file as it arrived** - where yt-dlp first put it and what its tags
+  said, recorded once, before anything identifies or renames it;
+- **the file now** - the catalog row, after enrichment, hand edits and
+  `organise`.
+
+They are tied together by the video id in the source URL yt-dlp writes into
+the file (`purl`), which no tag write touches - so a video that became
+*Title X by Artist C* in a different folder is still known to be the one
+downloaded, and is not fetched again. The inspector shows it under **Where
+it came from**, and **Identify again** can search from what the file arrived
+as instead of what it says now. Files downloaded before this was recorded
+get a record from what the catalog held.
+
+### Big libraries: several at once, pause and resume
+
+A playlist is split into its videos and fetched **three at a time** (one to
+four, under *Where files land*), each yt-dlp on its own with its own
+progress bar. One process at a time spent most of each item waiting - on
+the page, the signature challenge, ffmpeg - with the network idle.
+Identification was already off the download's path (its own queue, one
+MusicBrainz request a second), so it never held a download back; it simply
+finishes later.
+
+Before anything is fetched, every video the library already has is taken
+off the list - by the download archive and by the catalog, so a file
+renamed or re-tagged since is still recognised as that video.
+
+**Pause** lets the videos in hand finish and starts no more; **Stop now**
+kills them. Either way the run is kept under **Paused downloads** and
+**Resume** runs it again, taking only what it had not reached - and a run
+cut off by closing the program is kept the same way, as *interrupted*.
 
 Two things stop a second run re-fetching what you already have. yt-dlp keeps
 a download archive at `.lemon-zest-downloads.txt` in the folder (pass
@@ -253,7 +321,7 @@ column of its own.
 | --- | --- | --- |
 | **raw** | never looked up, or a lookup that came back empty | picks it up |
 | **awaiting review** | a match is stored and wants your decision | leaves it alone |
-| **enriched** | values are in the catalog - matched, accepted or typed | leaves it alone unless you ask again |
+| **enriched** | identified - matched automatically, accepted, or marked enriched by hand | leaves it alone unless you ask again |
 | **skipped** | deliberately excluded | **never** looks at it, even with `--redo`, even when you select it by hand |
 
 `skipped` is the one with teeth. A live bootleg MusicBrainz will never have,
@@ -305,7 +373,9 @@ Four rules make it safe to run over a library you care about:
   appears on. Title, artist and ISRC come from the recording and are taken;
   album, year and track number are filled in only where the file was silent.
 - **A hand-typed value wins.** `enrich set` outranks every source, survives a
-  re-run, and is re-applied after any later match.
+  re-run, and is re-applied after any later match. Typing a value does not
+  make a file *enriched*: correcting a spelling is not identifying a
+  recording. Only a lookup, an accepted match, or **Mark enriched** does.
 - **Audio files are not touched** unless you pass `--write-tags`, which asks
   first. When you do, each file is rewritten to a copy and swapped in, so an
   interruption leaves the original — and the content key is recomputed in the
@@ -348,6 +418,7 @@ on screen. Arrow keys walk the list, shift extends. With something selected:
 | `A` / `R` | accept or reject the stored match |
 | `S` | skip |
 | `U` | mark raw |
+| `N` | mark enriched - "this file is right as it is" |
 | `Enter` | edit the metadata by hand |
 | `W` | write the tags into the files |
 | `Esc` | clear the selection |
@@ -368,9 +439,22 @@ guess and you have just said what the answer is. Over a selection the box
 is not offered: one query cannot describe forty tracks.
 
 Genre comes from the release when the file has none — MusicBrainz records it
-per release and per release group, and the votes decide. It is only asked
-for when the tag is empty, so a file that already says *City Pop* keeps it
-and costs no extra request.
+per release and per release group, and the votes decide - and from the
+artist when the release has no votes, which is most singles. It is only
+asked for when the tag is empty, so a file that already says *City Pop*
+keeps it and costs no extra request. A YouTube *category* - "Music",
+"People & Blogs", which yt-dlp used to write into the genre tag - is not a
+genre and counts as empty; downloads no longer carry one. **Utilities > Fill
+in what is missing > Genres** (or `lemon-zest enrich genres`) fills the
+tracks identified before this.
+
+Lyrics come from [LRCLIB](https://lrclib.net), a free lyrics database that
+needs no key, and go **into the file** - `©lyr` in MP4, `USLT` in ID3,
+`LYRICS` in Vorbis comments - time-synced (LRC) when LRCLIB has them, plain
+when it does not. They are fetched when an identified track's tags are
+written, so every download that is identified gets them without being asked;
+**Utilities > Fill in what is missing > Lyrics** (or `lemon-zest lyrics`)
+fills the rest of the library. A file that already has lyrics is left alone.
 
 **Edit metadata** opens on one track with three tiers side by side — what the
 catalog says now, what the source proposed (click a proposal to drop it into
@@ -433,6 +517,33 @@ the device manifest still matches and a replug stays a no-op. A device whose
 template mirrors the library layout (`{rel_path}`) is named before anything
 moves, because its next sync will move the same files on the card.
 
+## Moving the library to another computer
+
+**Copy the library folder.** Each one carries a copy of the catalog in a
+hidden `.lemon-zest` folder, refreshed after every scan and download - the
+tracks, the playlists, what was identified and typed, where every download
+came from, and the downloads still paused - so the folder is all there is to
+take. Copy the `Playlists` folder beside it too. Part-downloaded files
+(`.lz-incomplete`) and the download archive are inside it already.
+
+On the other computer, **Utilities > Move to another computer**, point at
+where the folder landed, and **Open it**. The catalog comes in and every
+path in it is moved from where the folder was to where it is now - a library
+at `C:\Users\Bob\Music\lemon-zest` on one machine and
+`C:\Users\Remote\Music\library\master` on the other is the case it is for.
+
+```bash
+lemon-zest pack                       # refresh the copy now
+lemon-zest unpack "C:/Users/Remote/Music/library/master"
+lemon-zest relocate "D:/old/Music" "E:/Music"   # moved on this machine
+```
+
+What stays behind on purpose: cookies, the Firefox profile, the AcoustID key
+and the MusicBrainz contact are never written into the copy, and opening one
+keeps this machine's own. The program itself is not in the folder either -
+any release will open it. A folder that has moved on the same machine shows
+as **not found** under *Add music*, with a box to say where it is now.
+
 ## The interface
 
 ```bash
@@ -472,11 +583,19 @@ six tracks that came in this morning are otherwise six rows in the middle
 of an alphabet. *Mark all as seen* moves a watermark; it deletes nothing
 and no row leaves the library.
 
+**Not in a playlist** lists every track no playlist holds - the ones nothing
+carries to a player, and so the ones that get lost. A playlist that holds
+everything (a *DAP-master*) would answer the question for every track at
+once, so any playlist can be set aside there and stop counting; the choice
+is remembered.
+
 Clicking a row opens an inspector beside the table: the artwork the file
 itself carries (a downloaded video frame included, which is the reason to
 look), every field including the ones the table has no room for, the full
 path, when it arrived and when the file was last modified, and where its
-values came from.
+values came from. The **Updated** column says when the catalog's view of a
+track last changed - a tag, the file's bytes, or where it lives - which a
+database trigger keeps, so every path that edits a track counts.
 
 **Scan & import** lists the library folders. Each one can be rescanned,
 **hidden** - still indexed, but out of the library, the facets and the

@@ -28,10 +28,14 @@ CREATE TABLE IF NOT EXISTS track (
     album_artist TEXT,
     track_no     INTEGER,
     disc_no      INTEGER,
-    year         TEXT,
+    year         TEXT,                   -- the year alone: Rockbox shows it verbatim
+    date         TEXT,                   -- the full release date, ISO, when known
     genre        TEXT,
     isrc         TEXT,
     purl         TEXT,                   -- yt-dlp source URL
+    -- "youtube:<video id>", off purl: who this file is for life, whatever
+    -- it is renamed or re-tagged to. The key into media below.
+    source_id    TEXT,
     codec        TEXT,
     bitrate      INTEGER,
     sample_rate  INTEGER,
@@ -42,13 +46,61 @@ CREATE TABLE IF NOT EXISTS track (
     added_at     REAL,
     -- When this file stopped being new. Written by the promotion rule
     -- below rather than by a person: see promote_inbox.
-    inbox_done_at REAL
+    inbox_done_at REAL,
+    -- When what the catalog holds for this file last changed: its tags,
+    -- its bytes or its place. Kept by the trigger below rather than by each
+    -- writer, so a scan, an enrichment, a hand edit and a tag write all
+    -- count without any of them having to remember to.
+    updated_at   REAL
 );
 CREATE INDEX IF NOT EXISTS ix_track_isrc   ON track(isrc);
 CREATE INDEX IF NOT EXISTS ix_track_artist ON track(artist);
 CREATE INDEX IF NOT EXISTS ix_track_album  ON track(album);
 CREATE INDEX IF NOT EXISTS ix_track_root   ON track(root);
 CREATE INDEX IF NOT EXISTS ix_track_added  ON track(added_at);
+CREATE INDEX IF NOT EXISTS ix_track_source ON track(source_id);
+
+-- Where a downloaded file came from, and what it was when it arrived. The
+-- track row is what the file is now - renamed by organise, re-tagged by
+-- enrichment or by hand - and this is what it was before any of that: the
+-- file yt-dlp wrote, where, and what its tags said. Written once, on first
+-- arrival, and never updated, so a later pass can start again from the
+-- original rather than from whatever the last one left.
+CREATE TABLE IF NOT EXISTS media (
+    source_id     TEXT PRIMARY KEY,      -- "youtube:<video id>"
+    url           TEXT,                  -- the video itself
+    root          TEXT,                  -- library folder it landed in
+    initial_path  TEXT,                  -- relative to root, as yt-dlp named it
+    initial_key   TEXT,
+    initial_tags  TEXT,                  -- JSON: what the file said on arrival
+    downloaded_at REAL,
+    -- Recorded after the fact, for a file downloaded before this table
+    -- existed: the "initial" values are what the catalog held then.
+    backfilled    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Every URL that asked for a media item. Many to one: the same video in two
+-- playlists is one file with two sources, and both are kept.
+CREATE TABLE IF NOT EXISTS media_source (
+    source_id TEXT NOT NULL,
+    url       TEXT NOT NULL,
+    first_at  REAL,
+    last_at   REAL,
+    PRIMARY KEY (source_id, url)
+);
+
+CREATE TRIGGER IF NOT EXISTS track_updated AFTER UPDATE ON track
+WHEN OLD.path IS NOT NEW.path OR OLD.content_key IS NOT NEW.content_key
+  OR OLD.title IS NOT NEW.title OR OLD.artist IS NOT NEW.artist
+  OR OLD.album IS NOT NEW.album OR OLD.album_artist IS NOT NEW.album_artist
+  OR OLD.track_no IS NOT NEW.track_no OR OLD.disc_no IS NOT NEW.disc_no
+  OR OLD.year IS NOT NEW.year OR OLD.date IS NOT NEW.date
+  OR OLD.genre IS NOT NEW.genre
+  OR OLD.isrc IS NOT NEW.isrc
+BEGIN
+  UPDATE track SET updated_at = (julianday('now') - 2440587.5) * 86400.0
+  WHERE id = NEW.id;
+END;
 
 -- Library folders the scanner watches. Kept apart from track.root so a
 -- folder that holds no music yet is still a place downloads can land: an
@@ -277,6 +329,28 @@ def migrate(con):
         # library in the inbox, which is exactly what the inbox is not for.
         con.execute("UPDATE track SET added_at = seen_at WHERE added_at IS NULL")
 
+    if track_cols and "date" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN date TEXT")
+
+    if track_cols and "source_id" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN source_id TEXT")
+        # purl is what yt-dlp writes: https://www.youtube.com/watch?v=<id>.
+        con.execute(
+            "UPDATE track SET source_id = 'youtube:' || "
+            "substr(purl, instr(purl, 'watch?v=') + 8, 11) "
+            "WHERE instr(purl, 'youtube.com/watch?v=') > 0")
+
+    if track_cols and "updated_at" not in track_cols:
+        con.execute("ALTER TABLE track ADD COLUMN updated_at REAL")
+        # The best record there is of the last change: an applied match or
+        # a typed value, whichever came last, else when the file arrived.
+        con.execute(
+            "UPDATE track SET updated_at = MAX(COALESCE(added_at, seen_at), "
+            "COALESCE((SELECT applied_at FROM enrichment e "
+            "  WHERE e.content_key = track.content_key), 0), "
+            "COALESCE((SELECT MAX(set_at) FROM track_override o "
+            "  WHERE o.content_key = track.content_key), 0))")
+
     root_cols = _columns(con, "library_root")
     if root_cols and "hidden" not in root_cols:
         con.execute("ALTER TABLE library_root ADD COLUMN hidden "
@@ -328,6 +402,31 @@ def migrate(con):
             "UPDATE playlist SET origin = 'youtube' "
             "WHERE origin IN ('local', 'download') AND ("
             "  source_uri LIKE '%youtube.com%' OR source_uri LIKE '%youtu.be%')")
+
+    # A YouTube Music album or EP used to be made into a playlist. It is a
+    # release, not a list anybody made, so those go - the tracks stay, and
+    # a device carrying one drops its playlist file on the next sync.
+    if pl_cols:
+        con.execute("DELETE FROM playlist "
+                    "WHERE instr(source_uri, 'list=OLAK5uy_') > 0")
+    if dl_cols:
+        con.execute("UPDATE download_url SET playlist_name = NULL "
+                    "WHERE instr(url, 'list=OLAK5uy_') > 0")
+
+    # A YouTube category is not a genre (see meta.NOT_GENRES); a catalog
+    # that stored one treats it as the blank it is, so a lookup fills it.
+    if track_cols:
+        from .meta import NOT_GENRES
+        con.execute("UPDATE track SET genre = NULL WHERE LOWER(genre) IN (%s)"
+                    % ",".join("?" * len(NOT_GENRES)), sorted(NOT_GENRES))
+
+    # Typing a value used to mark a file enriched at 1.00 with nothing
+    # matched behind it. Those rows go back to raw; the typed values live in
+    # track_override and are untouched.
+    if _columns(con, "enrichment"):
+        con.execute("DELETE FROM enrichment WHERE source = 'manual' "
+                    "AND status = 'applied' AND confidence = 1.0 "
+                    "AND fields = '{}' AND mbid IS NULL")
 
     if dl_cols and "seq" not in dl_cols:
         con.execute("ALTER TABLE download_url ADD COLUMN seq INTEGER NOT NULL "
@@ -438,6 +537,22 @@ def connect(path=None, same_thread=True):
         "SELECT DISTINCT root, NULL, NULL FROM track "
         "WHERE root NOT IN (SELECT root FROM library_root)"
     )
+    # Files downloaded before media existed get a record now, from what the
+    # catalog holds - the best "as it arrived" there is for them. Once.
+    if meta_get(con, "media_backfilled") is None:
+        con.execute(
+            "INSERT OR IGNORE INTO media(source_id, url, root, initial_path, "
+            "initial_key, downloaded_at, backfilled) "
+            "SELECT source_id, purl, root, rel_path, content_key, added_at, 1 "
+            "FROM track WHERE source_id IS NOT NULL")
+        con.execute(
+            "INSERT OR IGNORE INTO media_source(source_id, url, first_at, "
+            "last_at) SELECT DISTINCT t.source_id, p.source_uri, "
+            "p.imported_at, p.imported_at FROM playlist_entry e "
+            "JOIN playlist p ON p.id = e.playlist_id "
+            "JOIN track t ON t.id = e.track_id "
+            "WHERE t.source_id IS NOT NULL AND p.source_uri IS NOT NULL")
+        meta_set(con, "media_backfilled", time.time())
     con.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -499,6 +614,9 @@ def roots_detail(con):
             "hidden": bool(row["hidden"]) if row else False,
             "scanned_at": row["scanned_at"] if row else None,
             "registered": row is not None,
+            # Not there: moved, renamed, or a catalog brought from another
+            # computer. The interface offers to point it somewhere.
+            "exists": os.path.isdir(root),
         })
     return out
 

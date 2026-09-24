@@ -88,14 +88,20 @@ def reset_library(con, delete_files=False):
             found = resolve_existing(row["path"])
             if found and _remove(found, errors):
                 files_deleted += 1
+        names = {pl_mod.safe_filename(r["name"])
+                 for r in con.execute("SELECT name FROM playlist")}
         for root in roots:
-            folder = os.path.join(root, pl_mod.LOCAL_DIR)
-            if not os.path.isdir(folder):
-                continue
-            for name in os.listdir(folder):
-                if name.lower().endswith((".m3u", ".m3u8")) and \
-                        _remove(os.path.join(folder, name), errors):
-                    playlist_files_deleted += 1
+            # Beside the library only what the catalog made: that folder is
+            # shared with whatever else sits next to the library.
+            for folder, only in ((pl_mod.local_dir(root), names),
+                                 (os.path.join(root, pl_mod.LEGACY_DIR), None)):
+                for name in pl_mod.list_playlist_files(folder):
+                    if (only is None or name in only) and \
+                            _remove(os.path.join(folder, name), errors):
+                        playlist_files_deleted += 1
+                        # and its cover, which is named after it
+                        _remove(os.path.join(folder, os.path.splitext(name)[0]
+                                             + ".jpg"), errors)
 
     archives_deleted = 0
     for root in roots:
@@ -114,6 +120,9 @@ def reset_library(con, delete_files=False):
     con.execute("DELETE FROM track")
     con.execute("DELETE FROM enrichment")
     con.execute("DELETE FROM track_override")
+    # Where each download came from goes with the files it describes.
+    con.execute("DELETE FROM media")
+    con.execute("DELETE FROM media_source")
     con.execute("DELETE FROM sync_list")
     # The URLs stay, but nothing they fed exists any more.
     con.execute("UPDATE download_url SET last_added = 0, last_checked = NULL")
@@ -121,6 +130,13 @@ def reset_library(con, delete_files=False):
     con.execute("DELETE FROM meta WHERE key = 'inbox_seen_at'")
     con.commit()
     db_mod.meta_set(con, "library_reset_at", time.time())
+    # The catalog copy inside each folder is of the library just forgotten;
+    # left as it was, opening the folder elsewhere would bring it all back.
+    from . import portable
+    try:
+        portable.pack_all(con)
+    except OSError as exc:
+        errors.append(f"catalog copy: {exc}")
 
     return {
         "tracks_forgotten": tracks,

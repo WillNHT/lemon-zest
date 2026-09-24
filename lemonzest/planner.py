@@ -268,7 +268,10 @@ def plan(con, device, root, prune=False):
         playlist_plan.append({"name": name, "source_uri": row["source_uri"],
                               "entries": entries, "skipped": skipped,
                               "filename": fname,
-                              "replaces": existing})
+                              "replaces": existing,
+                              # Copied beside the playlist file, where the
+                              # player looks for a playlist's own picture.
+                              "cover": pl_mod.find_cover(con, name)})
 
     # Playlist files Lemon Zest wrote that this plan no longer includes.
     planned_files = {p["filename"] for p in playlist_plan}

@@ -216,6 +216,17 @@ class ServerTests(unittest.TestCase):
             self.assertIsNotNone(tracks[0]["artist"], direction)
             self.assertIsNone(tracks[-1]["artist"], direction)
 
+    def test_the_last_edited_track_sorts_first_by_updated(self):
+        key = self.c.get("/api/library?q=Two").get_json()["tracks"][0][
+            "content_key"]
+        time.sleep(0.05)
+        self.c.post("/api/enrich/edit", json={"content_keys": [key],
+                                              "fields": {"album": "Other"}})
+        tracks = self.c.get(
+            "/api/library?sort=updated&dir=desc").get_json()["tracks"]
+        self.assertEqual(tracks[0]["content_key"], key)
+        self.assertGreater(tracks[0]["updated_at"], tracks[0]["added_at"])
+
     def test_a_column_nobody_defined_is_ignored_rather_than_run(self):
         r = self.c.get("/api/library?sort=t.rel_path);DROP+TABLE+track;--")
         self.assertEqual(r.status_code, 200)
@@ -223,6 +234,36 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.c.get("/api/stats").get_json()["tracks"], 4)
 
     # ----------------------------------------------------------- playlists
+
+    def test_tracks_in_no_playlist_and_an_ignored_catch_all(self):
+        # "mix" holds two of the four: the other two are in no playlist.
+        d = self.c.get("/api/library?unlisted=1").get_json()
+        self.assertEqual(d["total"], 2)
+        self.assertEqual(self.c.get("/api/stats").get_json()["unlisted"], 2)
+        # A playlist set aside stops counting, as a DAP-master one would.
+        out = self.c.post("/api/unlisted", json={"ignore": ["mix"]}).get_json()
+        self.assertEqual(out["ignore"], ["mix"])
+        d = self.c.get("/api/library?unlisted=1").get_json()
+        self.assertEqual(d["total"], 4)
+        self.assertEqual(self.c.get("/api/unlisted").get_json()["ignore"],
+                         ["mix"])
+
+    def test_a_download_cut_off_by_closing_is_offered_back(self):
+        from lemonzest import download
+        con = db.connect(self.db_path)
+        download.save_paused(con, {"id": "gone", "label": "big list",
+                                   "urls": ["https://example.test/list"],
+                                   "remaining": ["https://example.test/list"],
+                                   "state": "running", "at": time.time()})
+        con.close()
+        rows = self.c.get("/api/download/config").get_json()["paused"]
+        # Marked running, but no job is: the program was closed mid-run.
+        self.assertEqual([(r["id"], r["state"]) for r in rows],
+                         [("gone", "interrupted")])
+        self.c.delete("/api/download/paused/gone")
+        self.assertEqual(
+            self.c.get("/api/download/config").get_json()["paused"], [])
+        self.assertEqual(self.c.post("/api/jobs/nojob/pause").status_code, 404)
 
     def test_a_playlist_narrows_the_same_library_query(self):
         pid = self.c.get("/api/playlists").get_json()[0]["id"]

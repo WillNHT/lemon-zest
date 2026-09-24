@@ -37,6 +37,16 @@ INBOX_MARK = ("COALESCE((SELECT CAST(value AS REAL) FROM meta "
               "WHERE key = 'inbox_seen_at'), 0)")
 NEW_SQL = (f"(t.added_at IS NOT NULL AND t.added_at > {INBOX_MARK} "
            "AND t.inbox_done_at IS NULL)")
+# In no playlist - so nothing carries it to a player. Playlists named in the
+# ignore list do not count: one that holds everything ("DAP-master") would
+# otherwise make every track look placed.
+UNLISTED_KEY = "unlisted.ignore"
+UNLISTED_SQL = (
+    "t.id NOT IN (SELECT pe.track_id FROM playlist_entry pe "
+    "JOIN playlist p ON p.id = pe.playlist_id "
+    "WHERE pe.track_id IS NOT NULL AND p.name NOT IN (SELECT value FROM "
+    f"json_each(COALESCE((SELECT value FROM meta WHERE key = '{UNLISTED_KEY}'),"
+    " '[]'))))")
 
 # The promotion is a write, and the stats endpoint is polled every couple of
 # seconds, so it runs on a timer rather than on every poll.
@@ -47,6 +57,8 @@ _promoted_at = [0.0]
 # reloaded page can still show the outcome.
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+# How a running download is paused or stopped: job id -> DownloadControl.
+CONTROLS = {}
 MAX_JOBS = 50
 # Per job. A download reports every line yt-dlp writes, and the whole run is
 # what someone pastes into a bug report, so the ring has to be long enough
@@ -133,6 +145,8 @@ def create_app(db_path=None):
             "tracks": one(f"SELECT COUNT(*) FROM track {vis}"),
             "inbox": one("SELECT COUNT(*) FROM track t "
                          f"WHERE {VISIBLE} AND {NEW_SQL}"),
+            "unlisted": one("SELECT COUNT(*) FROM track t "
+                            f"WHERE {VISIBLE} AND {UNLISTED_SQL}"),
             "bytes": one("SELECT COALESCE(SUM(size),0) FROM track"),
             "artists": one("SELECT COUNT(DISTINCT artist) FROM track"),
             "albums": one("SELECT COUNT(DISTINCT album) FROM track"),
@@ -194,6 +208,8 @@ def create_app(db_path=None):
             params.append(int(pid))
         if str(args.get("new") or "") in ("1", "true", "yes"):
             clauses.append(NEW_SQL)
+        if str(args.get("unlisted") or "") in ("1", "true", "yes"):
+            clauses.append(UNLISTED_SQL)
         state = (args.get("state") or "").strip()
         if with_state and state in en.STATES:
             clauses.append(en.STATE_SQL + " = ?")
@@ -233,6 +249,7 @@ def create_app(db_path=None):
             "state": [en.STATE_SQL, "t.rel_path"],
             "format": ["t.ext", "t.bitrate"],
             "added": ["t.added_at", "t.id"],
+            "updated": ["COALESCE(t.updated_at, t.added_at)", "t.id"],
             "isrc": ["t.isrc"],
             "on_device": ["t.rel_path"],
         }
@@ -336,6 +353,7 @@ def create_app(db_path=None):
                 "size": r["size"], "ext": r["ext"], "genre": r["genre"],
                 "bitrate": r["bitrate"], "sample_rate": r["sample_rate"],
                 "isrc": r["isrc"], "purl": r["purl"], "path": r["path"],
+                "year": r["year"], "date": r["date"],
                 "rel_path": r["rel_path"],
                 "content_key": r["content_key"],
                 "playlist_pos": r["playlist_pos"] if pos_col else None,
@@ -346,6 +364,7 @@ def create_app(db_path=None):
                 "confidence": r["enrich_confidence"],
                 "overrides": r["overrides"],
                 "added_at": r["added_at"],
+                "updated_at": r["updated_at"] or r["added_at"],
                 "mtime": r["mtime"],
                 "empty": r["size"] == 0,
                 "untagged": not r["title"],
@@ -386,6 +405,115 @@ def create_app(db_path=None):
         c = con()
         return jsonify({"ok": True, "at": time.time(),
                         "promoted": db_mod.clear_inbox(c)})
+
+    @app.get("/api/unlisted")
+    def unlisted_get():
+        import json
+        return jsonify({"ignore": json.loads(
+            db_mod.meta_get(con(), UNLISTED_KEY) or "[]")})
+
+    @app.post("/api/unlisted")
+    def unlisted_set():
+        """Which playlists do not count when asking what is in none."""
+        import json
+        names = (request.json or {}).get("ignore") or []
+        names = sorted({playlists.norm_name(n) for n in names
+                        if isinstance(n, str) and n.strip()})
+        db_mod.meta_set(con(), UNLISTED_KEY,
+                        json.dumps(names, ensure_ascii=False))
+        return jsonify({"ignore": names})
+
+    # --------------------------------------------- moving the library
+
+    def _pack_quietly(c):
+        """Refresh the catalog copy each library folder carries.
+
+        After every scan and download, so the folder copied to another
+        computer is never more than one job behind. A copy that cannot be
+        written - a read-only folder - is not a reason for the job to fail.
+        """
+        from . import portable
+        try:
+            portable.pack_all(c)
+        except Exception:      # noqa: BLE001
+            traceback.print_exc()
+
+    def _portable_state(c):
+        from . import portable
+        return {"roots": [{"root": r, "exists": os.path.isdir(r),
+                           "packed_at": portable.packed(r)}
+                          for r in db_mod.roots(c)],
+                "tracks": c.execute("SELECT COUNT(*) FROM track").fetchone()[0]}
+
+    @app.get("/api/portable")
+    def portable_get():
+        return jsonify(_portable_state(con()))
+
+    @app.post("/api/portable/pack")
+    def portable_pack():
+        from . import portable
+        c = con()
+        portable.pack_all(c)
+        return jsonify(_portable_state(c))
+
+    def _quiet_queue():
+        """Hold the identification queue while the catalog is swapped or
+        rewritten under it: it names files by content key and path."""
+        q = _queue()
+        q.pause()
+        q.clear()
+        end = time.time() + 30
+        while q.current is not None and time.time() < end:
+            time.sleep(0.05)
+        return q
+
+    def _busy():
+        with JOBS_LOCK:
+            return next((j["kind"] for j in JOBS.values()
+                         if j["state"] == "running"), None)
+
+    @app.post("/api/portable/unpack")
+    def portable_unpack():
+        """Take in a library folder copied from another computer."""
+        from . import portable
+        body = request.json or {}
+        folder = (body.get("folder") or "").strip()
+        if not folder or not os.path.isdir(folder):
+            return jsonify({"error": "not a folder: " + folder}), 400
+        busy = _busy()
+        if busy:
+            return jsonify({"error": "wait for the running %s to finish"
+                                     % busy}), 409
+        q = _quiet_queue()
+        try:
+            out = portable.unpack(con(), folder,
+                                  replace=bool(body.get("replace")))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            q.resume()
+        return jsonify(out)
+
+    @app.post("/api/roots/relocate")
+    def roots_relocate():
+        """A library folder moved: point the catalog at where it is now."""
+        from . import portable
+        body = request.json or {}
+        old = (body.get("old") or "").strip()
+        new = (body.get("new") or "").strip()
+        if not old or not new or not os.path.isdir(new):
+            return jsonify({"error": "not a folder: " + new}), 400
+        busy = _busy()
+        if busy:
+            return jsonify({"error": "wait for the running %s to finish"
+                                     % busy}), 409
+        q = _quiet_queue()
+        try:
+            c = con()
+            moved = portable.relocate(c, old, new)
+        finally:
+            q.resume()
+        return jsonify({"moved": moved, "roots": db_mod.roots_detail(c)})
 
     # ---------------------------------------------------- library folders
 
@@ -456,6 +584,50 @@ def create_app(db_path=None):
             if not was_paused:
                 q.resume()
         return jsonify(out)
+
+    # What the library is missing, filled in on request. Each asks somebody
+    # else's service about every file that lacks the thing, so it is a job
+    # with progress rather than a click that hangs.
+    MAINTENANCE = {"genres": "missing genres", "lyrics": "missing lyrics"}
+
+    @app.post("/api/maintenance/<task>")
+    def maintenance(task):
+        if task not in MAINTENANCE:
+            return jsonify({"error": "unknown task"}), 404
+        job_id = _new_job("maintenance", MAINTENANCE[task])
+
+        def work():
+            from . import enrich as en
+            try:
+                c = db_mod.connect(app.config["DB_PATH"])
+
+                def cb(done, total):
+                    _update(job_id, done=done, total=total,
+                            detail="%d of %d" % (done, total))
+
+                if task == "lyrics":
+                    from . import lyrics
+                    counts = lyrics.fill(c, progress=cb)
+                    detail = ("%d of %d given lyrics, %d not found, %d "
+                              "already had them" % (
+                                  counts["written"], counts["considered"],
+                                  counts["none"], counts["had"]))
+                else:
+                    # MusicBrainz, so through the queue's one client.
+                    with _queue().exclusive() as client:
+                        counts = en.fill_genres(c, client, progress=cb)
+                    detail = ("%d of %d given a genre, %d have none on record"
+                              % (counts["filled"], counts["considered"],
+                                 counts["none"]))
+                _update(job_id, state="done", result=counts, detail=detail,
+                        finished=time.time())
+            except Exception as exc:
+                _update(job_id, state="failed", error=str(exc),
+                        finished=time.time())
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+        return jsonify({"job": job_id})
 
     @app.get("/api/art/<path:content_key>")
     def track_art(content_key):
@@ -630,6 +802,9 @@ def create_app(db_path=None):
             "JOIN track t ON t.id = e.track_id "
             "WHERE t.content_key = ? GROUP BY p.id ORDER BY p.name",
             (content_key,))]
+        # Where it came from and what it was on arrival, when it was
+        # downloaded: the other half of "what is this file".
+        out["origin"] = dl_mod.provenance(c, content_key)
         return jsonify(out)
 
     @app.post("/api/enrich/<action>")
@@ -656,9 +831,9 @@ def create_app(db_path=None):
     def enrich_state():
         """Move a selection between states by hand.
 
-        Only `skipped` and `raw` are settable: the other two are outcomes,
-        and a button that declared a file `enriched` with no answer behind it
-        would be writing a claim rather than recording one.
+        `skipped`, `raw` and `enriched` are settable. `awaiting` is an
+        outcome: a button that declared a proposal waiting with none behind
+        it would be writing a claim rather than recording one.
         """
         from . import enrich as en
         body = request.json or {}
@@ -1029,12 +1204,13 @@ def create_app(db_path=None):
                 # an entry can only be matched to a track the scan has
                 # already catalogued.
                 _update(job_id, detail="reading playlists")
-                found = playlists.import_dir(c, root, recursive=True)
+                found = playlists.import_library(c, root)
                 counts["playlists"] = len(found)
                 counts["playlist_entries"] = sum(f["total"] for f in found)
                 # Whatever the scan found that has never been looked at
                 # joins the identification queue, without being asked.
                 counts["queued"] = _start_auto_enrich(root=root)
+                _pack_quietly(c)
                 _update(job_id, state="done", result=counts,
                         finished=time.time())
             except Exception as exc:
@@ -1074,6 +1250,12 @@ def create_app(db_path=None):
             # eye on. Both come off the same table.
             "recent": dl_mod.recent_urls(c, 5),
             "kept": dl_mod.kept_urls(c),
+            # Paused, stopped, or cut off by the program closing - a record
+            # still marked running with no job behind it is the last kind.
+            "paused": [dict(r, state="interrupted")
+                       if r["state"] == "running" and r["id"] not in CONTROLS
+                       else r for r in dl_mod.paused(c)
+                       if r["id"] not in CONTROLS],
         }
 
     @app.get("/api/download/config")
@@ -1109,10 +1291,19 @@ def create_app(db_path=None):
         """
         job_id = _new_job("download", label or (urls[0] if len(urls) == 1
                                                 else f"{len(urls)} URLs"))
+        control = CONTROLS[job_id] = dl_mod.DownloadControl()
+        # Written down before anything is fetched: if the program is closed
+        # half way through, this is what lets the run be resumed.
+        record = {"id": job_id, "label": label or urls[0], "urls": urls,
+                  "remaining": urls, "root": root,
+                  "playlist": playlist_name, "single": single,
+                  "state": "running", "at": time.time()}
 
         def work():
+            c = None
             try:
                 c = db_mod.connect(app.config["DB_PATH"])
+                dl_mod.save_paused(c, record)
 
                 def on_event(kind, detail, done, total):
                     # Progress moves the bar but is not written down: it is
@@ -1133,7 +1324,13 @@ def create_app(db_path=None):
                 summary = dl_mod.download(
                     c, urls, root=root, playlist=playlist_name,
                     on_event=on_event, on_batch=on_batch,
-                    no_playlist=single, archive=archive)
+                    no_playlist=single, archive=archive, control=control)
+                if summary.get("stopped"):
+                    dl_mod.save_paused(c, dict(
+                        record, remaining=summary["remaining"],
+                        state=summary["stopped"], at=time.time()))
+                else:
+                    dl_mod.save_paused(c, drop=job_id)
                 # The files this run fetched were identified as they
                 # landed, one by one, so there is nothing left to start for
                 # them. Two exceptions, both scoped to the folder rather
@@ -1145,6 +1342,7 @@ def create_app(db_path=None):
                         or (summary["downloaded"] and not summary.get("queued")))
                 summary["queued_extra"] = _start_auto_enrich(
                     root=summary.get("root")) if owed else 0
+                _pack_quietly(c)
                 if kept_url:
                     # What the kept row shows next time: when it was last
                     # looked at, and what that look turned up.
@@ -1160,6 +1358,8 @@ def create_app(db_path=None):
                                + (f", {queued} being identified"
                                   if queued else ""))
             except dl_mod.DownloadError as exc:
+                if c is not None:
+                    dl_mod.save_paused(c, drop=job_id)
                 # The log is the point of a failed download: it is what gets
                 # copied into a bug report, so it outlives the job's event
                 # ring rather than only having been streamed past.
@@ -1171,6 +1371,8 @@ def create_app(db_path=None):
                 _update(job_id, state="failed", error=str(exc),
                         finished=time.time())
                 traceback.print_exc()
+            finally:
+                CONTROLS.pop(job_id, None)
 
         threading.Thread(target=work, daemon=True).start()
         return job_id
@@ -1221,7 +1423,8 @@ def create_app(db_path=None):
             return jsonify({"error": "that URL is a single video, not a "
                                      "playlist"}), 400
         dl_mod.keep_url(c, url, kept=True, info=info,
-                        playlist_name=playlists.norm_name(info["title"] or url),
+                        playlist_name=None if info.get("is_album")
+                        else playlists.norm_name(info["title"] or url),
                         root=(body.get("root") or "").strip() or None)
         return jsonify(_download_state(c))
 
@@ -1564,6 +1767,39 @@ def create_app(db_path=None):
         return jsonify([dict(r) for r in rows])
 
     # ------------------------------------------------------------ jobs
+
+    @app.post("/api/jobs/<job_id>/<how>")
+    def job_halt(job_id, how):
+        """Pause a download (finish what is in hand) or stop it (now)."""
+        control = CONTROLS.get(job_id)
+        if control is None or how not in ("pause", "stop"):
+            return jsonify({"error": "nothing to pause there"}), 404
+        control.pause() if how == "pause" else control.stop()
+        _update(job_id, detail="pausing - finishing what is in hand"
+                if how == "pause" else "stopping")
+        return jsonify({"ok": True, "mode": control.mode})
+
+    @app.post("/api/download/paused/<rid>/resume")
+    def download_resume(rid):
+        """Run a paused download again: the same URLs, taking only what
+        it had not reached - the archive and the catalog skip the rest, and
+        the playlist is rebuilt whole from the source."""
+        c = con()
+        rec = next((r for r in dl_mod.paused(c) if r["id"] == rid), None)
+        if rec is None:
+            return jsonify({"error": "no such paused download"}), 404
+        if not dl_mod.ytdlp_command():
+            return jsonify({"error": "yt-dlp is not installed"}), 400
+        dl_mod.save_paused(c, drop=rid)
+        return jsonify({"job": _run_download(
+            rec["urls"], root=rec.get("root"),
+            playlist_name=rec.get("playlist"), single=rec.get("single"),
+            archive=True, label=rec.get("label"))})
+
+    @app.delete("/api/download/paused/<rid>")
+    def download_forget(rid):
+        dl_mod.save_paused(con(), drop=rid)
+        return jsonify({"ok": True})
 
     @app.get("/api/jobs/<job_id>")
     def job_status(job_id):

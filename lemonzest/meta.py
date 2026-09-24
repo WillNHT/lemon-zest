@@ -7,12 +7,40 @@ and transcoding, neither of which the MVP does.
 """
 import hashlib
 import os
+import re
 
 from mutagen import File as MutagenFile
 
 AUDIO_EXTS = {".m4a", ".mp3", ".flac", ".opus", ".ogg", ".aac", ".wav", ".alac", ".m4b"}
 
 _CHUNK = 256 * 1024  # head and tail sampled for the content key
+
+# YouTube's video categories. yt-dlp writes the category into the genre tag,
+# so every download arrived with a genre of "Music" or "People & Blogs" -
+# which is not a genre, and which stopped the real one ever being looked
+# up, because a genre is only asked for when the file has none.
+NOT_GENRES = {
+    "music", "people & blogs", "entertainment", "film & animation",
+    "gaming", "comedy", "education", "howto & style", "news & politics",
+    "nonprofits & activism", "science & technology", "sports",
+    "travel & events", "autos & vehicles", "pets & animals",
+}
+
+
+_YOUTUBE_ID = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})")
+
+
+def source_id(url):
+    """What a file is, whatever it has been renamed or re-tagged to since.
+
+    ``youtube:<video id>``, read off the source URL yt-dlp writes into the
+    ``purl`` tag. The tag travels with the file and no tag write of ours
+    touches it, so it is the one identity a download keeps for life.
+    """
+    m = _YOUTUBE_ID.search(url or "")
+    return "youtube:" + m.group(1) if m else None
 
 
 def is_audio(path):
@@ -82,7 +110,7 @@ def read_tags(path):
     out = {
         "duration": None, "title": None, "artist": None, "album": None,
         "album_artist": None, "track_no": None, "disc_no": None, "year": None,
-        "genre": None, "isrc": None, "purl": None, "codec": None,
+        "date": None, "genre": None, "isrc": None, "purl": None, "codec": None,
         "bitrate": None, "sample_rate": None,
     }
     try:
@@ -120,7 +148,13 @@ def read_tags(path):
     out["album"] = g("\xa9alb", "talb", "album")
     out["album_artist"] = g("aart", "tpe2", "albumartist", "album_artist", "album artist")
     out["year"] = g("\xa9day", "tdrc", "tyer", "date", "year")
+    # The full release date lives in a tag of its own, because Rockbox shows
+    # the year tag verbatim and "20180201" is not a year. See tags.py.
+    out["date"] = g("----:com.apple.itunes:releasedate", "tdrl",
+                    "releasedate")
     out["genre"] = g("\xa9gen", "tcon", "genre")
+    if out["genre"] and out["genre"].strip().lower() in NOT_GENRES:
+        out["genre"] = None
     out["isrc"] = g("tsrc", "isrc", "----:com.apple.itunes:isrc")
     # yt-dlp writes the source URL here; on MP3 it lands in a TXXX/WXXX frame.
     out["purl"] = g("purl", "txxx:purl", "wxxx:purl", "comment", "\xa9cmt")
@@ -140,8 +174,12 @@ def read_tags(path):
             if out[dest] is not None:
                 break
 
+    from .artwork import iso_date, year_only
+    # A file written before the split may still carry a full date in the
+    # year tag; that is the date, and the year is its first four digits.
+    out["date"] = iso_date(out["date"]) or iso_date(out["year"])
     if out["year"]:
-        out["year"] = str(out["year"])[:10]
+        out["year"] = year_only(str(out["year"]))
     return out
 
 
@@ -152,6 +190,7 @@ def probe(path):
            "ext": os.path.splitext(path)[1].lower(),
            "content_key": content_key(path, st.st_size)}
     rec.update(read_tags(path))
+    rec["source_id"] = source_id(rec["purl"])
     return rec
 
 

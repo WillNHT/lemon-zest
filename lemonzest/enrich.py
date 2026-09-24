@@ -47,6 +47,7 @@ import urllib.parse
 import urllib.request
 
 from . import __version__
+from .artwork import iso_date
 
 # MusicBrainz asks for one request per second from a client that identifies
 # itself, and answers 503 to anything that does not. Both are honoured: the
@@ -87,7 +88,7 @@ MAX_DURATION_DELTA = 12.0
 # describing the file itself: a source knows about the recording, not about
 # where this copy came from.
 ENRICHABLE = ("title", "artist", "album", "album_artist",
-              "track_no", "disc_no", "year", "genre", "isrc")
+              "track_no", "disc_no", "year", "date", "genre", "isrc")
 
 
 # ------------------------------------------------------------------ states
@@ -438,6 +439,18 @@ class MusicBrainz:
         return [n for n, _ in sorted(by_name.items(),
                                      key=lambda kv: (-kv[1], kv[0]))]
 
+    def artist_genres(self, artist_id):
+        """The genres MusicBrainz records for an artist, best first."""
+        if ("artist", artist_id) not in self._genre_cache:
+            data = self.get(f"artist/{urllib.parse.quote(artist_id)}",
+                            inc="genres")
+            got = sorted((g for g in (data or {}).get("genres") or []
+                          if (g.get("name") or "").strip()),
+                         key=lambda g: (-(g.get("count") or 0), g["name"]))
+            self._genre_cache[("artist", artist_id)] = [
+                g["name"].strip() for g in got]
+        return self._genre_cache[("artist", artist_id)]
+
     def recording(self, mbid):
         """One recording in full, by id. How a fingerprint result is read."""
         return self.get(f"recording/{urllib.parse.quote(mbid)}",
@@ -716,7 +729,11 @@ def recording_fields(recording, prefer_album=None):
     length = recording.get("length")
     out = {"fields": fields, "artists": artists,
            "duration": (length / 1000.0) if length else None,
-           "mbid": recording.get("id"), "release_id": None}
+           "mbid": recording.get("id"), "release_id": None,
+           "artist_id": next((c["artist"].get("id")
+                              for c in recording.get("artist-credit") or []
+                              if isinstance(c, dict) and c.get("artist")),
+                             None)}
 
     isrcs = recording.get("isrcs") or []
     if isrcs:
@@ -729,7 +746,11 @@ def recording_fields(recording, prefer_album=None):
         release_fields["album"] = release.get("title")
         date = release.get("date")
         if date:
-            release_fields["year"] = str(date)[:10]
+            # The year alone, which is what a player shows, and the full
+            # date beside it, which is what "on this day" needs.
+            release_fields["year"] = str(date)[:4]
+            if iso_date(date):
+                release_fields["date"] = iso_date(date)
         credit = _release_credit(release)
         # "Various Artists" is a placeholder standing in for the fact that a
         # compilation has no single artist. Writing it into album_artist
@@ -772,6 +793,27 @@ def recording_fields(recording, prefer_album=None):
 # spent where it changes anything: on a file whose own tag is empty. A file
 # that already says "Shibuya-kei" is not improved by MusicBrainz voting for
 # "pop", and the release it came from is asked about once either way.
+def lookup_genres(client, release_id, artist_id):
+    """Genres for a track: its release's, or else its artist's.
+
+    Most releases carry no genre votes at all - a single, a Japanese
+    pressing, anything nobody has tagged - while the artist usually does.
+    The artist is the coarser answer and the far more common one, so it is
+    asked second, and only when the release had nothing. Never raises.
+    """
+    for ask, ref in (("release_genres", release_id),
+                     ("artist_genres", artist_id)):
+        if not ref or not hasattr(client, ask):
+            continue
+        try:
+            names = getattr(client, ask)(ref)
+        except Exception:      # noqa: BLE001 - a genre is never worth a failure
+            continue
+        if names:
+            return names
+    return []
+
+
 def _add_genre(client, cand, row):
     """Fill the candidate's genre from MusicBrainz, when the file has none.
 
@@ -783,12 +825,9 @@ def _add_genre(client, cand, row):
             return
     except (IndexError, KeyError):
         pass
-    if not cand.get("release_id") or cand["release_fields"].get("genre"):
+    if cand["release_fields"].get("genre"):
         return
-    try:
-        names = client.release_genres(cand["release_id"])
-    except Exception:      # noqa: BLE001 - a genre is never worth a failure
-        return
+    names = lookup_genres(client, cand.get("release_id"), cand.get("artist_id"))
     if names:
         # Title case, because that is how every other tagger writes them and
         # a library sorted by genre should not hold "rock" and "Rock".
@@ -824,7 +863,8 @@ def _best_candidate(records, row, album):
 
 # Fields that describe a release rather than the recording. They are filled
 # in where a file is silent and never used to overwrite what it already says.
-RELEASE_FIELDS = ("album", "album_artist", "year", "track_no", "disc_no")
+RELEASE_FIELDS = ("album", "album_artist", "year", "date", "track_no",
+                  "disc_no")
 
 
 # ------------------------------------------------------ the offline backfill
@@ -1299,17 +1339,21 @@ def reject(con, content_key):
 def set_state(con, content_keys, state):
     """Move files between the four states by hand. Returns how many moved.
 
-    Only the two states a person sets directly are accepted here - ``skipped``
-    and ``raw``. ``enriched`` is what accepting or typing a value does, and
-    ``awaiting`` is what a lookup produces; setting either by decree would
-    claim an answer exists when none does.
+    ``skipped``, ``raw`` and ``enriched`` are accepted. ``awaiting`` is what a
+    lookup produces, and declaring one by hand would claim a proposal exists
+    when none does.
 
     ``raw`` deletes the row rather than storing a status. A file with no
     enrichment row is exactly what "never been through the queue" means, and
     leaving a husk behind would keep a stale confidence and a stale mbid
     attached to a file whose next lookup starts from nothing.
+
+    ``enriched`` is a person saying "this file is right as it is". It is
+    stored with source ``manual`` and no confidence - nothing was matched -
+    and it drops any stored proposal, since accepting one is what Accept is
+    for.
     """
-    if state not in ("skipped", "raw"):
+    if state not in ("skipped", "raw", "enriched"):
         raise ValueError("cannot set state %r by hand" % state)
     keys = [k for k in (content_keys or []) if k]
     if not keys:
@@ -1321,6 +1365,16 @@ def set_state(con, content_keys, state):
             cur = con.execute("DELETE FROM enrichment WHERE content_key = ?",
                               (key,))
             n += cur.rowcount if cur.rowcount > 0 else 0
+        elif state == "enriched":
+            con.execute(
+                "INSERT INTO enrichment(content_key, status, source, "
+                "confidence, fields, fetched_at, applied_at) "
+                "VALUES (?,'applied','manual',0.0,'{}',?,?) "
+                "ON CONFLICT(content_key) DO UPDATE SET status='applied', "
+                "source='manual', confidence=0.0, fields='{}', mbid=NULL, "
+                "release_id=NULL, applied_at=excluded.applied_at",
+                (key, now, now))
+            n += 1
         else:
             con.execute(
                 "INSERT INTO enrichment(content_key, status, source, "
@@ -1335,14 +1389,11 @@ def set_state(con, content_keys, state):
 def override(con, content_key, **fields):
     """Record a hand-typed value. Outranks every source, now and later.
 
-    The file also comes out of the queue as ``enriched``: somebody has said
-    what this track is, which is a better answer than any lookup was going to
-    return, and leaving it as ``raw`` would send a run off to overwrite the
-    columns the typing did not cover.
-
-    An existing row keeps its ``mbid`` and ``release_id`` - those identify a
-    recording, and correcting a spelling does not unidentify it. Only the
-    status and the provenance move.
+    Typing does not change the file's state. Correcting a spelling is not
+    identifying a recording, so a raw file stays raw - a later lookup fills
+    the columns the typing did not cover, and the typed ones still win - and
+    an enriched one keeps its source and confidence. Declaring a file
+    enriched is its own act: ``set_state(..., "enriched")``.
     """
     now = time.time()
     wrote = False
@@ -1355,13 +1406,6 @@ def override(con, content_key, **fields):
             "value=excluded.value, set_at=excluded.set_at",
             (content_key, field, value, now))
         wrote = True
-    if wrote:
-        con.execute(
-            "INSERT INTO enrichment(content_key, status, source, confidence, "
-            "fields, fetched_at, applied_at) VALUES (?,?,?,?,?,?,?) "
-            "ON CONFLICT(content_key) DO UPDATE SET status='applied', "
-            "source='manual', confidence=1.0, applied_at=excluded.applied_at",
-            (content_key, "applied", "manual", 1.0, "{}", now, now))
     _apply_fields(con, content_key, {}, now)
     con.commit()
     return wrote
@@ -1553,7 +1597,7 @@ def _note_error(counts, message, track=None):
 
 
 def _process(con, rows, client, acoustid, counts, write_tags, artwork,
-             progress, query=None):
+             progress, query=None, with_lyrics=False):
     """The lookup loop. Shared by a whole-library run and a hand-picked one."""
     total = len(rows)
     consecutive = 0
@@ -1575,7 +1619,8 @@ def _process(con, rows, client, acoustid, counts, write_tags, artwork,
         counts[{"applied": "applied", "candidate": "candidates",
                 "none": "unmatched"}[status]] += 1
         if status == "applied" and write_tags:
-            res = write_back_result(con, row["content_key"], artwork=artwork)
+            res = write_back_result(con, row["content_key"], artwork=artwork,
+                                    with_lyrics=with_lyrics)
             counts["written" if res["ok"] else "write_failed"] += 1
             if res["reason"]:
                 _note_error(counts, res["reason"], row["rel_path"])
@@ -1674,7 +1719,7 @@ def auto_after_ingest(con, root=None, content_keys=None, progress=None,
         _process(con, rows, client, acoustid, counts,
                  True,   # write_tags: the point of the mode
                  True,   # artwork: a download's cover is a video frame
-                 progress)
+                 progress, with_lyrics=True)
     except Exception as exc:      # noqa: BLE001 - reported, never propagated
         counts["stopped"] = "%s: %s" % (type(exc).__name__, exc)
         _note_error(counts, exc)
@@ -1770,7 +1815,7 @@ class IngestStream:
                      self.counts,
                      True,   # write_tags: the point of the mode
                      True,   # artwork: a download's cover is a video frame
-                     None)
+                     None, with_lyrics=True)
             return self._outcome(content_key, before)
         except Exception as exc:      # noqa: BLE001 - reported, never raised
             self.counts["failed"] += 1
@@ -1844,6 +1889,53 @@ def _drop_skipped(con, rows, counts):
     wanted = [r for r in rows if r["content_key"] not in blocked]
     counts["skipped"] += len(rows) - len(wanted)
     return wanted
+
+
+def fill_genres(con, client, progress=None, write_tags=True):
+    """Give identified tracks with no genre the one MusicBrainz has.
+
+    For files identified before genres came from the artist as well as the
+    release, and before a YouTube category stopped counting as one. Asks
+    only about identified tracks - the others have no recording to ask
+    about - and fills a blank, never replaces a genre. Returns counts.
+    """
+    rows = con.execute(
+        "SELECT t.content_key, e.mbid, e.release_id FROM track t "
+        "JOIN enrichment e ON e.content_key = t.content_key "
+        "WHERE e.status = 'applied' AND e.mbid IS NOT NULL "
+        "AND (t.genre IS NULL OR t.genre = '') AND t.size > 0 "
+        "GROUP BY t.content_key").fetchall()
+    counts = {"considered": len(rows), "filled": 0, "none": 0, "failed": 0,
+              "written": 0, "errors": []}
+    consecutive = 0
+    for i, r in enumerate(rows, 1):
+        try:
+            artist_id = None
+            names = lookup_genres(client, r["release_id"], None)
+            if not names:
+                rec = client.recording(r["mbid"]) or {}
+                artist_id = recording_fields(rec).get("artist_id")
+                names = lookup_genres(client, None, artist_id)
+            consecutive = 0
+        except LookupError_ as exc:
+            counts["failed"] += 1
+            _note_error(counts, exc)
+            consecutive += 1
+            if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                break
+            continue
+        if not names:
+            counts["none"] += 1
+        else:
+            _apply_fields(con, r["content_key"], {"genre": names[0].title()},
+                          time.time())
+            con.commit()
+            counts["filled"] += 1
+            if write_tags and write_back_result(con, r["content_key"])["ok"]:
+                counts["written"] += 1
+        if progress:
+            progress(i, len(rows))
+    return counts
 
 
 def run_tracks(con, content_keys, client=None, write_tags=False, artwork=False,
@@ -1924,7 +2016,7 @@ def pending_write(con, content_key):
     }
 
 
-def write_back_result(con, content_key, artwork=False):
+def write_back_result(con, content_key, artwork=False, with_lyrics=False):
     """Push an applied enrichment into the audio file. Returns a report.
 
     ``{"ok": bool, "reason": str|None, "wrote": bool}``. A failure is
@@ -1957,6 +2049,22 @@ def write_back_result(con, content_key, artwork=False):
     if not fields:
         return out(False, "the catalog has no values for this file to write - "
                           "identify it or type something in first")
+
+    from .paths import resolve_existing
+    if with_lyrics and resolve_existing(row["path"]) \
+            and not tags_mod.has_lyrics(row["path"]):
+        # Asked of LRCLIB with what the catalog now says, which is only
+        # worth asking once the track has been identified - and this is
+        # only reached then. Lyrics are a nicety: no answer, or no service,
+        # writes the rest of the tags regardless.
+        from . import lyrics as lyrics_mod
+        try:
+            text = lyrics_mod.fetch(row["artist"], row["title"], row["album"],
+                                    row["duration"])
+        except LookupError_:
+            text = None
+        if text:
+            fields["lyrics"] = text
 
     cover = None
     cover_note = None

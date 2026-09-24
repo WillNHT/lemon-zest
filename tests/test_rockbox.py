@@ -32,6 +32,13 @@ class YearTests(unittest.TestCase):
         self.assertEqual(artwork.year_only("unknown"), "unknown")
         self.assertIsNone(artwork.year_only(None))
 
+    def test_a_full_date_is_kept_apart_from_the_year(self):
+        self.assertEqual(artwork.iso_date("20180201"), "2018-02-01")
+        self.assertEqual(artwork.iso_date("2018-02"), "2018-02")
+        self.assertIsNone(artwork.iso_date("2018-00-00"))
+        self.assertIsNone(artwork.iso_date("2018"))
+        self.assertIsNone(artwork.iso_date(None))
+
 
 class CoverTests(unittest.TestCase):
     def setUp(self):
@@ -87,14 +94,23 @@ class CoverTests(unittest.TestCase):
                              ["cover", "year"])
             audio = MP4(song)
             self.assertEqual(audio["\xa9day"], ["2018"])
+            # The date the year tag held is not lost: it moves to its own.
+            self.assertEqual(audio[tags.MP4_DATE], [b"2018-02-01"])
             self.assertTrue(artwork.is_player_safe(bytes(audio["covr"][0])))
             new = con.execute("SELECT content_key, year FROM track").fetchone()
             self.assertNotEqual(new["content_key"], row["content_key"])
             self.assertEqual(new["year"], "2018")
+            self.assertEqual(con.execute(
+                "SELECT date FROM track").fetchone()["date"], "2018-02-01")
             # A second pass finds nothing left to do.
             row = con.execute(
                 "SELECT path, content_key, year FROM track").fetchone()
             self.assertEqual(tags.fix_for_players(con, row), [])
+            # And a rescan reads the year and the date back as they are.
+            scan.scan(con, lib, full=True)
+            again = con.execute("SELECT year, date FROM track").fetchone()
+            self.assertEqual((again["year"], again["date"]),
+                             ("2018", "2018-02-01"))
         finally:
             con.close()
 

@@ -114,3 +114,21 @@ def year_only(value):
         return None
     m = _YEAR.search(str(value))
     return m.group(1) if m else value
+
+
+_DATE = re.compile(r"^\s*(\d{4})(?:[-/.]?(\d{2}))?(?:[-/.]?(\d{2}))?")
+
+
+def iso_date(value):
+    """``"20180201"`` becomes ``"2018-02-01"``; ``"2018-02"`` stays.
+
+    None when there is no month to add to the year: the year tag already
+    says that much, and a release date that is only a year is not one.
+    """
+    m = _DATE.match(str(value or ""))
+    if not m or not m.group(2) or m.group(2) == "00":
+        return None
+    parts = [m.group(1), m.group(2)]
+    if m.group(3) and m.group(3) != "00":
+        parts.append(m.group(3))
+    return "-".join(parts)

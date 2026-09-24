@@ -157,10 +157,22 @@ class StateTests(unittest.TestCase):
             "SELECT 1 FROM enrichment WHERE content_key = ?",
             (self.keys["One"],)).fetchone())
 
-    def test_only_the_two_hand_settable_states_are_accepted(self):
-        for bad in ("enriched", "awaiting", "applied", ""):
+    def test_only_the_hand_settable_states_are_accepted(self):
+        for bad in ("awaiting", "applied", ""):
             with self.assertRaises(ValueError):
                 enrich.set_state(self.con, [self.keys["One"]], bad)
+
+    def test_marking_enriched_by_hand_claims_no_confidence(self):
+        self.store("One", "candidate", {"album": "Guessed"})
+        enrich.set_state(self.con, [self.keys["One"]], "enriched")
+        row = self.con.execute(
+            "SELECT * FROM enrichment WHERE content_key = ?",
+            (self.keys["One"],)).fetchone()
+        self.assertEqual(self.state("One"), "enriched")
+        self.assertEqual((row["source"], row["confidence"]), ("manual", 0.0))
+        # The proposal is dropped, not applied: that is what Accept is for.
+        self.assertEqual(row["fields"], "{}")
+        self.assertEqual(self.track("One")["album"], "Album")
 
     def test_a_selection_of_one_key_moves_one_file(self):
         n = enrich.set_state(self.con, [self.keys["One"], self.keys["Two"]],
@@ -170,20 +182,30 @@ class StateTests(unittest.TestCase):
 
     # ------------------------------------------------------- hand editing
 
-    def test_typing_a_value_enriches_the_file(self):
+    def test_typing_a_value_does_not_enrich_the_file(self):
         enrich.override(self.con, self.keys["One"], album="What I Say")
-        self.assertEqual(self.state("One"), "enriched")
+        self.assertEqual(self.state("One"), "raw")
         self.assertEqual(self.track("One")["album"], "What I Say")
 
-    def test_typing_a_value_keeps_the_recording_it_was_matched_to(self):
+    def test_typing_a_value_leaves_the_match_as_it_was(self):
         self.store("One", "candidate", {"album": "Guessed"})
         enrich.override(self.con, self.keys["One"], album="Mine")
         row = self.con.execute(
             "SELECT * FROM enrichment WHERE content_key = ?",
             (self.keys["One"],)).fetchone()
-        self.assertEqual(row["mbid"], "rec-x")
-        self.assertEqual(row["source"], "manual")
-        self.assertEqual(row["status"], "applied")
+        self.assertEqual((row["mbid"], row["source"], row["status"],
+                          row["confidence"]),
+                         ("rec-x", "musicbrainz", "candidate", 0.7))
+
+    def test_an_old_typed_only_enrichment_goes_back_to_raw(self):
+        # What override() used to write: enriched at 1.00 on typing alone.
+        self.con.execute(
+            "INSERT INTO enrichment(content_key, status, source, confidence,"
+            " fields, fetched_at) VALUES (?, 'applied', 'manual', 1.0, '{}', 0)",
+            (self.keys["One"],))
+        self.con.commit()
+        db.migrate(self.con)
+        self.assertEqual(self.state("One"), "raw")
 
     def test_clearing_an_override_lets_the_source_show_again(self):
         self.store("One", "applied", {"album": "From The Source"})
@@ -192,6 +214,15 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.track("One")["album"], "Mine")
         enrich.clear_overrides(self.con, self.keys["One"], ["album"])
         self.assertEqual(enrich.overrides_for(self.con, self.keys["One"]), {})
+
+    def test_a_change_to_the_tags_moves_updated_and_a_rescan_does_not(self):
+        self.assertIsNone(self.track("One")["updated_at"])
+        self.con.execute("UPDATE track SET seen_at = ? WHERE content_key = ?",
+                         (time.time(), self.keys["One"]))
+        self.assertIsNone(self.track("One")["updated_at"])
+        enrich.override(self.con, self.keys["One"], album="Mine")
+        self.assertAlmostEqual(self.track("One")["updated_at"], time.time(),
+                               delta=5)
 
     def test_a_lookup_never_overwrites_a_hand_typed_value(self):
         enrich.override(self.con, self.keys["One"], title="Mine")
@@ -455,7 +486,7 @@ class StateApiTests(unittest.TestCase):
 
     def test_a_state_the_interface_may_not_set_is_refused(self):
         code, out = self.post("/api/enrich/state", {
-            "content_keys": [self.keys["One"]], "state": "enriched"})
+            "content_keys": [self.keys["One"]], "state": "awaiting"})
         self.assertEqual(code, 400)
 
     def test_a_bulk_accept_applies_every_candidate(self):

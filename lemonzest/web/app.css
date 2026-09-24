@@ -440,6 +440,9 @@ body.resizing, body.resizing * { cursor: col-resize !important;
    the page off the screen. */
 .batch .items { margin-top: 8px; padding-top: 6px;
   border-top: 1px solid var(--line); max-height: 232px; overflow-y: auto; }
+/* Anything that grows with the size of a run scrolls inside its card, so a
+   thousand-file download does not push the rest of the page away. */
+.scrollbox { max-height: 260px; overflow-y: auto; }
 .batch .item { display: flex; align-items: center; gap: 7px;
   padding: 3px 0; font-size: 12px; }
 .batch .item + .item { border-top: 1px solid var(--line); }
