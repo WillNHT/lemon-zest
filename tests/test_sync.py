@@ -22,7 +22,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lemonzest import db, devices, executor, planner, playlists, scan  # noqa: E402
-from lemonzest.paths import dedupe, safe_component  # noqa: E402
+from lemonzest.paths import dedupe, norm, safe_component  # noqa: E402
 
 FFMPEG = shutil.which("ffmpeg")
 
@@ -327,6 +327,35 @@ class SyncTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "escape.mp3")))
 
     # -- the device's own playlist naming -------------------------------
+
+    def _key(self, path):
+        return self.con.execute("SELECT content_key FROM track WHERE path = ?",
+                                (norm(os.path.abspath(path)),)).fetchone()[0]
+
+    def test_merged_versions_reach_the_card_once_as_their_master(self):
+        from lemonzest import dedupe as works
+        # One and Two are versions of Three; the playlist names One and Two.
+        works.merge(self.con, self._key(self.files[2]),
+                    [self._key(self.files[0]), self._key(self.files[1])])
+        p = self._plan()
+        self.assertEqual(sorted(c["rel"] for c in p["copies"]),
+                         ["Alpha/First/03 Three.mp3", "Beta/Second/01 Four.mp3"])
+        entries = [e[0] for e in p["playlists"][0]["entries"]]
+        self.assertEqual(entries, ["Alpha/First/03 Three.mp3",
+                                   "Beta/Second/01 Four.mp3"])
+
+    def test_a_written_playlist_read_back_keeps_its_versions(self):
+        from lemonzest import dedupe as works
+        works.merge(self.con, self._key(self.files[2]), [self._key(self.files[0])])
+        before = [r[0] for r in self.con.execute(
+            "SELECT track_id FROM playlist_entry ORDER BY pos")]
+        playlists.write_local(self.con, "mix", self.lib)
+        playlists.import_dir(self.con, playlists.local_dir(self.lib))
+        after = [r[0] for r in self.con.execute(
+            "SELECT track_id FROM playlist_entry ORDER BY pos")]
+        self.assertEqual(before, after)
+        works.unmerge(self.con, self._key(self.files[0]))
+        self.assertEqual(len(self._plan()["playlists"][0]["entries"]), 3)
 
     def _set_template(self, template):
         self.con.execute("UPDATE device SET playlist_template=? WHERE id=?",

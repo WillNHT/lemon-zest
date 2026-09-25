@@ -23,6 +23,7 @@ import time
 from .meta import content_key
 from .paths import dedupe, norm, render_template, resolve_existing
 from . import playlists as pl_mod
+from . import dedupe as works
 
 
 def desired_tracks(con, device_id):
@@ -79,6 +80,9 @@ def tracks_for_rules(con, rules):
 
     if not ids:
         return [], playlists
+    # A merged song goes to the card once, as its master, whichever version
+    # the rule named: a pseudonym's artist rule still brings the master.
+    ids = works.canon_ids(con, sorted(ids))
     qmarks = ",".join("?" * len(ids))
     rows = con.execute(
         f"SELECT * FROM track WHERE id IN ({qmarks}) "
@@ -249,18 +253,24 @@ def plan(con, device, root, prune=False):
         row = con.execute("SELECT * FROM playlist WHERE name=?", (name,)).fetchone()
         if not row:
             continue
-        entries, skipped = [], 0
+        entries, skipped, seen = [], 0, set()
         for e in con.execute(
-            "SELECT e.*, t.title, t.artist FROM playlist_entry e "
-            "LEFT JOIN track t ON t.id = e.track_id "
+            "SELECT e.*, c.canon_id, t.title, t.artist FROM playlist_entry e "
+            "LEFT JOIN track_canon c ON c.id = e.track_id "
+            "LEFT JOIN track t ON t.id = c.canon_id "
             "WHERE e.playlist_id=? ORDER BY e.pos", (row["id"],)
         ):
-            usable = e["track_id"] and e["track_id"] not in skip_ids
-            dest = plan_by_track.get(e["track_id"]) if usable else None
-            if not dest:
+            tid = e["canon_id"]
+            usable = tid and tid not in skip_ids
+            dest = plan_by_track.get(tid) if usable else None
+            if not dest or dest in seen:
                 skipped += 1
                 continue
-            title = e["title_hint"] or (
+            seen.add(dest)
+            # A hint written for a variant names the variant; the entry now
+            # plays the master, so it is named after it.
+            hint = e["title_hint"] if tid == e["track_id"] else None
+            title = hint or (
                 f"{e['artist']} - {e['title']}" if e["artist"] else e["title"])
             entries.append((dest, title, e["duration"], e["source_uri"]))
         fname = pl_mod.filename_for(name, pl_template)

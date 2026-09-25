@@ -27,6 +27,7 @@ import time
 import unicodedata
 import urllib.parse
 
+from . import dedupe
 from .paths import norm, resolve_existing, safe_component
 
 
@@ -247,11 +248,25 @@ def import_dir(con, directory, recursive=False):
         was = {r["raw_path"]: r["added_at"] for r in con.execute(
             "SELECT raw_path, added_at FROM playlist_entry "
             "WHERE playlist_id = ?", (pid,))}
+        # write_local names a variant's entry by its master's file. Read
+        # back, that entry keeps pointing at the variant it was made from,
+        # so taking the song apart again restores the playlist as it was.
+        variants = {}
+        for r in con.execute(
+                "SELECT e.track_id, e.raw_path, c.canon_id FROM playlist_entry e "
+                "JOIN track_canon c ON c.id = e.track_id "
+                "WHERE e.playlist_id = ? AND c.canon_id != e.track_id "
+                "ORDER BY e.pos", (pid,)):
+            variants.setdefault(r["canon_id"], []).append(r)
         now = time.time()
         joined = 0
         con.execute("DELETE FROM playlist_entry WHERE playlist_id=?", (pid,))
         for pos, e in enumerate(pl["entries"]):
             tid = by_path.get(e["abs_path"]) if e["abs_path"] else None
+            if tid in variants and variants[tid]:
+                old = variants[tid].pop(0)
+                tid = old["track_id"]
+                e = dict(e, raw_path=old["raw_path"])
             if tid:
                 matched += 1
             else:
@@ -310,15 +325,17 @@ def append_tracks(con, name, track_ids, origin="local", source_uri=None):
     )
     pid = con.execute("SELECT id FROM playlist WHERE name=?", (name,)).fetchone()["id"]
 
-    have = {r["track_id"] for r in con.execute(
-        "SELECT track_id FROM playlist_entry WHERE playlist_id=?", (pid,))
-        if r["track_id"] is not None}
+    # Compared as masters: the holiday cut of a song already here as its
+    # album cut is not a new entry.
+    have = {r["canon_id"] for r in con.execute(
+        "SELECT c.canon_id FROM playlist_entry e "
+        "JOIN track_canon c ON c.id = e.track_id WHERE e.playlist_id=?", (pid,))}
     pos = con.execute(
         "SELECT COALESCE(MAX(pos), -1) + 1 FROM playlist_entry WHERE playlist_id=?",
         (pid,)).fetchone()[0]
 
     added = skipped = 0
-    for tid in track_ids:
+    for tid in dedupe.canon_ids(con, track_ids):
         if tid in have:
             skipped += 1
             continue
@@ -402,16 +419,21 @@ def write_local(con, name, root):
     if row is None:
         raise ValueError("no such playlist: " + name)
     path = local_path(root, name)
-    rows = []
+    rows, seen = [], set()
     for e in con.execute(
             "SELECT e.title_hint, e.duration, e.source_uri, "
-            "t.path AS track_path, t.root, t.rel_path FROM playlist_entry e "
-            "JOIN track t ON t.id = e.track_id "
+            "t.id, t.path AS track_path, t.root, t.rel_path, "
+            "c.canon_id = e.track_id AS own FROM playlist_entry e "
+            "JOIN track_canon c ON c.id = e.track_id "
+            "JOIN track t ON t.id = c.canon_id "
             "WHERE e.playlist_id = ? ORDER BY e.pos", (row["id"],)):
-        if not os.path.isfile(e["track_path"]):
+        # Two versions of one song both play the master: write it once.
+        if e["id"] in seen or not os.path.isfile(e["track_path"]):
             continue
-        rows.append((card_path(e["root"], e["rel_path"]), e["title_hint"],
-                     e["duration"], e["source_uri"]))
+        seen.add(e["id"])
+        rows.append((card_path(e["root"], e["rel_path"]),
+                     e["title_hint"] if e["own"] else None,
+                     e["duration"] if e["own"] else None, e["source_uri"]))
     # The source goes in the file, not only in the catalog: a re-import -
     # which every scan of the library folder now does - would otherwise
     # read back a playlist that had forgotten where it came from.

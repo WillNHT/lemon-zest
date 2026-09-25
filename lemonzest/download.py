@@ -36,6 +36,7 @@ import time
 
 from . import artwork
 from . import db
+from . import dedupe
 from . import playlists as pl_mod
 from . import scan as scan_mod
 from .paths import norm
@@ -754,6 +755,9 @@ def _requested_track_ids(con, urls, cfg, downloaded, log, probes=None):
             by_video.setdefault(vid, row["id"])
 
     found = [by_video[v] for v in ids if v in by_video]
+    # A version merged behind its song's master is the master here: the
+    # playlist gets the song as the library keeps it.
+    found = dedupe.canon_ids(con, found)
     missing = len(ids) - len(found)
     log.append("playlist order: %d of %d items are in the catalog%s"
                % (len(found), len(ids),
@@ -911,6 +915,12 @@ def _already_have(con, root):
         vid = video_id(row["purl"])
         if vid:
             have.add(vid)
+    # And every video ever fetched, whether or not its file is still here:
+    # media is written once and never forgotten, so a version set aside
+    # behind its song's master - or deleted since - is not fetched again.
+    for row in con.execute("SELECT source_id FROM media "
+                           "WHERE source_id LIKE 'youtube:%'"):
+        have.add(row["source_id"].split(":", 1)[1])
     return have
 
 
@@ -973,6 +983,9 @@ def provenance(con, content_key):
                     (row["source_id"],)).fetchone()
     return {
         "source_id": row["source_id"],
+        # The other files the same song is held as, and where each came
+        # from: the whole trail, not just this file's end of it.
+        "versions": dedupe.versions_of(con, content_key),
         "url": (m["url"] if m else None) or row["purl"],
         "downloaded_at": m["downloaded_at"] if m else None,
         "backfilled": bool(m["backfilled"]) if m else True,
@@ -1622,9 +1635,21 @@ def download(con, urls, root=None, playlist=None, cfg=None, on_event=None,
         fed = by_url or (added_to if playlist else None)
         remember_url(con, url, info=(probes or {}).get(url),
                      playlist_name=(fed or {}).get("name"), root=norm(root))
+    # Arrivals that look like a song the library already holds. Never
+    # merged here: they wait on the duplicates page for somebody to say.
+    keys = [r[0] for r in con.execute(
+        "SELECT content_key FROM track WHERE id IN (%s)"
+        % ",".join("?" * len(track_ids)), list(track_ids))] if track_ids else []
+    versions = dedupe.suggest(con, keys=keys) if keys else []
+    if versions:
+        log.append("%d arrival%s look%s like a song already in the library; "
+                   "see Duplicates" % (len(versions),
+                                       "" if len(versions) == 1 else "s",
+                                       "s" if len(versions) == 1 else ""))
     del log[:-MAX_LOG]
 
     summary = {
+        "versions": len(versions),
         "root": norm(root),
         "files": [norm(f) for f in arrived],
         "downloaded": len(arrived),

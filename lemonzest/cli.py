@@ -438,6 +438,103 @@ def download_config(ctx, cookies, firefox_profile, root, output, audio_format,
 # -------------------------------------------------------------- playlists
 
 @cli.group()
+def dupes():
+    """Versions of one song: find them, merge them under a master."""
+
+
+def _key_of(con, ref):
+    """A track id or a content key, as the content key."""
+    row = con.execute("SELECT content_key FROM track WHERE id = ? "
+                      "OR content_key = ? LIMIT 1",
+                      (int(ref) if str(ref).isdigit() else -1, ref)).fetchone()
+    if not row:
+        raise click.ClickException("no such track: %s" % ref)
+    return row["content_key"]
+
+
+def _dedupe_call(fn, *args):
+    from . import dedupe
+    try:
+        return fn(*args)
+    except dedupe.DedupeError as exc:
+        raise click.ClickException(str(exc))
+
+
+@dupes.command("list")
+@click.option("--min-score", default=None, type=float,
+              help="Leave out weaker matches (0-1).")
+@click.pass_context
+def dupes_list(ctx, min_score):
+    """Groups of files that look like one song. Nothing is changed."""
+    from . import dedupe
+    con = _con(ctx)
+    groups = dedupe.suggest(con, min_score=min_score or dedupe.MIN_SCORE)
+    for g in groups:
+        console.print(f"[bold]{g['score']:.2f}[/] {', '.join(g['reasons'])}")
+        for t in g["tracks"]:
+            mark = "*" if t["content_key"] == g["master"] else " "
+            console.print(f"  {mark} {t['id']:>6}  {t['artist'] or '?'} - "
+                          f"{t['title'] or '?'}  [dim]{t['album'] or ''} "
+                          f"{dur_text(t['duration'])}[/]")
+    console.print(f"{len(groups)} group{'' if len(groups) == 1 else 's'}; "
+                  "* marks the suggested master")
+
+
+@dupes.command("merge")
+@click.argument("master")
+@click.argument("variants", nargs=-1, required=True)
+@click.pass_context
+def dupes_merge(ctx, master, variants):
+    """Keep MASTER as the song; VARIANTS stay, set aside behind it."""
+    from . import dedupe
+    con = _con(ctx)
+    work = _dedupe_call(dedupe.merge, con, _key_of(con, master),
+                        [_key_of(con, v) for v in variants])
+    console.print(f"merged into work {work}")
+
+
+@dupes.command("unmerge")
+@click.argument("track")
+@click.pass_context
+def dupes_unmerge(ctx, track):
+    """Take TRACK back out of its song."""
+    from . import dedupe
+    con = _con(ctx)
+    dedupe.unmerge(con, _key_of(con, track))
+
+
+@dupes.command("master")
+@click.argument("track")
+@click.pass_context
+def dupes_master(ctx, track):
+    """Let TRACK stand for its song."""
+    from . import dedupe
+    con = _con(ctx)
+    _dedupe_call(dedupe.set_master, con, _key_of(con, track))
+
+
+@dupes.command("dismiss")
+@click.argument("tracks", nargs=-1, required=True)
+@click.pass_context
+def dupes_dismiss(ctx, tracks):
+    """TRACKS are different songs: stop suggesting them together."""
+    from . import dedupe
+    con = _con(ctx)
+    dedupe.dismiss(con, [_key_of(con, t) for t in tracks])
+
+
+@dupes.command("pick")
+@click.argument("field")
+@click.argument("track")
+@click.pass_context
+def dupes_pick(ctx, field, track):
+    """Give the master FIELD (or 'cover') from another version, TRACK."""
+    from . import dedupe
+    con = _con(ctx)
+    _dedupe_call(dedupe.pick, con, field, _key_of(con, track))
+
+
+@cli.group()
 def playlist():
     """Work with playlists."""
 

@@ -20,7 +20,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from . import db as db_mod
 from . import devices as dev_mod
 from . import download as dl_mod
-from . import executor, planner, playlists, scan
+from . import dedupe, executor, planner, playlists, scan
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -29,6 +29,11 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 # facets and the paged table all narrow together.
 VISIBLE = ("t.root NOT IN (SELECT root FROM library_root WHERE hidden = 1)")
 VISIBLE_BARE = VISIBLE.replace("t.root", "root")
+# A version kept behind its song's master: in the catalog, off the list.
+VARIANT_SQL = ("EXISTS (SELECT 1 FROM work_member w "
+               "WHERE w.content_key = t.content_key AND w.is_master = 0)")
+# Every track id a playlist entry stands for once versions are merged.
+ENTRY_OF = ("SELECT c.id FROM track_canon c WHERE c.canon_id = t.id")
 # What is still new. A file leaves the inbox when it has finished arriving
 # - identified, skipped or rejected, or simply old enough - which db's
 # promote_inbox decides and writes down. The watermark is still honoured
@@ -42,7 +47,8 @@ NEW_SQL = (f"(t.added_at IS NOT NULL AND t.added_at > {INBOX_MARK} "
 # otherwise make every track look placed.
 UNLISTED_KEY = "unlisted.ignore"
 UNLISTED_SQL = (
-    "t.id NOT IN (SELECT pe.track_id FROM playlist_entry pe "
+    "t.id NOT IN (SELECT c.canon_id FROM playlist_entry pe "
+    "JOIN track_canon c ON c.id = pe.track_id "
     "JOIN playlist p ON p.id = pe.playlist_id "
     "WHERE pe.track_id IS NOT NULL AND p.name NOT IN (SELECT value FROM "
     f"json_each(COALESCE((SELECT value FROM meta WHERE key = '{UNLISTED_KEY}'),"
@@ -140,13 +146,16 @@ def create_app(db_path=None):
         c = con()
         _promote_due(c)
         one = lambda q: c.execute(q).fetchone()[0]
-        vis = f"WHERE {VISIBLE_BARE}"
         return jsonify({
-            "tracks": one(f"SELECT COUNT(*) FROM track {vis}"),
+            # Songs, as the list shows them: a version set aside behind its
+            # master is not counted a second time.
+            "tracks": one("SELECT COUNT(*) FROM track t "
+                          f"WHERE {VISIBLE} AND NOT {VARIANT_SQL}"),
             "inbox": one("SELECT COUNT(*) FROM track t "
-                         f"WHERE {VISIBLE} AND {NEW_SQL}"),
+                         f"WHERE {VISIBLE} AND {NEW_SQL} AND NOT {VARIANT_SQL}"),
             "unlisted": one("SELECT COUNT(*) FROM track t "
-                            f"WHERE {VISIBLE} AND {UNLISTED_SQL}"),
+                            f"WHERE {VISIBLE} AND {UNLISTED_SQL} "
+                            f"AND NOT {VARIANT_SQL}"),
             "bytes": one("SELECT COALESCE(SUM(size),0) FROM track"),
             "artists": one("SELECT COUNT(DISTINCT artist) FROM track"),
             "albums": one("SELECT COUNT(DISTINCT album) FROM track"),
@@ -203,9 +212,12 @@ def create_app(db_path=None):
         # same facets and the same inspector as everything else.
         pid = (args.get("playlist") or "").strip()
         if pid.isdigit():
-            clauses.append("t.id IN (SELECT track_id FROM playlist_entry "
-                           "WHERE playlist_id = ?)")
+            clauses.append("t.id IN (SELECT c.canon_id FROM playlist_entry pe "
+                           "JOIN track_canon c ON c.id = pe.track_id "
+                           "WHERE pe.playlist_id = ?)")
             params.append(int(pid))
+        if str(args.get("versions") or "") not in ("1", "true", "yes"):
+            clauses.append("NOT " + VARIANT_SQL)
         if str(args.get("new") or "") in ("1", "true", "yes"):
             clauses.append(NEW_SQL)
         if str(args.get("unlisted") or "") in ("1", "true", "yes"):
@@ -280,11 +292,11 @@ def create_app(db_path=None):
         if key == "pos" and pid.isdigit():
             direction = " DESC" if descending else " ASC"
             return ("ORDER BY (SELECT MIN(pos) FROM playlist_entry pe "
-                    "WHERE pe.track_id = t.id AND pe.playlist_id = ?)"
+                    f"WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = ?)"
                     + direction, [int(pid)])
         if pid.isdigit():
             return ("ORDER BY (SELECT MIN(pos) FROM playlist_entry pe "
-                    "WHERE pe.track_id = t.id AND pe.playlist_id = ?)",
+                    f"WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = ?)",
                     [int(pid)])
         if args.get("order") == "added":
             return "ORDER BY t.added_at DESC, t.id DESC", []
@@ -305,10 +317,10 @@ def create_app(db_path=None):
         # table can number the rows the way the playlist does.
         pid = (request.args.get("playlist") or "").strip()
         pos_col = ("(SELECT MIN(pos) FROM playlist_entry pe "
-                   " WHERE pe.track_id = t.id AND pe.playlist_id = %d) "
+                   f" WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = %d) "
                    "AS playlist_pos, "
                    "(SELECT MAX(pe.added_at) FROM playlist_entry pe "
-                   " WHERE pe.track_id = t.id AND pe.playlist_id = %d) "
+                   f" WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = %d) "
                    "AS playlist_added_at, " % (int(pid), int(pid))
                    ) if pid.isdigit() else ""
 
@@ -328,7 +340,11 @@ def create_app(db_path=None):
             "e.status AS enrich_status, e.source AS enrich_source, "
             "e.confidence AS enrich_confidence, "
             "(SELECT COUNT(*) FROM track_override o "
-            "   WHERE o.content_key = t.content_key) AS overrides "
+            "   WHERE o.content_key = t.content_key) AS overrides, "
+            # How many files this song is held as; 1 when never merged.
+            "MAX(1, (SELECT COUNT(*) FROM work_member w2 WHERE w2.work_id = "
+            "  (SELECT w.work_id FROM work_member w "
+            "   WHERE w.content_key = t.content_key))) AS versions "
             f"FROM track t {join} WHERE {where} "
             + order
             + " LIMIT ? OFFSET ?", params + order_params + [limit, offset]
@@ -363,6 +379,7 @@ def create_app(db_path=None):
                 "enrich_source": r["enrich_source"],
                 "confidence": r["enrich_confidence"],
                 "overrides": r["overrides"],
+                "versions": r["versions"],
                 "added_at": r["added_at"],
                 "updated_at": r["updated_at"] or r["added_at"],
                 "mtime": r["mtime"],
@@ -799,13 +816,57 @@ def create_app(db_path=None):
             " WHERE x.playlist_id = p.id) AS entries "
             "FROM playlist_entry e "
             "JOIN playlist p ON p.id = e.playlist_id "
-            "JOIN track t ON t.id = e.track_id "
+            # Through its versions too: a playlist holding the holiday cut
+            # plays this master.
+            "JOIN track_canon c ON c.id = e.track_id "
+            "JOIN track t ON t.id IN (e.track_id, c.canon_id) "
             "WHERE t.content_key = ? GROUP BY p.id ORDER BY p.name",
             (content_key,))]
         # Where it came from and what it was on arrival, when it was
         # downloaded: the other half of "what is this file".
         out["origin"] = dl_mod.provenance(c, content_key)
+        # The other files this song is held as, when it has been merged.
+        out["versions"] = dedupe.versions_of(c, content_key)
         return jsonify(out)
+
+    # ------------------------------------------------------ duplicates
+
+    @app.get("/api/dupes")
+    def dupes_list():
+        """Groups of files that look like one song, for a person to settle."""
+        try:
+            floor = float(request.args.get("min_score", dedupe.MIN_SCORE))
+        except ValueError:
+            floor = dedupe.MIN_SCORE
+        return jsonify({"groups": dedupe.suggest(con(), min_score=floor)})
+
+    @app.get("/api/dupes/versions/<path:content_key>")
+    def dupes_versions(content_key):
+        return jsonify(dedupe.versions_of(con(), content_key) or {})
+
+    @app.post("/api/dupes/<action>")
+    def dupes_act(action):
+        body = request.json or {}
+        c = con()
+        try:
+            if action == "merge":
+                work = dedupe.merge(c, body.get("master"), _keys(body))
+                return jsonify({"work_id": work})
+            if action == "dismiss":
+                dedupe.dismiss(c, _keys(body))
+                return jsonify({"ok": True})
+            if action == "unmerge":
+                return jsonify({"work_id": dedupe.unmerge(
+                    c, body.get("content_key"))})
+            if action == "master":
+                return jsonify({"work_id": dedupe.set_master(
+                    c, body.get("content_key"))})
+            if action == "pick":
+                return jsonify({"master": dedupe.pick(
+                    c, body.get("field"), body.get("from_key"))})
+        except dedupe.DedupeError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": "unknown action"}), 404
 
     @app.post("/api/enrich/<action>")
     def enrich_decide(action):
@@ -1089,8 +1150,10 @@ def create_app(db_path=None):
         entries = c.execute(
             "SELECT e.pos, e.title_hint, e.duration, e.source_uri, e.raw_path, "
             "e.added_at, "
-            "t.id track_id, t.title, t.artist, t.album, t.ext, t.size, t.bitrate "
-            "FROM playlist_entry e LEFT JOIN track t ON t.id=e.track_id "
+            "t.id track_id, t.title, t.artist, t.album, t.ext, t.size, t.bitrate, "
+            "e.track_id AS entry_track_id "
+            "FROM playlist_entry e LEFT JOIN track_canon c ON c.id=e.track_id "
+            "LEFT JOIN track t ON t.id=c.canon_id "
             "WHERE e.playlist_id=? ORDER BY e.pos", (pid,)
         ).fetchall()
         devices = c.execute(
