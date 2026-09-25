@@ -2458,6 +2458,9 @@ const MAINTENANCE = [
     + 'MusicBrainz has for their release, or else for their artist.'],
   ['lyrics', 'Lyrics', 'Tracks with no lyrics get them from LRCLIB - '
     + 'time-synced where it has them - written into the file.'],
+  ['loudness', 'Volume', 'Tracks with no ReplayGain get their loudness '
+    + 'measured and tagged, so Rockbox plays them all at one volume. '
+    + 'The audio itself is not changed.'],
 ];
 
 function renderMaintenance() {
