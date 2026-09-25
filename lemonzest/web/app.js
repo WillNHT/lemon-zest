@@ -492,7 +492,8 @@ function stateTag(t) {
   const via = t.enrich_source ? ` via ${t.enrich_source}` : '';
   return `<span class="tag ${st.cls}" title="${h(st.label + ': ' + st.hint + via)}"
     >${st.label}${conf}</span>`
-    + (t.overrides ? '<span class="tag" title="carries hand-typed values">edited</span>' : '');
+    + (t.overrides ? '<span class="tag" title="carries hand-typed values">edited</span>' : '')
+    + (t.versions > 1 ? `<span class="tag" title="held as ${t.versions} files; this one stands for the song">×${t.versions}</span>` : '');
 }
 
 // How long ago, in the words a person uses about a download that just

@@ -29,6 +29,11 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 # facets and the paged table all narrow together.
 VISIBLE = ("t.root NOT IN (SELECT root FROM library_root WHERE hidden = 1)")
 VISIBLE_BARE = VISIBLE.replace("t.root", "root")
+# A version kept behind its song's master: in the catalog, off the list.
+VARIANT_SQL = ("EXISTS (SELECT 1 FROM work_member w "
+               "WHERE w.content_key = t.content_key AND w.is_master = 0)")
+# Every track id a playlist entry stands for once versions are merged.
+ENTRY_OF = ("SELECT c.id FROM track_canon c WHERE c.canon_id = t.id")
 # What is still new. A file leaves the inbox when it has finished arriving
 # - identified, skipped or rejected, or simply old enough - which db's
 # promote_inbox decides and writes down. The watermark is still honoured
@@ -203,9 +208,12 @@ def create_app(db_path=None):
         # same facets and the same inspector as everything else.
         pid = (args.get("playlist") or "").strip()
         if pid.isdigit():
-            clauses.append("t.id IN (SELECT track_id FROM playlist_entry "
-                           "WHERE playlist_id = ?)")
+            clauses.append("t.id IN (SELECT c.canon_id FROM playlist_entry pe "
+                           "JOIN track_canon c ON c.id = pe.track_id "
+                           "WHERE pe.playlist_id = ?)")
             params.append(int(pid))
+        if str(args.get("versions") or "") not in ("1", "true", "yes"):
+            clauses.append("NOT " + VARIANT_SQL)
         if str(args.get("new") or "") in ("1", "true", "yes"):
             clauses.append(NEW_SQL)
         if str(args.get("unlisted") or "") in ("1", "true", "yes"):
@@ -280,11 +288,11 @@ def create_app(db_path=None):
         if key == "pos" and pid.isdigit():
             direction = " DESC" if descending else " ASC"
             return ("ORDER BY (SELECT MIN(pos) FROM playlist_entry pe "
-                    "WHERE pe.track_id = t.id AND pe.playlist_id = ?)"
+                    f"WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = ?)"
                     + direction, [int(pid)])
         if pid.isdigit():
             return ("ORDER BY (SELECT MIN(pos) FROM playlist_entry pe "
-                    "WHERE pe.track_id = t.id AND pe.playlist_id = ?)",
+                    f"WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = ?)",
                     [int(pid)])
         if args.get("order") == "added":
             return "ORDER BY t.added_at DESC, t.id DESC", []
@@ -305,10 +313,10 @@ def create_app(db_path=None):
         # table can number the rows the way the playlist does.
         pid = (request.args.get("playlist") or "").strip()
         pos_col = ("(SELECT MIN(pos) FROM playlist_entry pe "
-                   " WHERE pe.track_id = t.id AND pe.playlist_id = %d) "
+                   f" WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = %d) "
                    "AS playlist_pos, "
                    "(SELECT MAX(pe.added_at) FROM playlist_entry pe "
-                   " WHERE pe.track_id = t.id AND pe.playlist_id = %d) "
+                   f" WHERE pe.track_id IN ({ENTRY_OF}) AND pe.playlist_id = %d) "
                    "AS playlist_added_at, " % (int(pid), int(pid))
                    ) if pid.isdigit() else ""
 
@@ -328,7 +336,11 @@ def create_app(db_path=None):
             "e.status AS enrich_status, e.source AS enrich_source, "
             "e.confidence AS enrich_confidence, "
             "(SELECT COUNT(*) FROM track_override o "
-            "   WHERE o.content_key = t.content_key) AS overrides "
+            "   WHERE o.content_key = t.content_key) AS overrides, "
+            # How many files this song is held as; 1 when never merged.
+            "MAX(1, (SELECT COUNT(*) FROM work_member w2 WHERE w2.work_id = "
+            "  (SELECT w.work_id FROM work_member w "
+            "   WHERE w.content_key = t.content_key))) AS versions "
             f"FROM track t {join} WHERE {where} "
             + order
             + " LIMIT ? OFFSET ?", params + order_params + [limit, offset]
@@ -363,6 +375,7 @@ def create_app(db_path=None):
                 "enrich_source": r["enrich_source"],
                 "confidence": r["enrich_confidence"],
                 "overrides": r["overrides"],
+                "versions": r["versions"],
                 "added_at": r["added_at"],
                 "updated_at": r["updated_at"] or r["added_at"],
                 "mtime": r["mtime"],
@@ -1089,8 +1102,10 @@ def create_app(db_path=None):
         entries = c.execute(
             "SELECT e.pos, e.title_hint, e.duration, e.source_uri, e.raw_path, "
             "e.added_at, "
-            "t.id track_id, t.title, t.artist, t.album, t.ext, t.size, t.bitrate "
-            "FROM playlist_entry e LEFT JOIN track t ON t.id=e.track_id "
+            "t.id track_id, t.title, t.artist, t.album, t.ext, t.size, t.bitrate, "
+            "e.track_id AS entry_track_id "
+            "FROM playlist_entry e LEFT JOIN track_canon c ON c.id=e.track_id "
+            "LEFT JOIN track t ON t.id=c.canon_id "
             "WHERE e.playlist_id=? ORDER BY e.pos", (pid,)
         ).fetchall()
         devices = c.execute(

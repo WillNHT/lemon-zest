@@ -76,6 +76,21 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(d["devices"], 1)
         self.assertGreaterEqual(d["attention"], 1)
 
+    def test_a_merged_version_leaves_the_library_list(self):
+        from lemonzest import dedupe
+        con = db.connect(self.db_path)
+        keys = [r[0] for r in con.execute(
+            "SELECT content_key FROM track WHERE title IN ('One', 'Two') "
+            "ORDER BY title")]
+        dedupe.merge(con, keys[0], [keys[1]])
+        con.close()
+        titles = [t["title"] for t in self.c.get("/api/library").get_json()["tracks"]]
+        self.assertIn("One", titles)
+        self.assertNotIn("Two", titles)
+        rows = self.c.get("/api/library?versions=1").get_json()["tracks"]
+        self.assertEqual({t["title"]: t["versions"] for t in rows
+                          if t["title"] in ("One", "Two")}, {"One": 2, "Two": 2})
+
     def test_library_sorts_untagged_last(self):
         d = self.c.get("/api/library").get_json()
         self.assertEqual(d["total"], 4)
