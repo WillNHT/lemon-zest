@@ -20,7 +20,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from . import db as db_mod
 from . import devices as dev_mod
 from . import download as dl_mod
-from . import executor, planner, playlists, scan
+from . import dedupe, executor, planner, playlists, scan
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -818,7 +818,48 @@ def create_app(db_path=None):
         # Where it came from and what it was on arrival, when it was
         # downloaded: the other half of "what is this file".
         out["origin"] = dl_mod.provenance(c, content_key)
+        # The other files this song is held as, when it has been merged.
+        out["versions"] = dedupe.versions_of(c, content_key)
         return jsonify(out)
+
+    # ------------------------------------------------------ duplicates
+
+    @app.get("/api/dupes")
+    def dupes_list():
+        """Groups of files that look like one song, for a person to settle."""
+        try:
+            floor = float(request.args.get("min_score", dedupe.MIN_SCORE))
+        except ValueError:
+            floor = dedupe.MIN_SCORE
+        return jsonify({"groups": dedupe.suggest(con(), min_score=floor)})
+
+    @app.get("/api/dupes/versions/<path:content_key>")
+    def dupes_versions(content_key):
+        return jsonify(dedupe.versions_of(con(), content_key) or {})
+
+    @app.post("/api/dupes/<action>")
+    def dupes_act(action):
+        body = request.json or {}
+        c = con()
+        try:
+            if action == "merge":
+                work = dedupe.merge(c, body.get("master"), _keys(body))
+                return jsonify({"work_id": work})
+            if action == "dismiss":
+                dedupe.dismiss(c, _keys(body))
+                return jsonify({"ok": True})
+            if action == "unmerge":
+                return jsonify({"work_id": dedupe.unmerge(
+                    c, body.get("content_key"))})
+            if action == "master":
+                return jsonify({"work_id": dedupe.set_master(
+                    c, body.get("content_key"))})
+            if action == "pick":
+                return jsonify({"master": dedupe.pick(
+                    c, body.get("field"), body.get("from_key"))})
+        except dedupe.DedupeError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": "unknown action"}), 404
 
     @app.post("/api/enrich/<action>")
     def enrich_decide(action):

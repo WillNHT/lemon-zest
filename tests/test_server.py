@@ -91,6 +91,33 @@ class ServerTests(unittest.TestCase):
         self.assertEqual({t["title"]: t["versions"] for t in rows
                           if t["title"] in ("One", "Two")}, {"One": 2, "Two": 2})
 
+    def test_duplicates_are_suggested_merged_and_taken_apart(self):
+        con = db.connect(self.db_path)
+        con.execute("UPDATE track SET isrc = 'USX1' WHERE title IN ('One', 'Two')")
+        con.commit()
+        keys = {r[0]: r[1] for r in con.execute(
+            "SELECT title, content_key FROM track WHERE title IN ('One', 'Two')")}
+        con.close()
+        groups = self.c.get("/api/dupes").get_json()["groups"]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["reasons"], ["isrc"])
+        r = self.c.post("/api/dupes/merge", json={
+            "master": keys["One"], "content_keys": [keys["Two"]]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.c.get("/api/dupes").get_json()["groups"], [])
+        r = self.c.post("/api/dupes/pick", json={"field": "title",
+                                                 "from_key": keys["Two"]})
+        self.assertEqual(r.status_code, 200)
+        d = self.c.get("/api/enrich/track/" + keys["One"]).get_json()
+        self.assertEqual(d["overrides"]["title"], "Two")
+        self.assertEqual(d["versions"]["picks"], {"title": keys["Two"]})
+        r = self.c.post("/api/dupes/pick", json={"field": "path",
+                                                 "from_key": keys["Two"]})
+        self.assertEqual(r.status_code, 400)
+        self.c.post("/api/dupes/unmerge", json={"content_key": keys["Two"]})
+        self.assertEqual(self.c.get("/api/dupes/versions/" + keys["One"])
+                         .get_json(), {})
+
     def test_library_sorts_untagged_last(self):
         d = self.c.get("/api/library").get_json()
         self.assertEqual(d["total"], 4)

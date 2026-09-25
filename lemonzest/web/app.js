@@ -175,6 +175,7 @@ function libraryParams() {
   // A playlist narrows the same table rather than replacing it.
   if (S.view === 'playlist' && S.playlistId) p.set('playlist', S.playlistId);
   if (S.view === 'unlisted') p.set('unlisted', '1');
+  if (S.showVersions) p.set('versions', '1');
   if (S.sort.col) { p.set('sort', S.sort.col); p.set('dir', S.sort.dir); }
   return p;
 }
@@ -398,6 +399,9 @@ function renderSidebar() {
       navRow({ act: 'view', arg: 'unlisted', label: 'Not in a playlist',
                icon: 'i-list', n: num(st.unlisted), on: S.view === 'unlisted',
                title: 'Tracks no playlist carries to a player' }) +
+      navRow({ act: 'view', arg: 'dupes', label: 'Duplicates', icon: 'i-disc',
+               on: S.view === 'dupes',
+               title: 'Songs held as more than one file' }) +
       navRow({ act: 'view', arg: 'problems', label: 'Needs attention',
                icon: 'i-warn', n: num(st.attention), on: S.view === 'problems' })) +
 
@@ -1000,6 +1004,7 @@ function renderInspector() {
              <button class="btn sm" data-sel-act="accept">Accept</button>
              <button class="btn sm" data-sel-act="reject">Reject</button>
            </div>` : ''}
+      ${renderVersions(d)}
       ${renderOrigin(d)}
       <div class="pl-seen">
         <h4>As seen in</h4>
@@ -1092,6 +1097,8 @@ function renderLibrary() {
       ${stateChip('awaiting', 'Awaiting review')}
       ${stateChip('enriched', 'Enriched')}
       ${stateChip('skipped', 'Skipped')}
+      <button class="chip ${S.showVersions ? 'on' : ''}" data-versions-toggle="1"
+        title="Also list the versions set aside behind each song's master">Every version</button>
       <span class="grow" style="flex:1"></span>
       <span class="faint" style="font-size:10px">New files are identified and
         tagged automatically. Pick tracks to redo, correct or skip them.</span>
@@ -2338,6 +2345,115 @@ function renderProblems() {
   </div>`;
 }
 
+/* Versions of one song, found and settled.
+
+   Each card is one suggestion: the files side by side, a column each, and
+   a row per field. The first row picks the master - the file every
+   playlist and device will use from now on. Every other row picks where
+   the master's value comes from, so the cover can come from one version
+   and the title from another. Nothing is deleted: the others stay in the
+   library, set aside behind the master. */
+const DUPE_FIELDS = [['cover', 'cover'], ['title', 'title'], ['artist', 'artist'],
+  ['album', 'album'], ['album_artist', 'album artist'], ['year', 'year']];
+const DUPE_REASON = {
+  source: 'same video', isrc: 'same ISRC', mbid: 'same recording',
+  title: 'same title and length',
+  'title, other artist': 'same title and length, other artist',
+};
+
+function renderDupes() {
+  const g = S.dupes;
+  if (!g) return '<div class="empty"><span class="spin"></span></div>';
+  if (!g.length) {
+    return `<div class="pad"><div class="notice ok">${icon('i-check')}
+      <div>No duplicates found. Files are compared by source video, ISRC,
+      matched recording, and title with length.</div></div></div>`;
+  }
+  const cell = (t, f) => (f === 'cover'
+    ? `<img src="/api/art/${encodeURIComponent(t.content_key)}" alt=""
+        style="width:40px;height:40px;object-fit:cover;border:1px solid var(--line-2)"
+        onerror="this.replaceWith(document.createTextNode('none'))">`
+    : `<span class="clip">${h(t[f])}</span>`);
+  return `<div class="pad stack">
+    <div class="faint" style="font-size:11px">${num(g.length)} possible
+      duplicate${g.length === 1 ? '' : 's'}. Choose the master and, row by
+      row, which version each value comes from. The other versions stay in
+      the library, hidden behind the master and kept for the record.</div>
+    ${g.map((grp, gi) => `<div class="card" data-dupe-card="${gi}">
+      <header><h3>${h(grp.tracks[0].title || 'untitled')}</h3>
+        <span class="tag">${grp.score.toFixed(2)}</span>
+        <span class="muted">${h(grp.reasons.map(r => DUPE_REASON[r] || r).join(' · '))}</span></header>
+      <table class="tbl"><thead><tr><th style="width:90px"></th>
+        ${grp.tracks.map(t => `<th class="clip mono" title="${h(t.rel_path)}"
+          style="font-size:10px">${h(t.rel_path)}</th>`).join('')}</tr></thead>
+      <tbody>
+        <tr><td class="faint">master</td>${grp.tracks.map(t => `<td><label>
+          <input type="radio" name="m-${gi}" value="${h(t.content_key)}"
+            ${t.content_key === grp.master ? 'checked' : ''}> use this file</label></td>`).join('')}</tr>
+        ${DUPE_FIELDS.map(([f, label]) => `<tr><td class="faint">${h(label)}</td>
+          ${grp.tracks.map(t => `<td><label style="display:flex;gap:4px;align-items:center">
+            <input type="radio" name="f-${gi}-${f}" value="${h(t.content_key)}"
+              ${t.content_key === grp.master ? 'checked' : ''}>
+            ${cell(t, f)}</label></td>`).join('')}</tr>`).join('')}
+        <tr><td class="faint">length</td>${grp.tracks.map(t =>
+          `<td class="mono">${h(dur(t.duration))}</td>`).join('')}</tr>
+      </tbody></table>
+      <div class="in hstack">
+        <span class="grow" style="flex:1"></span>
+        <button class="btn" data-dupe-dismiss="${gi}">Not the same song</button>
+        <button class="btn primary" data-dupe-merge="${gi}">Merge</button>
+      </div>
+    </div>`).join('')}
+  </div>`;
+}
+
+async function loadDupes() {
+  S.dupes = (await api('/dupes')).groups;
+}
+
+async function mergeDupe(gi) {
+  const grp = S.dupes[gi];
+  const card = document.querySelector(`[data-dupe-card="${gi}"]`);
+  const chosen = (name) => {
+    const el = card.querySelector(`input[name="${name}"]:checked`);
+    return el ? el.value : null;
+  };
+  const master = chosen('m-' + gi) || grp.master;
+  const keys = grp.tracks.map(t => t.content_key).filter(k => k !== master);
+  await api('/dupes/merge', { method: 'POST',
+    body: JSON.stringify({ master, content_keys: keys }) });
+  // Values from another version: a text field is typed onto the master, a
+  // cover is written into its file.
+  for (const [f] of DUPE_FIELDS) {
+    const from = chosen(`f-${gi}-${f}`);
+    if (from && from !== master) {
+      await api('/dupes/pick', { method: 'POST',
+        body: JSON.stringify({ field: f, from_key: from }) });
+    }
+  }
+  await Promise.all([loadDupes(), loadCore()]);
+}
+
+function renderVersions(d) {
+  const v = d.versions;
+  if (!v || !v.tracks) return '';
+  const picks = v.picks || {};
+  const took = (key) => Object.keys(picks).filter(f => picks[f] === key);
+  return `<div class="pl-seen">
+    <h4>Versions <span class="faint mono">${v.tracks.length}</span></h4>
+    <ul class="pl-list">${v.tracks.map(t => `<li style="flex-wrap:wrap">
+      <span class="clip" title="${h(t.rel_path)}">${t.is_master ? '<strong>master</strong> · ' : ''}${h(t.album || t.rel_path)}${t.year ? ' · ' + h(t.year) : ''}</span>
+      ${took(t.content_key).length ? `<span class="faint" style="font-size:10px">gives the master its ${h(took(t.content_key).join(', '))}</span>` : ''}
+      ${t.source_url ? `<a class="mono faint clip" style="font-size:10px" href="${h(t.source_url)}"
+        target="_blank" rel="noreferrer">${h(t.source_url)}</a>` : ''}
+      <span class="grow" style="flex:1"></span>
+      ${t.is_master ? '' : `<button class="btn sm" data-dupe-master="${h(t.content_key)}">Make master</button>`}
+      <button class="btn sm" data-dupe-unmerge="${h(t.content_key)}"
+        title="Treat this file as a song of its own again">Unmerge</button>
+    </li>`).join('')}</ul>
+  </div>`;
+}
+
 // ----------------------------------------------------------------- modal
 
 function showModal(title, body, footer) {
@@ -2587,6 +2703,7 @@ const TITLES = {
   normalize: () => 'NORMALIZE VOLUME',
   utilities: () => 'UTILITIES',
   problems: () => 'NEEDS ATTENTION',
+  dupes: () => 'DUPLICATES' + (S.dupes ? ' \u2014 ' + num(S.dupes.length) + ' TO SETTLE' : ''),
 };
 
 function renderStatus() {
@@ -2713,7 +2830,7 @@ function render() {
     device: renderDevice, playlist: renderPlaylist,
     addDevice: renderAddDevice, normalize: renderNormalize,
     utilities: renderUtilities,
-    syncList: renderSyncList, problems: renderProblems,
+    syncList: renderSyncList, problems: renderProblems, dupes: renderDupes,
     download: renderDownload,
   }[S.view];
   $('#pane').innerHTML = body ? body() : '';
@@ -3355,7 +3472,9 @@ document.addEventListener('click', (ev) => {
     + '[data-sl-apply],[data-pl-tolist],'
     + '[data-close-inspector],[data-dismiss-outcome],'
     + '[data-root-hide],[data-root-remove],[data-root-forget],'
-    + '[data-plsync],[data-playlist],[data-track]');
+    + '[data-plsync],[data-playlist],[data-track],'
+    + '[data-dupe-merge],[data-dupe-dismiss],[data-dupe-master],'
+    + '[data-dupe-unmerge],[data-versions-toggle]');
   if (!t) return;
 
   const d = t.dataset;
@@ -3470,6 +3589,29 @@ document.addEventListener('click', (ev) => {
     S.offset = 0; S.sel.clear(); S.anchor = null;
     return guard(loadLibrary);
   }
+  if (d.dupeMerge) return guard(() => mergeDupe(+d.dupeMerge));
+  if (d.dupeDismiss) {
+    const grp = S.dupes[+d.dupeDismiss];
+    return guard(async () => {
+      await api('/dupes/dismiss', { method: 'POST', body: JSON.stringify({
+        content_keys: grp.tracks.map(t => t.content_key) }) });
+      await loadDupes();
+    });
+  }
+  if (d.dupeMaster || d.dupeUnmerge) {
+    return guard(async () => {
+      await api('/dupes/' + (d.dupeMaster ? 'master' : 'unmerge'), {
+        method: 'POST', body: JSON.stringify({
+          content_key: d.dupeMaster || d.dupeUnmerge }) });
+      S.inspectKey = null;
+      await loadLibrary();
+    });
+  }
+  if (d.versionsToggle) {
+    S.showVersions = !S.showVersions;
+    S.offset = 0;
+    return guard(loadLibrary);
+  }
   if (d.act === 'view') {
     S.view = d.arg;
     if (d.arg === 'unlisted') {
@@ -3494,6 +3636,11 @@ document.addEventListener('click', (ev) => {
       S.syncList = null;
       render();
       return guard(async () => { S.syncList = await api('/sync-list'); });
+    }
+    if (d.arg === 'dupes') {
+      S.dupes = null;
+      render();
+      return guard(loadDupes);
     }
     if (d.arg === 'problems') {
       S.problems = null;
@@ -4051,7 +4198,7 @@ function readUiState() {
       S.view = 'playlist';
       S.playlistId = was.playlistId;
       await loadPlaylist(was.playlistId);
-    } else if (['inbox', 'unlisted', 'download', 'problems', 'syncList', 'normalize',
+    } else if (['inbox', 'unlisted', 'download', 'problems', 'dupes', 'syncList', 'normalize',
                 'utilities',
                 'device'].includes(was.view)) {
       S.view = was.view;
@@ -4065,6 +4212,7 @@ function readUiState() {
     else if (isTrackView()) await loadLibrary();
     if (S.view === 'download') await loadDownload();
     if (S.view === 'problems') S.problems = await api('/problems');
+    if (S.view === 'dupes') await loadDupes();
     if (S.view === 'syncList') S.syncList = await api('/sync-list');
     if (S.view === 'device' && S.deviceId) {
       await loadLog(S.deviceId);

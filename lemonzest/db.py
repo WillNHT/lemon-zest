@@ -274,6 +274,9 @@ CREATE TABLE IF NOT EXISTS track_override (
     field       TEXT NOT NULL,
     value       TEXT,
     set_at      REAL NOT NULL,
+    -- Taken from another version of the same song, when it was: the
+    -- content key of the file the value (or the cover) was picked from.
+    from_key    TEXT,
     PRIMARY KEY (content_key, field)
 );
 
@@ -469,6 +472,10 @@ def migrate(con):
         con.execute("DELETE FROM enrichment WHERE source = 'manual' "
                     "AND status = 'applied' AND confidence = 1.0 "
                     "AND fields = '{}' AND mbid IS NULL")
+
+    ov_cols = _columns(con, "track_override")
+    if ov_cols and "from_key" not in ov_cols:
+        con.execute("ALTER TABLE track_override ADD COLUMN from_key TEXT")
 
     if dl_cols and "seq" not in dl_cols:
         con.execute("ALTER TABLE download_url ADD COLUMN seq INTEGER NOT NULL "

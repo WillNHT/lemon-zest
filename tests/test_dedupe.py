@@ -11,27 +11,32 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lemonzest import db, dedupe, tags  # noqa: E402
+from lemonzest import db, dedupe, download, tags  # noqa: E402
 
 
-class DedupeTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="lz-dedupe-")
-        self.con = db.connect(os.path.join(self.tmp, "lz.db"))
-        self.ids = {k: self.add(k) for k in ("album", "holiday", "best", "other")}
-
+class Catalog(unittest.TestCase):
     def tearDown(self):
         self.con.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def add(self, key):
+    def add(self, key, title="Song", artist=None, duration=None, **extra):
         path = "/m/%s.m4a" % key
+        cols = dict(path=path, rel_path=key + ".m4a", root="/m", size=1,
+                    mtime=0, content_key=key, ext=".m4a", title=title,
+                    artist=artist, duration=duration, seen_at=time.time(),
+                    added_at=time.time(), **extra)
         cur = self.con.execute(
-            "INSERT INTO track(path, rel_path, root, size, mtime, content_key,"
-            " ext, title, seen_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (path, key + ".m4a", "/m", 1, 0, key, ".m4a", "Song", time.time()))
+            "INSERT INTO track(%s) VALUES (%s)"
+            % (",".join(cols), ",".join("?" * len(cols))), list(cols.values()))
         self.con.commit()
         return cur.lastrowid
+
+
+class DedupeTests(Catalog):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lz-dedupe-")
+        self.con = db.connect(os.path.join(self.tmp, "lz.db"))
+        self.ids = {k: self.add(k) for k in ("album", "holiday", "best", "other")}
 
     def canon(self, key):
         return dedupe.canon_ids(self.con, [self.ids[key]])[0]
@@ -79,6 +84,63 @@ class DedupeTests(unittest.TestCase):
             dedupe.merge(self.con, "album", ["album"])
         with self.assertRaises(dedupe.DedupeError):
             dedupe.merge(self.con, "album", ["nope"])
+
+
+class SuggestTests(Catalog):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lz-dedupe-")
+        self.con = db.connect(os.path.join(self.tmp, "lz.db"))
+        add = self.add
+        self.ids = {
+            "album": add("album", "Snow (Remastered)", "Band", 200.0,
+                         album="Album", isrc="USX1"),
+            "holiday": add("holiday", "Snow", "Band", 201.0,
+                           album="Holiday", isrc="usx1"),
+            "alias": add("alias", "Snow", "Pseudonym", 199.0),
+            "short": add("short", "Snow", "Band", 120.0),
+            "other": add("other", "Rain", "Band", 200.0),
+        }
+
+    def groups(self, **kw):
+        return [sorted(t["content_key"] for t in g["tracks"])
+                for g in dedupe.suggest(self.con, **kw)]
+
+    def test_isrc_title_and_pseudonym_are_found_but_not_a_different_length(self):
+        g = dedupe.suggest(self.con)
+        self.assertEqual(self.groups(), [["album", "alias", "holiday"]])
+        self.assertEqual(g[0]["master"], "album")
+        self.assertIn("isrc", g[0]["reasons"])
+        self.assertIn("title, other artist", g[0]["reasons"])
+
+    def test_a_dismissed_pair_and_a_merged_work_stop_being_suggested(self):
+        dedupe.dismiss(self.con, ["album", "alias", "holiday"])
+        self.assertEqual(self.groups(), [])
+        self.con.execute("DELETE FROM dup_dismissed")
+        dedupe.merge(self.con, "album", ["holiday", "alias"])
+        self.assertEqual(self.groups(), [])
+
+    def test_narrowed_to_what_just_arrived(self):
+        self.assertEqual(self.groups(keys=["other"]), [])
+        self.assertEqual(len(self.groups(keys=["alias"])), 1)
+
+    def test_picking_a_field_from_a_version_and_taking_it_back(self):
+        dedupe.merge(self.con, "album", ["holiday"])
+        dedupe.pick(self.con, "album", "holiday")
+        row = self.con.execute("SELECT album FROM track WHERE content_key = "
+                               "'album'").fetchone()
+        self.assertEqual(row[0], "Holiday")
+        v = dedupe.versions_of(self.con, "holiday")
+        self.assertEqual(v["picks"], {"album": "holiday"})
+        dedupe.pick(self.con, "album", "album")
+        self.assertEqual(dedupe.versions_of(self.con, "album")["picks"], {})
+        with self.assertRaises(dedupe.DedupeError):
+            dedupe.pick(self.con, "path", "holiday")
+
+    def test_a_video_once_fetched_is_never_fetched_again(self):
+        self.con.execute(
+            "INSERT INTO media(source_id, url) VALUES ('youtube:bbbbbbbbbbb', "
+            "'https://www.youtube.com/watch?v=bbbbbbbbbbb')")
+        self.assertIn("bbbbbbbbbbb", download._already_have(self.con, self.tmp))
 
 
 if __name__ == "__main__":
