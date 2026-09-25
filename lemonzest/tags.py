@@ -29,7 +29,7 @@ import tempfile
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import (APIC, TALB, TCON, TDRC, TDRL, TIT2, TPE1, TPE2,
-                         TPOS, TRCK, TSRC, USLT)
+                         TPOS, TRCK, TSRC, TXXX, USLT)
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
@@ -61,6 +61,9 @@ _VORBIS = {
     "isrc": "isrc", "track_no": "tracknumber", "disc_no": "discnumber",
     "date": "releasedate", "lyrics": "lyrics",
 }
+# ReplayGain (see loudness.py), in the spellings Rockbox and foobar2000 read:
+# a TXXX frame, an iTunes freeform atom, a Vorbis comment of the same name.
+REPLAYGAIN = ("replaygain_track_gain", "replaygain_track_peak")
 
 
 class TagWriteError(RuntimeError):
@@ -78,6 +81,10 @@ def _write_mp4(audio, fields, cover):
         # meta.py already reads that spelling back.
         audio["----:com.apple.iTunes:ISRC"] = [
             str(fields["isrc"]).encode("utf-8")]
+    for key in REPLAYGAIN:
+        if fields.get(key) is not None:
+            audio["----:com.apple.iTunes:" + key] = [
+                str(fields[key]).encode("utf-8")]
     if fields.get("track_no") is not None:
         audio["trkn"] = [(int(fields["track_no"]), 0)]
     if fields.get("disc_no") is not None:
@@ -98,6 +105,11 @@ def _write_id3(audio, fields, cover):
                                                text=[str(fields[field])])])
     if fields.get("isrc") is not None:
         tags.setall("TSRC", [TSRC(encoding=3, text=[str(fields["isrc"])])])
+    for key in REPLAYGAIN:
+        if fields.get(key) is not None:
+            tags.delall("TXXX:" + key.upper())
+            tags.add(TXXX(encoding=3, desc=key.upper(),
+                          text=[str(fields[key])]))
     if fields.get("track_no") is not None:
         tags.setall("TRCK", [TRCK(encoding=3, text=[str(fields["track_no"])])])
     if fields.get("disc_no") is not None:
@@ -116,6 +128,9 @@ def _write_vorbis(audio, fields, cover):
     for field, name in _VORBIS.items():
         if fields.get(field) is not None:
             audio[name] = [str(fields[field])]
+    for key in REPLAYGAIN:
+        if fields.get(key) is not None:
+            audio[key] = [str(fields[key])]
     if cover and isinstance(audio, FLAC):
         data, mime = cover
         pic = Picture()
@@ -277,6 +292,24 @@ def has_lyrics(path):
     if hasattr(tags, "getall"):
         return bool(tags.getall("USLT") or tags.getall("SYLT"))
     return bool(_raw_tag(audio, ("\xa9lyr", "lyrics", "unsyncedlyrics")))
+
+
+def has_replaygain(path):
+    """Whether the file already carries a ReplayGain track gain."""
+    real = resolve_existing(path)
+    try:
+        audio = MutagenFile(real) if real else None
+    except Exception:      # noqa: BLE001 - unreadable is "no"
+        return False
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return False
+    if hasattr(tags, "getall"):
+        return any(f.desc.lower() == REPLAYGAIN[0]
+                   for f in tags.getall("TXXX"))
+    return bool(_raw_tag(audio, ("----:com.apple.iTunes:" + REPLAYGAIN[0],
+                                 "----:com.apple.iTunes:REPLAYGAIN_TRACK_GAIN",
+                                 REPLAYGAIN[0], "r128_track_gain")))
 
 
 def _raw_tag(audio, keys):

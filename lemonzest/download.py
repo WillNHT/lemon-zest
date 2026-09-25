@@ -1000,19 +1000,23 @@ def provenance(con, content_key):
 
 
 def _write_date(path, released, log):
-    """Put the release date yt-dlp knows into the file's own date tag.
+    """Put the release date yt-dlp knows, and the track's ReplayGain, into
+    the file's own tags.
 
     Before the file is catalogued, so the catalog reads it back like any
-    other tag. A file that will not take it keeps its year and says so.
+    other tag - and in one rewrite, not two. A file that will not take them
+    keeps what it had and says so.
     """
-    from . import tags
-    if not artwork.iso_date(released):
+    from . import loudness, tags
+    fields = loudness.measure(path) or {}
+    if artwork.iso_date(released):
+        fields["date"] = released
+    if not fields:
         return
     try:
-        tags.write(path, {"date": released})
+        tags.write(path, fields)
     except tags.TagWriteError as exc:
-        log.append("could not write the release date into %s: %s"
-                   % (path, exc))
+        log.append("could not write tags into %s: %s" % (path, exc))
 
 
 def remember_url(con, url, info=None, playlist_name=None, root=None,

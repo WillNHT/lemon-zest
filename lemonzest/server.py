@@ -605,7 +605,8 @@ def create_app(db_path=None):
     # What the library is missing, filled in on request. Each asks somebody
     # else's service about every file that lacks the thing, so it is a job
     # with progress rather than a click that hangs.
-    MAINTENANCE = {"genres": "missing genres", "lyrics": "missing lyrics"}
+    MAINTENANCE = {"genres": "missing genres", "lyrics": "missing lyrics",
+                   "loudness": "volume normalization"}
 
     @app.post("/api/maintenance/<task>")
     def maintenance(task):
@@ -629,6 +630,13 @@ def create_app(db_path=None):
                               "already had them" % (
                                   counts["written"], counts["considered"],
                                   counts["none"], counts["had"]))
+                elif task == "loudness":
+                    from . import loudness
+                    counts = loudness.fill(c, progress=cb)
+                    detail = ("%d of %d normalized, %d could not be measured, "
+                              "%d already were" % (
+                                  counts["written"], counts["considered"],
+                                  counts["failed"], counts["had"]))
                 else:
                     # MusicBrainz, so through the queue's one client.
                     with _queue().exclusive() as client:

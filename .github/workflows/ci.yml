@@ -77,10 +77,7 @@ jobs:
   build:
     name: executable (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # actions: write is for pruning old build artifacts; see the last step.
-    permissions:
-      contents: read
-      actions: write
+    # Builds and smoke-tests only; releases carry their own zip.
     strategy:
       fail-fast: false
       matrix:
@@ -106,27 +103,3 @@ jobs:
       # ffmpeg that was supposed to be inside it. Start it and ask.
       - run: python packaging/smoke_test.py dist/lemon-zest/lemon-zest.exe
       - run: python packaging/make_zip.py
-      # Each build is ~190 MB, and the repository's artifact storage is
-      # small: a week of pushes filled it and every later upload failed.
-      # A CI build is for trying a branch, not for keeping - releases carry
-      # their own zip - so it lives a day, and only the newest three stay.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lemon-zest-${{ matrix.os }}
-          path: dist/*.zip
-          if-no-files-found: error
-          retention-days: 1
-      - name: Keep only the newest three builds
-        # A fork's pull request gets a read-only token; its build still
-        # counts, it just cannot tidy up after itself.
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api --paginate "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name | startswith("lemon-zest-")) | select(.expired | not) | "\(.created_at) \(.id)"' \
-            | sort -r | tail -n +4 | while read -r _ id; do
-              echo "deleting old build artifact $id"
-              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id"
-            done
