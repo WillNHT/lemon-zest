@@ -2373,7 +2373,7 @@ function renderDupes() {
     ? `<img src="/api/art/${encodeURIComponent(t.content_key)}" alt=""
         style="width:40px;height:40px;object-fit:cover;border:1px solid var(--line-2)"
         onerror="this.replaceWith(document.createTextNode('none'))">`
-    : `<span class="clip">${h(t[f])}</span>`);
+    : `<span>${h(t[f])}</span>`);
   return `<div class="pad stack">
     <div class="faint" style="font-size:11px">${num(g.length)} possible
       duplicate${g.length === 1 ? '' : 's'}. Choose the master and, row by
@@ -2391,7 +2391,7 @@ function renderDupes() {
           <input type="radio" name="m-${gi}" value="${h(t.content_key)}"
             ${t.content_key === grp.master ? 'checked' : ''}> use this file</label></td>`).join('')}</tr>
         ${DUPE_FIELDS.map(([f, label]) => `<tr><td class="faint">${h(label)}</td>
-          ${grp.tracks.map(t => `<td><label style="display:flex;gap:4px;align-items:center">
+          ${grp.tracks.map(t => `<td><label style="display:inline-flex;gap:6px;align-items:center">
             <input type="radio" name="f-${gi}-${f}" value="${h(t.content_key)}"
               ${t.content_key === grp.master ? 'checked' : ''}>
             ${cell(t, f)}</label></td>`).join('')}</tr>`).join('')}

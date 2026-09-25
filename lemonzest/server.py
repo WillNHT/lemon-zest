@@ -47,7 +47,8 @@ NEW_SQL = (f"(t.added_at IS NOT NULL AND t.added_at > {INBOX_MARK} "
 # otherwise make every track look placed.
 UNLISTED_KEY = "unlisted.ignore"
 UNLISTED_SQL = (
-    "t.id NOT IN (SELECT pe.track_id FROM playlist_entry pe "
+    "t.id NOT IN (SELECT c.canon_id FROM playlist_entry pe "
+    "JOIN track_canon c ON c.id = pe.track_id "
     "JOIN playlist p ON p.id = pe.playlist_id "
     "WHERE pe.track_id IS NOT NULL AND p.name NOT IN (SELECT value FROM "
     f"json_each(COALESCE((SELECT value FROM meta WHERE key = '{UNLISTED_KEY}'),"
@@ -145,13 +146,16 @@ def create_app(db_path=None):
         c = con()
         _promote_due(c)
         one = lambda q: c.execute(q).fetchone()[0]
-        vis = f"WHERE {VISIBLE_BARE}"
         return jsonify({
-            "tracks": one(f"SELECT COUNT(*) FROM track {vis}"),
+            # Songs, as the list shows them: a version set aside behind its
+            # master is not counted a second time.
+            "tracks": one("SELECT COUNT(*) FROM track t "
+                          f"WHERE {VISIBLE} AND NOT {VARIANT_SQL}"),
             "inbox": one("SELECT COUNT(*) FROM track t "
-                         f"WHERE {VISIBLE} AND {NEW_SQL}"),
+                         f"WHERE {VISIBLE} AND {NEW_SQL} AND NOT {VARIANT_SQL}"),
             "unlisted": one("SELECT COUNT(*) FROM track t "
-                            f"WHERE {VISIBLE} AND {UNLISTED_SQL}"),
+                            f"WHERE {VISIBLE} AND {UNLISTED_SQL} "
+                            f"AND NOT {VARIANT_SQL}"),
             "bytes": one("SELECT COALESCE(SUM(size),0) FROM track"),
             "artists": one("SELECT COUNT(DISTINCT artist) FROM track"),
             "albums": one("SELECT COUNT(DISTINCT album) FROM track"),
@@ -812,7 +816,10 @@ def create_app(db_path=None):
             " WHERE x.playlist_id = p.id) AS entries "
             "FROM playlist_entry e "
             "JOIN playlist p ON p.id = e.playlist_id "
-            "JOIN track t ON t.id = e.track_id "
+            # Through its versions too: a playlist holding the holiday cut
+            # plays this master.
+            "JOIN track_canon c ON c.id = e.track_id "
+            "JOIN track t ON t.id IN (e.track_id, c.canon_id) "
             "WHERE t.content_key = ? GROUP BY p.id ORDER BY p.name",
             (content_key,))]
         # Where it came from and what it was on arrival, when it was

@@ -255,9 +255,11 @@ def suggest(con, keys=None, min_score=MIN_SCORE):
         if wanted and not (g["keys"] & wanted):
             continue
         # An existing master stays master; otherwise the file that knows
-        # its album, and then the one that arrived first.
+        # its album, the earliest release - the original, not the holiday
+        # album or the "best of" - and then the one that arrived first.
         members_ = sorted((rows[k] for k in g["keys"]), key=lambda r: (
-            not r["is_master"], not r["album"], r["added_at"] or 0, r["id"]))
+            not r["is_master"], not r["album"], str(r["year"] or "9999")[:4],
+            r["added_at"] or 0, r["id"]))
         out.append({"score": g["score"], "reasons": sorted(g["reasons"]),
                     "master": members_[0]["content_key"],
                     "tracks": [_public(r) for r in members_]})
