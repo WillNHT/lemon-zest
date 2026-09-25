@@ -3,7 +3,7 @@ import os
 import sqlite3
 import time
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -276,6 +276,48 @@ CREATE TABLE IF NOT EXISTS track_override (
     set_at      REAL NOT NULL,
     PRIMARY KEY (content_key, field)
 );
+
+-- A work: one song held as several files - the album cut, the holiday
+-- album, the "best of", the same video fetched twice. One file is the
+-- master and every reference resolves to it; the rest are kept, untouched,
+-- as a record of what was fetched. Keyed by content_key like the override
+-- and enrichment tables, so a move or a rescan does not break the group.
+CREATE TABLE IF NOT EXISTS work (
+    id         INTEGER PRIMARY KEY,
+    created_at REAL,
+    updated_at REAL
+);
+CREATE TABLE IF NOT EXISTS work_member (
+    content_key TEXT PRIMARY KEY,
+    work_id     INTEGER NOT NULL REFERENCES work(id) ON DELETE CASCADE,
+    is_master   INTEGER NOT NULL DEFAULT 0,
+    reason      TEXT,        -- bytes | source | isrc | mbid | fuzzy | manual
+    joined_at   REAL
+);
+CREATE INDEX IF NOT EXISTS ix_wm_work ON work_member(work_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_wm_master ON work_member(work_id)
+    WHERE is_master;
+
+-- "These two are not the same song", so a turned-down suggestion stays
+-- turned down. key_a < key_b.
+CREATE TABLE IF NOT EXISTS dup_dismissed (
+    key_a TEXT NOT NULL,
+    key_b TEXT NOT NULL,
+    at    REAL,
+    PRIMARY KEY (key_a, key_b)
+);
+
+-- Every track id beside the id of the file that stands for it: its work's
+-- master, or itself. Resolved on read rather than by rewriting references,
+-- so a playlist still says which version it was made from and an unmerge
+-- loses nothing.
+CREATE VIEW IF NOT EXISTS track_canon AS
+SELECT t.id AS id,
+       COALESCE((SELECT MIN(mt.id) FROM work_member v
+                 JOIN work_member mm ON mm.work_id = v.work_id AND mm.is_master
+                 JOIN track mt ON mt.content_key = mm.content_key
+                 WHERE v.content_key = t.content_key), t.id) AS canon_id
+FROM track t;
 
 CREATE TABLE IF NOT EXISTS sync_log (
     id        INTEGER PRIMARY KEY,

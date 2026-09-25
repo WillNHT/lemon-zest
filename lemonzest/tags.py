@@ -211,8 +211,8 @@ def _discard(tmp):
 def rekey(con, old_key, path, new_key):
     """Point every row that referenced the old content key at the new one.
 
-    Called after a successful write. Three tables key off the content key and
-    all three have to move together:
+    Called after a successful write. Four tables key off the content key and
+    all four have to move together:
 
       * ``track``, or the next scan treats a corrected file as a new one;
       * ``enrichment`` and ``track_override``, or the enrichment that was
@@ -239,6 +239,10 @@ def rekey(con, old_key, path, new_key):
         (new_key, old_key))
     con.execute("UPDATE device_manifest SET content_key=? WHERE content_key=?",
                 (new_key, old_key))
+    # Its place in a work, or a tag write would split a merged song.
+    con.execute(
+        "UPDATE OR IGNORE work_member SET content_key=? WHERE content_key=?",
+        (new_key, old_key))
 
 
 def read_cover(path):
