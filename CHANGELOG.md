@@ -1,6 +1,27 @@
 # CHANGELOG
 
 
+## v0.11.0 (2026-09-25)
+
+### Continuous Integration
+
+- Build and smoke-test the executable without uploading it
+  ([`4f31974`](https://github.com/WillNHT/lemon-zest/commit/4f31974ce242ea28ddf25aaa9f254f5548d9dbda))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+- **loudness**: Normalize volume with ReplayGain tags on download and on request
+  ([`fe57598`](https://github.com/WillNHT/lemon-zest/commit/fe57598f9b38d9d5545a9ca5fb0d7d6790b135f1))
+
+Measure each track with ffmpeg's EBU R128 meter and write replaygain_track_gain/peak (MP4 freeform,
+  ID3 TXXX, Vorbis comment), which the Rockbox fork applies by default. Audio is never re-encoded.
+  New downloads are tagged on arrival; a Volume maintenance button tags the rest.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.10.0 (2026-09-25)
 
 ### Bug Fixes
