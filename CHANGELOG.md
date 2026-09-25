@@ -1,6 +1,59 @@
 # CHANGELOG
 
 
+## v0.10.0 (2026-09-25)
+
+### Bug Fixes
+
+- **dedupe**: Count songs, not files, and follow versions into playlists
+  ([`5e1e49c`](https://github.com/WillNHT/lemon-zest/commit/5e1e49cd29885400eac289c241f7b4c6963745e1))
+
+The sidebar counts skip versions set aside behind a master, "not in a playlist" treats a master as
+  listed when one of its versions is, and the inspector's "as seen in" lists the playlists that
+  reach a track through its versions. The suggested master is the earliest release, so the album cut
+  wins over the holiday album and the best-of; the duplicates table shows every value in full.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+- **dedupe**: Group versions of a song under a master file
+  ([`97a3b4e`](https://github.com/WillNHT/lemon-zest/commit/97a3b4e2f28835d8627f3cdb0ac1784217850afb))
+
+Adds work/work_member/dup_dismissed tables and a track_canon view that resolves every track to its
+  work's master. Membership is keyed by content_key and follows tag rewrites through tags.rekey.
+  dedupe.py offers merge, set_master, unmerge and canon_ids; nothing touches files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **dedupe**: Playlists, device sync and library resolve to the master
+  ([`078b98e`](https://github.com/WillNHT/lemon-zest/commit/078b98e2927e879fe2c9ab6abbe653acd5054002))
+
+Every reader goes through track_canon: device rules and playlists put a merged song on the card
+  once, as its master; the PC-side playlist file names the master's file; append_tracks treats
+  another version of a song already present as present. Reading a written playlist back keeps each
+  entry on the version it was made from, so unmerge restores it.
+
+The library list hides non-master versions unless ?versions=1, and shows a ×N badge on songs held as
+  several files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **dedupe**: Suggest duplicates, merge from the UI and CLI, pick values per version
+  ([`f754977`](https://github.com/WillNHT/lemon-zest/commit/f754977723e5181c44d37ae63f575b41b59983af))
+
+Suggestions come from same source video, ISRC, matched recording, or the same title and length (with
+  or without the same artist, which is how a pseudonym re-release shows up). Turned-down pairs are
+  remembered. Merged songs gain a Versions panel in the inspector; the Duplicates page lets you
+  choose the master and, per field, which version each value (or the cover) comes from. Picks are
+  recorded with the version they came from.
+
+Downloads never fetch a video already in media, even after its file is gone, resolve playlist order
+  to masters, and report arrivals that look like a song already held without merging them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.9.0 (2026-09-24)
 
 ### Bug Fixes
