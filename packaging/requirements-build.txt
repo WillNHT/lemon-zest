@@ -7,4 +7,9 @@ pyinstaller>=6.3
 # yt-dlp ships inside the executable, so a packaged build never asks the
 # user to install it. Unpinned on purpose: YouTube breaks yt-dlp regularly
 # and the fix is always the newest release.
-yt-dlp
+#
+# The [default] extra is not optional here: it is what pulls in yt-dlp-ejs,
+# the challenge solver scripts the JavaScript runtime actually runs. Without
+# them the bundled Deno has nothing to execute and every YouTube video fails
+# - with an error that blames the runtime, whichever one is installed.
+yt-dlp[default]

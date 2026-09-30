@@ -23,6 +23,8 @@ import os
 import re
 import sys
 
+from PyInstaller.utils.hooks import collect_data_files
+
 # PyInstaller runs a spec with exec(), so __file__ is not defined; SPECPATH
 # is the directory the spec lives in.
 HERE = SPECPATH
@@ -95,6 +97,18 @@ hiddenimports = [
     # the import graph would not find it.
     "yt_dlp",
 ]
+
+# A JavaScript runtime is half of what YouTube needs; the other half is the
+# solver scripts that runtime executes, which live in a separate package and
+# arrive only with yt-dlp[default]. A build without them ships a Deno with
+# nothing to run, so it is refused here rather than discovered by a user.
+try:
+    import yt_dlp_ejs  # noqa: F401
+except ImportError:
+    raise SystemExit("yt-dlp-ejs is not installed - the build would fail "
+                     "every YouTube download. pip install 'yt-dlp[default]'")
+hiddenimports += ["yt_dlp_ejs", "yt_dlp_ejs.yt.solver"]
+datas += collect_data_files("yt_dlp_ejs")
 
 excludes = [
     "tkinter",

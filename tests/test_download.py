@@ -1000,6 +1000,14 @@ class DownloadTests(unittest.TestCase):
         self.assertIn("JavaScript runtime",
                       download.explain("WARNING: n challenge solving failed"))
 
+    def test_missing_solver_scripts_are_not_blamed_on_the_runtime(self):
+        hint = download.explain(
+            "WARNING: [youtube] [jsc:deno] Challenge solver lib script "
+            "version 0.0.0 is not supported\n"
+            "WARNING: [youtube] abc: n challenge solving failed")
+        self.assertIn("solver scripts", hint)
+        self.assertIn("will not help", hint)
+
     def test_config_round_trips(self):
         download.set_config(self.con, cookies_mode="firefox",
                             audio_format="opus", nonsense="x")
