@@ -1,6 +1,43 @@
 # CHANGELOG
 
 
+## v0.11.2 (2026-09-30)
+
+### Bug Fixes
+
+- **ui**: Reload what the page shows after every action, in one place
+  ([`3a0c37b`](https://github.com/WillNHT/lemon-zest/commit/3a0c37bbeda7c39c4b5ac649ccdbf6485ea523f7))
+
+Each action reloaded only the endpoints its author remembered it touched, so lists drawn from
+  different endpoints drifted apart: a newly scanned library folder was missing from the download
+  page's "Into" box, because the box comes from /download/config and the scan only reloaded /stats.
+
+- loadView()/refresh(): one function that reloads whatever the current page is drawn from; every
+  mutation and navigation goes through it. - jobFinished(): a single completion handler for every
+  job kind. - A background look-in (4s while a job or the identification queue is working, 12s idle,
+  and on tab refocus) picks up changes made elsewhere. - render() skips markup that has not changed
+  and keeps scroll positions; passive renders also keep unsent input, focus and caret.
+
+Also fixes: stale inspector after an edit, pairing a device opening the wrong one, the download page
+  stuck on its spinner for an empty catalog, "Rescan library" scanning only the first folder, a
+  finished sync writing its log and plan onto another device's page, playlist reloads marking new
+  rows seen, and out-of-order library responses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Testing
+
+- **download**: Serialise the stub's archive writes
+  ([`04b0088`](https://github.com/WillNHT/lemon-zest/commit/04b008865fcb094ee6f4c939b910fe3f03e138ca))
+
+The yt-dlp stand-in appends to the download archive from several worker processes at once. An append
+  on Windows is a seek followed by a write, so two landing together could leave one line where there
+  should be two, and the next run then fetched again what the first had - failing
+  test_the_batch_counts_what_the_archive_already_had about one run in six.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.11.1 (2026-09-30)
 
 ### Bug Fixes
