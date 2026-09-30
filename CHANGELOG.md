@@ -1,6 +1,23 @@
 # CHANGELOG
 
 
+## v0.11.1 (2026-09-30)
+
+### Bug Fixes
+
+- **download**: Bundle yt-dlp's challenge solver scripts in the executable
+  ([`b2860e9`](https://github.com/WillNHT/lemon-zest/commit/b2860e9524663c6732caca2f35784bdf1c75d853))
+
+The release build installed plain yt-dlp, which leaves out yt-dlp-ejs: the solver scripts the
+  JavaScript runtime runs. The packaged Deno had nothing to execute, every YouTube download failed,
+  and the hint blamed a missing runtime, so installing Deno or Node changed nothing.
+
+Install yt-dlp[default], refuse to build without yt-dlp-ejs, check for the scripts in the smoke
+  test, and explain the failure accurately.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.11.0 (2026-09-25)
 
 ### Continuous Integration
