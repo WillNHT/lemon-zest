@@ -105,6 +105,19 @@ def run_bundled_tools(exe):
             raise SystemExit(f"{name} is missing from the bundle:\n{out.stdout}")
     print("ok   bundled ffmpeg, ffprobe, deno, fpcalc")
 
+    # Deno alone solves nothing: yt-dlp hands it the solver scripts out of
+    # yt-dlp-ejs, and a build made without that package passes everything
+    # above and then fails every YouTube download.
+    wanted = {"core.min.js", "lib.min.js"}
+    for folder, _dirs, files in os.walk(os.path.dirname(os.path.abspath(exe))):
+        if os.path.basename(os.path.dirname(os.path.dirname(folder))) \
+                == "yt_dlp_ejs":
+            wanted -= set(files)
+    if wanted:
+        raise SystemExit("yt-dlp's challenge solver scripts are missing from "
+                         "the bundle: " + ", ".join(sorted(wanted)))
+    print("ok   bundled yt-dlp-ejs solver scripts")
+
 
 def get(url):
     with urllib.request.urlopen(url, timeout=5) as resp:

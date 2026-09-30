@@ -549,6 +549,16 @@ _HINTS = (
      "has joined the channel."),
     (re.compile(r"private video|video unavailable", re.I),
      "The video is private or unavailable."),
+    # A runtime is only half of it: what it runs is the solver scripts from
+    # yt-dlp-ejs. When those are missing yt-dlp's complaint still talks about
+    # challenge solving, and telling someone to install Deno a second time
+    # sends them nowhere - so this is matched before the runtime hint.
+    (re.compile(r"challenge solver \w+ script|yt-dlp-ejs|remote.components",
+                re.I),
+     "yt-dlp has a JavaScript runtime but not the challenge solver scripts "
+     "it runs in it, so YouTube hands over no playable format. Installing "
+     "Deno or Node will not help. Update Lemon Zest, or if you run your own "
+     "yt-dlp, install the scripts with: pip install -U \"yt-dlp[default]\""),
     # YouTube signs its media URLs with a challenge that has to be run.
     # Without a runtime to run it in, yt-dlp gets no playable format and
     # says "The page needs to be reloaded", which explains nothing.
