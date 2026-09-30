@@ -87,8 +87,23 @@ for name in names:
           % (idx, len(every), os.path.basename(name)))
     print("[lz-file]" + path)
     if archive:
-        with open(archive, "a", encoding="utf-8") as fh:
-            fh.write(name + "\\n")
+        # One writer at a time. The workers run several of these at once,
+        # and an append on Windows is a seek and then a write: two of them
+        # landing together leave one line where there should be two, and
+        # the next run fetches again what this one had.
+        lock = archive + ".lock"
+        while True:
+            try:
+                held = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except (FileExistsError, PermissionError):
+                time.sleep(0.005)
+        try:
+            with open(archive, "a", encoding="utf-8") as fh:
+                fh.write(name + "\\n")
+        finally:
+            os.close(held)
+            os.remove(lock)
     # A gate, when the test asks for one: the file is written and then
     # nothing more happens until whoever is watching says so. It is how a
     # test can insist that the work following a file happened before the

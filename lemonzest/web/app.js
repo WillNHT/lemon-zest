@@ -151,7 +151,11 @@ async function loadCore() {
   S.stats = stats;
   S.devices = devices;
   S.playlists = playlists;
-  if (!S.scopeId && devices.length) S.scopeId = devices[0].id;
+  coreSeen = coreMark(stats, devices, playlists);
+  // The device the tick column is about may have been removed since.
+  if (!devices.some(d => d.id === S.scopeId)) {
+    S.scopeId = devices.length ? devices[0].id : null;
+  }
 }
 
 /* `S.filter` is whichever set belongs to the view being looked at.
@@ -188,16 +192,32 @@ function isTrackView() {
     || S.view === 'unlisted';
 }
 
+let librarySeq = 0;
+
 async function loadLibrary() {
   const p = libraryParams();
   p.set('limit', S.limit); p.set('offset', S.offset);
   if (S.view === 'inbox') { p.set('new', '1'); p.set('order', 'added'); }
   if (S.scopeId) p.set('device', S.scopeId);
+  // Two of these can be in flight at once - a search being typed, a job
+  // finishing behind it - and the answer that lands last is not always the
+  // one asked for last. Only the newest question gets to fill the table.
+  const seq = ++librarySeq;
   const [lib, facets] = await Promise.all([
     api('/library?' + p), api('/facets?' + p),
   ]);
+  if (seq !== librarySeq) return;
   S.tracks = lib.tracks; S.tracksTotal = lib.total;
   S.facets = facets;
+  // A page that no longer exists - the last rows of it were just cleared,
+  // merged or filtered away - is an empty table under a count that says
+  // there is music. Step back to the last page that does.
+  if (!S.tracks.length && S.tracksTotal && S.offset) {
+    S.offset = Math.floor((S.tracksTotal - 1) / S.limit) * S.limit;
+    return loadLibrary();
+  }
+  // Whatever just changed the rows may have changed the one being read.
+  reloadInspector();
 }
 
 /* Open a playlist: its own details, and the library narrowed to it.
@@ -220,22 +240,43 @@ function openPlaylist(id) {
   });
 }
 
-async function loadPlaylist(id) {
+/* `peek` reads the playlist without marking it seen: a reload behind the
+   reader's back must not be what decides they have looked at the new rows. */
+async function loadPlaylist(id, opts) {
   S.playlistId = id;
-  S.playlistDetail = id ? await api('/playlists/' + id) : null;
+  const detail = id
+    ? await api('/playlists/' + id + (opts && opts.peek ? '?peek=1' : ''))
+    : null;
+  if (S.playlistId !== id) return;
+  // The rows stay "new" against the watermark the page was opened with,
+  // however many times it is reloaded while it is open.
+  if (detail && opts && opts.peek && S.playlistDetail
+      && S.playlistDetail.playlist.id === id) {
+    detail.since = S.playlistDetail.since;
+  }
+  S.playlistDetail = detail;
 }
 
+let planSeq = 0;
+
 async function loadPlan(deviceId) {
+  const seq = ++planSeq;
   S.planning = true; S.plan = null; S.planError = null;
   render();
+  let plan = null, error = null;
   try {
-    S.plan = await api('/devices/' + deviceId + '/plan');
+    plan = await api('/devices/' + deviceId + '/plan');
   } catch (e) {
-    S.planError = e.message;
-    if (e.payload && e.payload.not_mounted) S.planError = e.payload.error;
-  } finally {
-    S.planning = false;
+    error = e.message;
+    if (e.payload && e.payload.not_mounted) error = e.payload.error;
   }
+  // A plan takes a while, and the page may be about another device by the
+  // time it arrives. One device's plan under another's name is worse than
+  // no plan.
+  if (seq !== planSeq) return;
+  S.planning = false;
+  if (S.deviceId !== deviceId) return;
+  S.plan = plan; S.planError = error;
 }
 
 async function loadDownload() {
@@ -243,7 +284,106 @@ async function loadDownload() {
 }
 
 async function loadLog(deviceId) {
-  S.log = await api('/devices/' + deviceId + '/log?limit=60');
+  const log = await api('/devices/' + deviceId + '/log?limit=60');
+  if (S.deviceId === deviceId) S.log = log;
+}
+
+/* Everything the page being looked at is drawn from, fetched again.
+
+   Each action used to reload what its author remembered it touched, and the
+   lists drifted apart: a folder scanned on this page was missing from the
+   "Into" box a card further up, because the box is drawn from the download
+   settings and the scan only reloaded the counts. So the question is asked
+   the other way round - not "what did this change" but "what is on screen" -
+   and asked in one place.
+
+   `quiet` is a reload nobody asked for, behind the reader's back: it leaves
+   alone what is slow to work out (a device plan walks the whole card) and
+   what the reader may be half way through (the duplicates page holds their
+   choices in its radio buttons). */
+async function loadView(opts) {
+  const quiet = !!(opts && opts.quiet);
+  const v = S.view;
+  if (v === 'playlist') {
+    if (!S.playlists.some(p => p.id === S.playlistId)) {
+      // The playlist went away - a reset, a removed folder.
+      S.view = 'library'; S.playlistId = null; S.playlistDetail = null;
+      S.offset = 0; S.sel.clear(); S.anchor = null;
+      return loadLibrary();
+    }
+    await loadPlaylist(S.playlistId, { peek: true });
+    return loadLibrary();
+  }
+  if (v === 'unlisted') return loadUnlisted();
+  if (isTrackView()) return loadLibrary();
+  if (v === 'device') {
+    const dev = S.devices.find(d => d.id === S.deviceId);
+    if (!dev) { S.view = 'library'; S.deviceId = null; return loadLibrary(); }
+    await loadLog(dev.id);
+    if (!dev.mounted_at) { S.plan = null; S.planError = null; }
+    else if (!quiet) await loadPlan(dev.id);
+    return;
+  }
+  if (v === 'download') return loadDownload();
+  if (v === 'normalize') { if (!S.dl) await loadDownload(); return; }
+  if (v === 'syncList') { S.syncList = await api('/sync-list'); return; }
+  if (v === 'problems') { S.problems = await api('/problems'); return; }
+  if (v === 'dupes') { if (!quiet || !S.dupes) await loadDupes(); return; }
+  if (v === 'addDevice' && quiet) return loadVolumes();
+  if (v === 'utilities' && !quiet) {
+    // Counted again by render(), which fetches whichever of these is empty
+    // and not already on its way.
+    if (!(S.resetInfo && S.resetInfo.loading)) S.resetInfo = null;
+    if (!S.portableLoading) S.portable = null;
+  }
+}
+
+async function refresh(opts) {
+  await loadCore();
+  await loadView(opts);
+}
+
+/* The same, unasked: what another tab, the command line, the identification
+   queue or a cable being plugged in changed while this page sat open.
+
+   Cheap when nothing happened - three small requests, compared with what is
+   already held - and only when something did is the page itself reloaded.
+   An action of the reader's own that started in the meantime wins: its
+   answer is newer than this one's question. */
+let epoch = 0;
+let coreSeen = '';
+let looking = false;
+
+// What the core says, as one string to compare. Free space is left out: a
+// folder on the system disk gains and loses a few kilobytes every second,
+// and that is not a reason to fetch the library again.
+function coreMark(stats, devices, playlists) {
+  return JSON.stringify([stats, playlists,
+    devices.map(d => Object.assign({}, d, { space: null }))]);
+}
+
+async function refreshQuietly() {
+  if (looking) return;               // the last look has not come back yet
+  looking = true;
+  const at = epoch;
+  try {
+    const [stats, devices, playlists] = await Promise.all([
+      api('/stats'), api('/devices'), api('/playlists'),
+    ]);
+    if (at !== epoch) return;
+    const seen = coreMark(stats, devices, playlists);
+    const changed = seen !== coreSeen;
+    coreSeen = seen;
+    S.stats = stats; S.devices = devices; S.playlists = playlists;
+    if (!S.devices.some(d => d.id === S.scopeId)) {
+      S.scopeId = devices.length ? devices[0].id : null;
+    }
+    if (changed) await loadView({ quiet: true });
+    if (at !== epoch) return;
+    render({ passive: true });
+  } finally {
+    looking = false;
+  }
 }
 
 // ------------------------------------------------------------------ jobs
@@ -283,25 +423,29 @@ async function adoptRunningJob() {
    started it - so a job this tab adopted finishes the same way as one it
    began itself. */
 async function jobFinished(job) {
-  if (job.kind === 'download') {
-    S.dlResult = job.result || null;
-    await loadCore();
-    await loadDownload();
-    if (S.view === 'playlist' && S.playlistId) {
-      await loadPlaylist(S.playlistId, { peek: true });
+  epoch += 1;
+  if (job.kind === 'download') S.dlResult = job.result || null;
+  if (job.kind === 'enrich' || job.kind === 'write-tags') S.outcome = job;
+  if (job.kind === 'write-tags') {
+    // Writing tags changes every content key it touches, so the selection
+    // now names files that no longer exist under those keys. Dropping it
+    // is more honest than leaving a selection that silently acts on
+    // nothing.
+    S.sel.clear(); S.anchor = null;
+  }
+  // Whatever it was, it changed the catalog, and the page being looked at
+  // is drawn from the catalog. A download also changes the download page's
+  // own lists - recent, kept, paused - and a scan the folders it offers,
+  // which is one more reason not to decide here which pages care.
+  try {
+    await refresh();
+    if (S.view !== 'download' && S.dl
+        && (job.kind === 'download' || job.kind === 'scan')) {
+      await loadDownload();
     }
-    if (isTrackView()) await loadLibrary();
-    followAutoEnrich(job, 'the new files');
-    return;
+  } catch (e) {
+    S.error = e.message;
   }
-  if (job.kind === 'enrich' || job.kind === 'write-tags') {
-    S.outcome = job;
-    await loadCore();
-    if (isTrackView()) await loadLibrary();
-    return;
-  }
-  await loadCore();
-  if (isTrackView()) await loadLibrary();
 }
 
 /* Look in on the program every few seconds when nothing is being watched.
@@ -311,13 +455,32 @@ async function jobFinished(job) {
    dictionary in memory, and the timer stops itself while a job is being
    polled properly. */
 const ADOPT_EVERY = 4000;
-setInterval(() => {
-  if (pollTimer) return;               // already watching one, closely
+let ticks = 0;
+
+async function lookIn() {
   if (document.hidden) return;         // a background tab needs nothing
-  adoptRunningJob().then(() => {
-    if (S.job && S.job.state === 'running') render();
-  }, () => { /* the server may be restarting; the next tick will find it */ });
-}, ADOPT_EVERY);
+  ticks += 1;
+  try {
+    if (!pollTimer) {                  // else already watching one, closely
+      await adoptRunningJob();
+      if (S.job && S.job.state === 'running') render({ passive: true });
+    }
+    // While something is visibly working - a job, the identification
+    // queue - the counts move every few seconds and so does this. Idle,
+    // every third look is enough to notice a card being plugged in.
+    const q = (S.stats || {}).enrich_queue || {};
+    const working = (S.job && S.job.state === 'running')
+      || q.waiting || q.current;
+    if (working || ticks % 3 === 0) await refreshQuietly();
+  } catch (e) { /* the server may be restarting; the next tick will find it */ }
+}
+
+setInterval(lookIn, ADOPT_EVERY);
+
+// Coming back to the tab is the moment it is most likely to be out of date.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && S.stats) { ticks = 2; lookIn(); }
+});
 
 function watchJob(id, onDone) {
   clearInterval(pollTimer);
@@ -328,9 +491,11 @@ function watchJob(id, onDone) {
       if (job.state !== 'running') {
         clearInterval(pollTimer);
         pollTimer = null;
-        if (onDone) await onDone(job);
+        await (onDone || jobFinished)(job);
       }
-      render();
+      // Passive: a progress tick must not take the caret out of a box
+      // somebody is typing in, or wind a list back to its top.
+      render({ passive: true });
     } catch (e) {
       clearInterval(pollTimer); pollTimer = null;
     }
@@ -389,7 +554,7 @@ function renderSidebar() {
       ${foot ? `<div class="foot">${h(foot)}</div>` : ''}
     </div>`;
 
-  $('#sidebar').innerHTML =
+  const html =
     sect('Library', undefined,
       navRow({ act: 'view', arg: 'library', label: 'Music', icon: 'i-disc',
                n: num(st.tracks), on: S.view === 'library' }) +
@@ -450,6 +615,7 @@ function renderSidebar() {
       navRow({ act: 'view', arg: 'utilities', label: 'Utilities',
                icon: 'i-warn', on: S.view === 'utilities',
                title: 'Maintenance: start the library over' }));
+  setHtml($('#sidebar'), html);
 }
 
 // --------------------------------------------------------------- library
@@ -1063,10 +1229,24 @@ function syncInspector() {
   if (key === S.inspectKey) return;
   S.inspectKey = key;
   S.inspect = null;
+  reloadInspector();
+}
+
+/* Ask again about the track the inspector is showing.
+
+   The panel is a second copy of the row beside it, and used to be fetched
+   only when the selection moved - so saving an edit changed the row and
+   left the old title sitting in the panel next to it. What is there stays
+   up until the new answer arrives, rather than blinking to a spinner. */
+function reloadInspector() {
+  const key = S.inspectKey;
   if (!key) return;
   api('/enrich/track/' + encodeURIComponent(key)).then((d) => {
     // The selection may have moved on while the request was in flight.
-    if (S.inspectKey === key) { S.inspect = d; render(); }
+    if (S.inspectKey !== key) return;
+    const changed = JSON.stringify(d) !== JSON.stringify(S.inspect);
+    S.inspect = d;
+    if (changed) render({ passive: true });
   }, () => { /* an inspector that cannot load is not an error worth a banner */ });
 }
 
@@ -1525,7 +1705,10 @@ function renderDevice() {
   const d = S.devices.find(x => x.id === S.deviceId);
   if (!d) return '<div class="empty">Select a device.</div>';
   const p = S.plan;
-  const job = S.job && S.job.kind === 'sync' ? S.job : null;
+  // One sync at a time, and it belongs to one device: its progress bar on
+  // another device's page would be a claim about the wrong card.
+  const job = S.job && S.job.kind === 'sync' && S.job.label === d.name
+    ? S.job : null;
   const running = job && job.state === 'running';
   const space = d.space;
 
@@ -1769,7 +1952,10 @@ function renderSources() {
             style="flex:1;border:1px solid var(--line-2);border-radius:3px;padding:4px 7px">
           <button class="btn primary" type="submit">Import</button>
         </form>
-        <div id="pl-result"></div>
+        ${S.plImport ? `<div class="notice ok">${icon('i-check')}<div>
+          ${num(S.plImport.playlists)} playlists, ${num(S.plImport.entries)} entries,
+          ${num(S.plImport.matched)} matched${S.plImport.enriched
+            ? `, ${num(S.plImport.enriched)} source URIs added` : ''}.</div></div>` : ''}
       </div>
     </div>`;
 }
@@ -2681,10 +2867,13 @@ function runReset() {
       method: 'POST',
       body: JSON.stringify({ confirm: 'RESET', delete_files: files }),
     });
-    S.resetInfo = null;
     S.sel.clear(); S.anchor = null;
-    S.playlistDetail = null;
-    await loadCore();
+    S.playlistId = null; S.playlistDetail = null;
+    // Nothing held from before the reset describes the catalog any more.
+    S.tracks = []; S.tracksTotal = 0;
+    S.syncList = null; S.problems = null; S.dupes = null; S.dlResult = null;
+    await refresh();
+    if (S.dl) await loadDownload();
   });
 }
 
@@ -2821,13 +3010,120 @@ function stopPlaying() {
   document.body.classList.remove('playing');
 }
 
-function render() {
+/* Put markup on the page only when it is not what is there already.
+
+   Most renders change one corner of the screen, and rebuilding the rest
+   costs more than time: a list rebuilt is a list scrolled back to its top,
+   a box rebuilt is a box that has lost what was being typed into it. */
+function setHtml(el, html) {
+  if (el._html === html) return false;
+  el._html = html;
+  el.innerHTML = html;
+  return true;
+}
+
+// The lists that scroll inside the page rather than with it.
+const SCROLLERS = '.list,.items,.scrollbox,.console,.log,[style*="overflow"]';
+
+// A name for a form control that survives the page being rebuilt around it.
+function fieldKey(el) {
+  if (!el || !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return null;
+  // Drawn from the selection and the page number, which are state.
+  if (el.dataset.pick !== undefined || el.id === 'pick-all'
+      || el.id === 'page-jump') return null;
+  const form = el.form && el.form.id ? el.form.id + ':' : '';
+  if (el.type === 'radio') return form + 'radio:' + el.name + '=' + el.value;
+  if (el.id) return '#' + el.id;
+  if (el.name) return form + el.name;
+  for (const k of ['pane', 'filter', 'relocateTo', 'pl']) {
+    if (el.dataset[k] !== undefined) return k + ':' + el.dataset[k];
+  }
+  return null;
+}
+
+function fieldDirty(el) {
+  if (el.type === 'checkbox' || el.type === 'radio') {
+    return el.checked !== el.defaultChecked;
+  }
+  if (el.tagName === 'SELECT') {
+    return Array.from(el.options).some(o => o.selected !== o.defaultSelected);
+  }
+  return el.value !== el.defaultValue;
+}
+
+/* What the reader has done to the page that the state does not know about:
+   how far each list is scrolled and - for a render nobody asked for - what
+   has been typed and not yet sent, and where the caret is. */
+function holdPage(root, passive) {
+  const held = { scroll: [], fields: new Map(), focus: null };
+  root.querySelectorAll(SCROLLERS).forEach((el, i) => {
+    if (el.scrollTop || el.scrollLeft) {
+      held.scroll.push({ i, cls: el.className, top: el.scrollTop,
+                         left: el.scrollLeft });
+    }
+  });
+  if (!passive) return held;
+  for (const el of root.querySelectorAll('input,textarea,select')) {
+    const key = fieldKey(el);
+    if (!key || !fieldDirty(el)) continue;
+    held.fields.set(key, el.type === 'checkbox' || el.type === 'radio'
+      ? { checked: el.checked } : { value: el.value });
+  }
+  const at = document.activeElement;
+  if (at && root.contains(at) && fieldKey(at)) {
+    held.focus = { key: fieldKey(at) };
+    try {
+      held.focus.start = at.selectionStart; held.focus.end = at.selectionEnd;
+    } catch (e) { /* not a text box */ }
+  }
+  return held;
+}
+
+function restorePage(root, held) {
+  const scrollers = root.querySelectorAll(SCROLLERS);
+  for (const sc of held.scroll) {
+    const el = scrollers[sc.i];
+    if (!el || el.className !== sc.cls) continue;
+    el.scrollTop = sc.top; el.scrollLeft = sc.left;
+  }
+  if (!held.fields.size && !held.focus) return;
+  for (const el of root.querySelectorAll('input,textarea,select')) {
+    const key = fieldKey(el);
+    if (!key) continue;
+    const was = held.fields.get(key);
+    if (was && was.checked !== undefined) el.checked = was.checked;
+    else if (was && (el.tagName !== 'SELECT'
+        || Array.from(el.options).some(o => o.value === was.value))) {
+      el.value = was.value;
+    }
+    if (held.focus && held.focus.key === key && document.activeElement !== el) {
+      el.focus();
+      try { el.setSelectionRange(held.focus.start, held.focus.end); }
+      catch (e) { /* not a text box */ }
+    }
+  }
+}
+
+let paneShows = '';
+
+/* `passive` marks a render nobody asked for - a progress tick, a look at
+   what changed elsewhere. It redraws what is new and leaves the reader's
+   own work on the page where it was. */
+function render(opts) {
+  const passive = !!(opts && opts.passive);
   saveUiState();
   if (isTrackView()) syncInspector();
+  const frame = $('#app');
+  const pane = $('#pane');
+  // A different page starts at its top; the same page stays where it is.
+  const shows = [S.view, S.playlistId, S.deviceId].join('|');
+  const moved = shows !== paneShows;
+  paneShows = shows;
+  const held = holdPage(frame, passive && !moved);
   renderSidebar();
-  $('#titlebar').innerHTML = `<span>${h((TITLES[S.view] || (() => S.view))())}</span>
+  setHtml($('#titlebar'), `<span>${h((TITLES[S.view] || (() => S.view))())}</span>
     <span class="grow"></span>
-    ${S.error ? `<span style="color:var(--bad);text-transform:none;font-family:var(--sans);font-size:11px">${h(S.error)}</span>` : ''}`;
+    ${S.error ? `<span style="color:var(--bad);text-transform:none;font-family:var(--sans);font-size:11px">${h(S.error)}</span>` : ''}`);
   const body = {
     library: renderLibrary, inbox: renderInbox, unlisted: renderUnlisted,
     device: renderDevice, playlist: renderPlaylist,
@@ -2836,9 +3132,15 @@ function render() {
     syncList: renderSyncList, problems: renderProblems, dupes: renderDupes,
     download: renderDownload,
   }[S.view];
-  $('#pane').innerHTML = body ? body() : '';
+  const rebuilt = setHtml(pane, body ? body() : '');
+  if (moved) {
+    pane.scrollTop = 0;
+    held.scroll = held.scroll.filter(sc => !pane.contains(
+      frame.querySelectorAll(SCROLLERS)[sc.i]));
+  }
+  restorePage(frame, held);
   renderStatus();
-  if (S.view === 'addDevice') loadVolumes();
+  if (S.view === 'addDevice' && rebuilt) loadVolumes();
   if (S.view === 'utilities' && !S.resetInfo) loadResetInfo();
   if (S.view === 'utilities' && !S.portable && !S.portableLoading) {
     S.portableLoading = true;
@@ -3101,11 +3403,7 @@ function startEnrich(keys) {
     S.outcome = null;
     S.job = { id: res.job, kind: 'enrich', state: 'running', done: 0,
               total: keys.length, label: num(keys.length) + ' tracks' };
-    watchJob(res.job, async (job) => {
-      S.outcome = job;
-      await loadCore();
-      await loadLibrary();
-    });
+    watchJob(res.job);
   });
 }
 
@@ -3347,16 +3645,7 @@ function startWriteTags(keys) {
     S.outcome = null;
     S.job = { id: res.job, kind: 'write-tags', state: 'running', done: 0,
               total: keys.length, label: num(keys.length) + ' files' };
-    watchJob(res.job, async (job) => {
-      S.outcome = job;
-      // Writing tags changes every content key it touches, so the selection
-      // now names files that no longer exist under those keys. Dropping it
-      // is more honest than leaving a selection that silently acts on
-      // nothing.
-      S.sel.clear(); S.anchor = null;
-      await loadCore();
-      await loadLibrary();
-    });
+    watchJob(res.job);
   });
 }
 
@@ -3364,7 +3653,11 @@ function startWriteTags(keys) {
 
 async function guard(fn) {
   S.error = null;
+  // Bumped on the way in and on the way out: a look at the server that
+  // began before this finished describes a catalog this has since changed.
+  epoch += 1;
   try { await fn(); } catch (e) { S.error = e.message; }
+  epoch += 1;
   render();
 }
 
@@ -3522,12 +3815,7 @@ document.addEventListener('click', (ev) => {
       S.dlResult = null;
       S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
                 total: 0, label: d.keeprun };
-      watchJob(res.job, async (job) => {
-        S.dlResult = job.result || null;
-        await loadCore();
-        await loadDownload();
-        followAutoEnrich(job, 'the new files');
-      });
+      watchJob(res.job);
     });
   }
 
@@ -3543,8 +3831,12 @@ document.addEventListener('click', (ev) => {
       S.unpacked = await api('/portable/unpack', {
         method: 'POST', body: JSON.stringify({ folder: folder.trim(), replace }),
       });
-      S.portable = await api('/portable');
-      await loadCore();
+      // A different catalog now: nothing held from the old one describes it.
+      S.sel.clear(); S.anchor = null;
+      S.playlistId = null; S.playlistDetail = null;
+      S.tracks = []; S.tracksTotal = 0;
+      await refresh();
+      if (S.dl) await loadDownload();
     });
   }
   if (d.relocate) {
@@ -3555,7 +3847,7 @@ document.addEventListener('click', (ev) => {
         method: 'POST',
         body: JSON.stringify({ old: d.relocate, new: (box ? box.value : '').trim() }),
       });
-      await loadCore();
+      await refresh();
     });
   }
   if (d.dlHalt) {
@@ -3572,7 +3864,7 @@ document.addEventListener('click', (ev) => {
         S.dlResult = null;
         S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
                   total: 0, label: 'resume' };
-        watchJob(res.job, (job) => jobFinished(job));
+        watchJob(res.job);
       }
       await loadDownload();
     });
@@ -3582,7 +3874,7 @@ document.addEventListener('click', (ev) => {
       const res = await api('/maintenance/' + d.maint, { method: 'POST' });
       S.job = { id: res.job, kind: 'maintenance', state: 'running', done: 0,
                 total: 0, label: d.maint };
-      watchJob(res.job, (job) => jobFinished(job));
+      watchJob(res.job);
     });
   }
   if (d.act === 'review') {
@@ -3590,7 +3882,7 @@ document.addEventListener('click', (ev) => {
     // question the card was about.
     S.view = 'library'; S.filter.state = 'awaiting';
     S.offset = 0; S.sel.clear(); S.anchor = null;
-    return guard(loadLibrary);
+    return guard(refresh);
   }
   if (d.dupeMerge) return guard(() => mergeDupe(+d.dupeMerge));
   if (d.dupeDismiss) {
@@ -3598,7 +3890,7 @@ document.addEventListener('click', (ev) => {
     return guard(async () => {
       await api('/dupes/dismiss', { method: 'POST', body: JSON.stringify({
         content_keys: grp.tracks.map(t => t.content_key) }) });
-      await loadDupes();
+      await refresh();
     });
   }
   if (d.dupeMaster || d.dupeUnmerge) {
@@ -3607,7 +3899,7 @@ document.addEventListener('click', (ev) => {
         method: 'POST', body: JSON.stringify({
           content_key: d.dupeMaster || d.dupeUnmerge }) });
       S.inspectKey = null;
-      await loadLibrary();
+      await refresh();
     });
   }
   if (d.versionsToggle) {
@@ -3617,57 +3909,39 @@ document.addEventListener('click', (ev) => {
   }
   if (d.act === 'view') {
     S.view = d.arg;
-    if (d.arg === 'unlisted') {
-      S.offset = 0; S.sel.clear(); S.anchor = null;
-      S.sort = { col: null, dir: 'asc' };
-      return guard(loadUnlisted);
-    }
-    if (d.arg === 'library' || d.arg === 'inbox') {
+    if (isTrackView()) {
       // The views share the table, and the offset, selection and sort
       // belong to the question that was asked, not to the one being left.
       S.offset = 0; S.sel.clear(); S.anchor = null;
       S.sort = { col: null, dir: 'asc' };
-      return guard(loadLibrary);
+      // Not painted until loaded: the rows held are the last page's.
+      return guard(refresh);
     }
     if (d.arg === 'utilities') {
-      S.portable = null;
-      S.unpacked = null;
-      S.resetInfo = null;
-      S.resetResult = null;
+      // Emptied here, so the first paint below is what fetches them.
+      S.unpacked = null; S.resetResult = null;
+      S.resetInfo = null; S.portable = null;
     }
-    if (d.arg === 'syncList') {
-      S.syncList = null;
-      render();
-      return guard(async () => { S.syncList = await api('/sync-list'); });
-    }
-    if (d.arg === 'dupes') {
-      S.dupes = null;
-      render();
-      return guard(loadDupes);
-    }
-    if (d.arg === 'problems') {
-      S.problems = null;
-      render();
-      return guard(async () => { S.problems = await api('/problems'); });
-    }
-    if (d.arg === 'download') {
-      S.dlProbe = null;
-      // Painted first, loaded second: the config asks yt-dlp its version and
-      // looks for a JavaScript runtime, and a click that waits on both is a
-      // click that feels broken.
-      render();
-      return guard(loadDownload);
-    }
-    return render();
+    if (d.arg === 'syncList') S.syncList = null;
+    if (d.arg === 'dupes') S.dupes = null;
+    if (d.arg === 'problems') S.problems = null;
+    if (d.arg === 'download') { S.dlProbe = null; S.plImport = null; }
+    // Painted first, loaded second: the download page asks yt-dlp its
+    // version and looks for a JavaScript runtime, and a click that waits on
+    // both is a click that feels broken. Every page is loaded on the way
+    // in, along with the counts beside it, so none of them opens on what
+    // was true the last time it was looked at.
+    render();
+    return guard(refresh);
   }
-  if (d.act === 'device' || d.playlistJump) { /* handled below */ }
   if (d.act === 'device') {
-    S.view = 'device'; S.deviceId = +d.arg; S.plan = null; S.job = null;
-    return guard(async () => {
-      await loadLog(+d.arg);
-      const dev = S.devices.find(x => x.id === +d.arg);
-      if (dev && dev.mounted_at) await loadPlan(+d.arg);
-    });
+    S.view = 'device'; S.deviceId = +d.arg;
+    S.plan = null; S.planError = null; S.log = [];
+    // A finished job's report is about the page it finished on. One still
+    // running is the program's business, whichever page is open.
+    if (S.job && S.job.state !== 'running') S.job = null;
+    render();
+    return guard(refresh);
   }
   if (d.slRemove) {
     const body = { remove: [[d.slRemove, t.dataset.ref]] };
@@ -3712,15 +3986,7 @@ document.addEventListener('click', (ev) => {
       S.dlResult = null;
       S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
                 total: 0, label: S.playlistDetail.playlist.name };
-      watchJob(res.job, async (job) => {
-        S.dlResult = job.result || null;
-        // The playlist, the library and every device plan that mentions it
-        // have all just changed.
-        await loadCore();
-        await loadPlaylist(id, { peek: true });
-        await loadLibrary();
-        followAutoEnrich(job, 'the new files');
-      });
+      watchJob(res.job);
     });
   }
   if (d.plTolist) {
@@ -3776,11 +4042,7 @@ document.addEventListener('click', (ev) => {
       });
       S.job = { id: res.job, kind: 'sync', state: 'running', done: 0, total: 0,
                 label: (S.devices.find(x => x.id === id) || {}).name || '' };
-      watchJob(res.job, async () => {
-        await loadCore();
-        await loadLog(id);
-        await loadPlan(id);
-      });
+      watchJob(res.job);
     });
   }
   if (d.unset) {
@@ -3789,8 +4051,7 @@ document.addEventListener('click', (ev) => {
       await api('/devices/' + S.deviceId + '/set', {
         method: 'POST', body: JSON.stringify({ remove: [[kind, ref]] }),
       });
-      await loadCore();
-      await loadPlan(S.deviceId);
+      await refresh();
     });
   }
   if (d.pickSet) {
@@ -3812,9 +4073,7 @@ document.addEventListener('click', (ev) => {
       await api('/devices/' + id + '/set', {
         method: 'POST', body: JSON.stringify({ add, remove }),
       });
-      await loadCore();
-      const dv = S.devices.find(x => x.id === id);
-      if (dv && dv.mounted_at) await loadPlan(id);
+      await refresh();
     });
   }
   if (d.plsync) {
@@ -3827,8 +4086,7 @@ document.addEventListener('click', (ev) => {
         body: JSON.stringify(on ? { remove: [['playlist', name]] }
                                 : { add: [['playlist', name]] }),
       });
-      await loadCore();
-      await loadPlaylist(S.playlistId, { peek: true });
+      await refresh();
     });
   }
   if (d.usevol) {
@@ -3882,8 +4140,7 @@ document.addEventListener('click', (ev) => {
     return guard(async () => {
       await api('/inbox/seen', { method: 'POST', body: JSON.stringify({}) });
       S.sel.clear(); S.anchor = null; S.offset = 0;
-      await loadCore();
-      await loadLibrary();
+      await refresh();
     });
   }
   if (d.rootHide) {
@@ -3893,8 +4150,8 @@ document.addEventListener('click', (ev) => {
         method: 'POST',
         body: JSON.stringify({ root: d.rootHide, hidden }),
       });
-      await loadCore();
-      if (isTrackView()) await loadLibrary();
+      closeModal();
+      await refresh();
     });
   }
   if (d.rootRemove) return removeRootModal(d.rootRemove);
@@ -3908,8 +4165,7 @@ document.addEventListener('click', (ev) => {
         method: 'POST',
         body: JSON.stringify({ root, forget_tracks: true }),
       });
-      await loadCore();
-      if (isTrackView()) await loadLibrary();
+      await refresh();
     });
   }
   if (d.closeInspector) {
@@ -3920,7 +4176,11 @@ document.addEventListener('click', (ev) => {
   if (d.scan) return startScan(d.scan);
 });
 
-function startScan(root) {
+/* Scan a folder, and then - when asked to - the ones after it.
+
+   `then` is what makes "Rescan library" mean the library: the button used
+   to scan the first folder and stop, under a tooltip that said every one. */
+function startScan(root, then) {
   return guard(async () => {
     const res = await api('/scan', {
       method: 'POST', body: JSON.stringify({ root }),
@@ -3928,24 +4188,12 @@ function startScan(root) {
     S.job = { id: res.job, kind: 'scan', label: root, state: 'running',
               done: 0, total: 0 };
     watchJob(res.job, async (job) => {
-      await loadCore();
-      if (S.view === 'library') await loadLibrary();
-      followAutoEnrich(job, root);
+      await jobFinished(job);
+      if (job.state === 'done' && then && then.length) {
+        startScan(then[0], then.slice(1));
+      }
     });
   });
-}
-
-/* Identification is no longer a job that a scan or a download starts.
-
-   It is a queue the program works through at one request a second, whatever
-   else is going on - so what a finished download hands back is how many
-   files it put on that queue, and the queue says the rest itself, in the
-   status strip and on its own card. Kept as a function because both callers
-   still want the library to catch up with whatever just landed. */
-async function followAutoEnrich(job, label) {
-  await loadCore();
-  if (isTrackView()) await loadLibrary();
-  render();
 }
 
 /* The backlog, in the status strip.
@@ -3969,16 +4217,17 @@ document.addEventListener('submit', (ev) => {
   if (f.id === 'scan-form') return startScan(f.root.value.trim());
   if (f.id === 'add-device-form') {
     return guard(async () => {
-      await api('/devices', {
+      const row = await api('/devices', {
         method: 'POST',
         body: JSON.stringify({ root: f.root.value.trim(),
                                name: f.name.value.trim(),
                                profile: f.profile.value }),
       });
-      await loadCore();
-      S.view = 'device';
-      S.deviceId = S.devices[S.devices.length - 1].id;
-      await loadLog(S.deviceId);
+      // The one just paired, by its id: the list comes back in name order,
+      // and its last row is whichever device sorts last.
+      S.view = 'device'; S.deviceId = row.id;
+      S.plan = null; S.planError = null; S.log = [];
+      await refresh();
     });
   }
   if (f.id === 'dl-form') {
@@ -3995,14 +4244,7 @@ document.addEventListener('submit', (ev) => {
       });
       S.job = { id: res.job, kind: 'download', state: 'running', done: 0,
                 total: 0, label: urls.length === 1 ? urls[0] : urls.length + ' URLs' };
-      watchJob(res.job, async (job) => {
-        S.dlResult = job.result || null;
-        // A download changes the library, the playlists and every device
-        // plan that mentions them, so the whole core is reloaded.
-        await loadCore();
-        await loadDownload();
-        followAutoEnrich(job, 'the new files');
-      });
+      watchJob(res.job);
     });
   }
   if (f.id === 'dl-cookie-form' || f.id === 'dl-output-form'
@@ -4019,17 +4261,15 @@ document.addEventListener('submit', (ev) => {
         method: 'POST',
         body: JSON.stringify({ directory: f.directory.value.trim() }),
       });
-      await loadCore();
-      const tot = out.results.reduce((a, r) => a + r.total, 0);
-      const mat = out.results.reduce((a, r) => a + r.matched, 0);
-      const enr = out.results.reduce((a, r) => a + (r.enriched || 0), 0);
-      render();
-      const el = $('#pl-result');
-      if (el) {
-        el.innerHTML = `<div class="notice ok">${icon('i-check')}<div>
-          ${out.results.length} playlists, ${num(tot)} entries,
-          ${num(mat)} matched${enr ? `, ${num(enr)} source URIs added` : ''}.</div></div>`;
-      }
+      // Held in the state, not written onto the page: the next render -
+      // and there is one every time anything finishes - would wipe it.
+      S.plImport = {
+        playlists: out.results.length,
+        entries: out.results.reduce((a, r) => a + r.total, 0),
+        matched: out.results.reduce((a, r) => a + r.matched, 0),
+        enriched: out.results.reduce((a, r) => a + (r.enriched || 0), 0),
+      };
+      await refresh();
     });
   }
 });
@@ -4103,8 +4343,8 @@ document.addEventListener('input', (ev) => {
 
 $('#btn-rescan').addEventListener('click', () => {
   const roots = (S.stats && S.stats.roots) || [];
-  if (!roots.length) { S.view = 'download'; return render(); }
-  startScan(roots[0]);
+  if (!roots.length) { S.view = 'download'; render(); return guard(refresh); }
+  startScan(roots[0], roots.slice(1));
 });
 
 document.addEventListener('keydown', (ev) => {
@@ -4211,18 +4451,13 @@ function readUiState() {
         S.view = 'library';
       }
     }
-    if (S.view === 'unlisted') await loadUnlisted();
-    else if (isTrackView()) await loadLibrary();
-    if (S.view === 'download') await loadDownload();
-    if (S.view === 'problems') S.problems = await api('/problems');
-    if (S.view === 'dupes') await loadDupes();
-    if (S.view === 'syncList') S.syncList = await api('/sync-list');
-    if (S.view === 'device' && S.deviceId) {
-      await loadLog(S.deviceId);
-      const dev = S.devices.find(x => x.id === S.deviceId);
-      if (dev && dev.mounted_at) await loadPlan(S.deviceId);
-    }
+    // An empty catalog opens on the page that fills it - decided before
+    // the page is loaded, so that page arrives with its own data.
     if (!S.stats.tracks) S.view = 'download';
+    // Opening a playlist is what marks it seen, and loadPlaylist above has
+    // done that; every other page loads the way a click on it would.
+    if (S.view === 'playlist') await loadLibrary();
+    else await loadView();
     // Whatever the program is already doing, this tab now shows.
     await adoptRunningJob();
   } catch (e) {
